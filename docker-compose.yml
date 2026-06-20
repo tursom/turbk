@@ -1,0 +1,28 @@
+services:
+  turbk:
+    build:
+      context: .
+    image: turbk:dev
+    restart: unless-stopped
+    user: "0:0"
+    ports:
+      - "8080:8080"
+    environment:
+      TURBK_LISTEN: ":8080"
+      TURBK_PUBLIC_URL: "http://localhost:8080"
+      TURBK_WEB_DIR: "/app/web/dist"
+      TURBK_ADMIN_USERNAME: "${TURBK_ADMIN_USERNAME:-admin}"
+      TURBK_ADMIN_PASSWORD: "${TURBK_ADMIN_PASSWORD:-admin}"
+      TURBK_SESSION_TTL_HOURS: "${TURBK_SESSION_TTL_HOURS:-24}"
+      TURBK_STATE_DIR: "/var/lib/turbk/state"
+      TURBK_REPO_DIR: "/var/lib/turbk/repo"
+      TURBK_RESTORE_ROOTS: "/var/lib/turbk/restore"
+    volumes:
+      - turbk-state:/var/lib/turbk/state
+      - turbk-repo:/var/lib/turbk/repo
+      - turbk-restore:/var/lib/turbk/restore
+
+volumes:
+  turbk-state:
+  turbk-repo:
+  turbk-restore:

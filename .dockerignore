@@ -1,0 +1,10 @@
+.git
+.omc
+data
+tmp
+bin
+dist
+web/node_modules
+web/dist
+coverage.out
+*.log
