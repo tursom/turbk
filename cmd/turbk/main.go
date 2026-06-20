@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/turbk/turbk/internal/config"
-	"github.com/turbk/turbk/internal/httpapi"
-	"github.com/turbk/turbk/internal/repository"
-	"github.com/turbk/turbk/internal/state"
+	"github.com/tursom/turbk/internal/config"
+	"github.com/tursom/turbk/internal/httpapi"
+	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/state"
 )
 
 func main() {

@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/turbk/turbk/internal/config"
-	"github.com/turbk/turbk/internal/repository"
-	"github.com/turbk/turbk/internal/state"
+	"github.com/tursom/turbk/internal/config"
+	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/state"
 	"github.com/zeebo/blake3"
 )
 

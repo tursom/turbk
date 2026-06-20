@@ -10,8 +10,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/turbk/turbk/internal/repository"
-	"github.com/turbk/turbk/internal/state"
+	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/state"
 )
 
 type maintenanceReport struct {

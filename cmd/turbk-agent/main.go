@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/turbk/turbk/internal/repository"
-	"github.com/turbk/turbk/internal/version"
+	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/version"
 	"github.com/zeebo/blake3"
 )
 

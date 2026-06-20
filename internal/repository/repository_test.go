@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/turbk/turbk/internal/source"
+	"github.com/tursom/turbk/internal/source"
 )
 
 func testRepository(t *testing.T, chunkAvg int, segmentSize int64) *Repository {

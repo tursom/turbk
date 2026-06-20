@@ -1,5 +1,8 @@
 .git
 .omc
+.env
+.env.*
+!.env.example
 data
 tmp
 bin
@@ -8,3 +11,5 @@ web/node_modules
 web/dist
 coverage.out
 *.log
+config.yaml
+turbk.yaml

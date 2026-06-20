@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/turbk/turbk/internal/state"
+	"github.com/tursom/turbk/internal/state"
 )
 
 const schedulerInterval = 30 * time.Second

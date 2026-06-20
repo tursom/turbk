@@ -1,4 +1,4 @@
-name: Container Image
+name: Container Images
 
 on:
   push:
@@ -18,8 +18,18 @@ env:
 
 jobs:
   build:
-    name: Build and push image
+    name: Build and push ${{ matrix.name }} image
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            image_suffix: ""
+            dockerfile: ./Dockerfile
+          - name: agent
+            image_suffix: "-agent"
+            dockerfile: ./deploy/agent/Dockerfile
 
     steps:
       - name: Checkout
@@ -55,7 +65,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.image }}
+          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.image }}${{ matrix.image_suffix }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -67,11 +77,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            GOPROXY=https://proxy.golang.org,direct
             VERSION=${{ steps.vars.outputs.version }}
             COMMIT=${{ github.sha }}
             DATE=${{ steps.vars.outputs.date }}

@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/turbk/turbk/internal/source"
+	"github.com/tursom/turbk/internal/source"
 )
 
 type BackupProgress struct {

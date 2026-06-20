@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
-	"github.com/turbk/turbk/internal/config"
+	"github.com/tursom/turbk/internal/config"
 	"github.com/zeebo/blake3"
 )
 

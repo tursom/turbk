@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/turbk/turbk/internal/config"
+	"github.com/tursom/turbk/internal/config"
 	_ "modernc.org/sqlite"
 )
 

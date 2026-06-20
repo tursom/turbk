@@ -2,6 +2,9 @@
 
 Turbk 是一个单机部署优先的备份服务器。当前仓库已落地 Go Server、Linux Agent、SQLite 状态库、SMR 友好的 append-only 仓库、Pull connector 基础能力和 Vue 管理后台。
 
+仓库地址：`https://github.com/tursom/turbk`
+Go module：`github.com/tursom/turbk`
+
 ## 本地运行
 
 安装前端依赖并构建 Web UI：
@@ -121,7 +124,7 @@ curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs \
   --data '{"name":"sftp pull","source_type":"sftp","credential_id":1,"source_config":{"root":"/srv/data"},"enabled":true}'
 ```
 
-凭据 payload 会在 SQLite 中以 AES-256-GCM 加密保存，列表 API 只返回凭据元数据。
+凭据 payload 会在 SQLite 中以 AES-256-GCM 加密保存。Pull 凭据列表只返回元数据；Agent 凭据会额外返回 `client_id` 和可重复查看的 `client_secret`，用于客户端配置。
 
 FTP/FTPS Pull 凭据使用相同的凭据 API。FTPS 可按服务端类型选择显式 TLS，并在自签证书环境中临时跳过证书校验：
 
@@ -175,19 +178,72 @@ curl -b /tmp/turbk.cookie http://localhost:8080/api/v1/runs/1/logs
 
 ## Docker
 
+这里部署的是 Turbk 服务端。服务端镜像只包含 `turbk`，不包含 `turbk-agent`。
+
+从源码目录本地构建并部署服务端：
+
 ```bash
-docker compose up --build
+cp .env.example .env
+# 修改 .env 中的 TURBK_ADMIN_PASSWORD 等部署参数
+docker compose build
+docker compose up -d
 ```
 
-默认持久卷：
+服务端 compose 默认镜像名：
 
-- `turbk-state` -> `/var/lib/turbk/state`
-- `turbk-repo` -> `/var/lib/turbk/repo`
-- `turbk-restore` -> `/var/lib/turbk/restore`
+- `ghcr.io/tursom/turbk:latest`
+
+`docker compose build` 会把本地源码构建成这个镜像名。也可以通过 `TURBK_IMAGE` 指定其他 tag，例如 `turbk:local` 或 `ghcr.io/tursom/turbk:sha-<commit>`。
+如果构建时下载 Go 依赖较慢，可以在 `.env` 中把 `GOPROXY` 改成当前网络可用的 Go module 代理。
+
+如果只想使用 GitHub Container Registry 上已经推送的镜像：
+
+```bash
+cp .env.example .env
+# 修改 .env 中的 TURBK_ADMIN_PASSWORD 等部署参数
+docker compose pull
+docker compose up -d --no-build
+```
+
+GitHub Actions 会在 push 和 tag 时构建并推送服务端镜像 `ghcr.io/tursom/turbk` 和 agent 镜像 `ghcr.io/tursom/turbk-agent`；PR 只构建不推送。
+
+compose 默认绑定挂载：
+
+- `${TURBK_STATE_DIR:-./data/state}` -> `/var/lib/turbk/state`
+- `${TURBK_REPO_DIR:-./data/repo}` -> `/var/lib/turbk/repo`
+- `${TURBK_RESTORE_DIR:-./data/restore}` -> `/var/lib/turbk/restore`
+
+如果要让容器内的 `local` 备份任务读取宿主机目录，需要在 `docker-compose.yml` 的 `volumes` 中额外挂载源目录，例如：
+
+```yaml
+      - "/srv/data:/mnt/source:ro"
+```
 
 容器默认以 `root` 运行，便于读写宿主机挂载进来的备份源、仓库盘和恢复目录。
 镜像 runtime 使用 `alpine:3.22`，构建阶段使用 `golang:1.26-alpine` 和 `node:22-alpine`。
-部署时建议在 compose 或运行环境中覆盖 `TURBK_ADMIN_PASSWORD`，不要沿用开发默认密码。
+部署时必须覆盖 `TURBK_ADMIN_PASSWORD`，不要沿用开发默认密码。
+
+## Agent Docker
+
+Agent 要部署在被备份主机上，使用独立目录：
+
+```bash
+cd deploy/agent
+cp .env.example .env
+# 填写 TURBK_SERVER_URL、TURBK_AGENT_ID、TURBK_AGENT_SECRET 和 TURBK_AGENT_SOURCE_DIR
+docker compose pull
+docker compose run --rm turbk-agent
+```
+
+也可以在被备份主机上从源码构建 agent 镜像：
+
+```bash
+cd deploy/agent
+docker compose build
+docker compose run --rm turbk-agent
+```
+
+agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 agent 是一次性执行模型；需要定时备份时，在被备份主机上用 cron 或 systemd timer 定时运行 `docker compose run --rm turbk-agent`。
 
 ## 开发验证
 

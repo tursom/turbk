@@ -1,0 +1,27 @@
+services:
+  turbk-agent:
+    image: ${TURBK_AGENT_IMAGE:-ghcr.io/tursom/turbk-agent:latest}
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        VERSION: ${TURBK_AGENT_VERSION:-0.1.0-dev}
+        COMMIT: ${TURBK_AGENT_COMMIT:-local}
+        DATE: ${TURBK_AGENT_BUILD_DATE:-unknown}
+    pull_policy: ${TURBK_AGENT_PULL_POLICY:-missing}
+    user: "0:0"
+    environment:
+      TURBK_SERVER_URL: "${TURBK_SERVER_URL:?set TURBK_SERVER_URL}"
+      TURBK_AGENT_ID: "${TURBK_AGENT_ID:?set TURBK_AGENT_ID}"
+      TURBK_AGENT_SECRET: "${TURBK_AGENT_SECRET:?set TURBK_AGENT_SECRET}"
+      TURBK_AGENT_ROOT: "${TURBK_AGENT_ROOT:-/backup/source}"
+      TURBK_AGENT_JOB_NAME: "${TURBK_AGENT_JOB_NAME:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-}"
+    volumes:
+      - "${TURBK_AGENT_SOURCE_DIR:?set TURBK_AGENT_SOURCE_DIR}:${TURBK_AGENT_ROOT:-/backup/source}:ro"
+    command:
+      - "-once"
+    restart: "no"

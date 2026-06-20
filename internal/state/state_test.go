@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/turbk/turbk/internal/config"
+	"github.com/tursom/turbk/internal/config"
 )
 
 func TestOpenInitializesSQLiteAndDirs(t *testing.T) {

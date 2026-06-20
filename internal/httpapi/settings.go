@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/turbk/turbk/internal/config"
-	"github.com/turbk/turbk/internal/state"
+	"github.com/tursom/turbk/internal/config"
+	"github.com/tursom/turbk/internal/state"
 	"golang.org/x/crypto/bcrypt"
 )
 

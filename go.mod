@@ -1,4 +1,4 @@
-module github.com/turbk/turbk
+module github.com/tursom/turbk
 
 go 1.26
 

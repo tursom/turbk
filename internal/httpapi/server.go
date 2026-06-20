@@ -20,11 +20,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/turbk/turbk/internal/config"
-	"github.com/turbk/turbk/internal/repository"
-	"github.com/turbk/turbk/internal/source"
-	"github.com/turbk/turbk/internal/state"
-	"github.com/turbk/turbk/internal/version"
+	"github.com/tursom/turbk/internal/config"
+	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/source"
+	"github.com/tursom/turbk/internal/state"
+	"github.com/tursom/turbk/internal/version"
 )
 
 type Server struct {
