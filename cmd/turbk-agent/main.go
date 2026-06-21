@@ -67,13 +67,11 @@ func main() {
 	var clientID string
 	var clientSecret string
 	var root string
-	var jobName string
 	var once bool
 	flag.StringVar(&serverURL, "server", os.Getenv("TURBK_SERVER_URL"), "Turbk server URL")
 	flag.StringVar(&clientID, "client-id", os.Getenv("TURBK_AGENT_ID"), "Agent client ID")
 	flag.StringVar(&clientSecret, "client-secret", os.Getenv("TURBK_AGENT_SECRET"), "Agent client secret")
 	flag.StringVar(&root, "root", os.Getenv("TURBK_AGENT_ROOT"), "Root directory to back up")
-	flag.StringVar(&jobName, "job-name", os.Getenv("TURBK_AGENT_JOB_NAME"), "Server-side agent job name")
 	flag.BoolVar(&once, "once", false, "Send one heartbeat or run one backup and exit")
 	flag.Parse()
 
@@ -92,7 +90,7 @@ func main() {
 			logger.Error("agent heartbeat failed", "error", err)
 			os.Exit(1)
 		}
-		if err := runBackup(client, root, jobName, logger); err != nil {
+		if err := runBackup(client, root, logger); err != nil {
 			logger.Error("agent backup failed", "error", err)
 			os.Exit(1)
 		}
@@ -138,7 +136,7 @@ func (c *agentClient) sendHeartbeat() error {
 	return err
 }
 
-func runBackup(client *agentClient, root, jobName string, logger *slog.Logger) error {
+func runBackup(client *agentClient, root string, logger *slog.Logger) error {
 	root = filepath.Clean(root)
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -152,7 +150,6 @@ func runBackup(client *agentClient, root, jobName string, logger *slog.Logger) e
 	if _, err := client.doJSON(http.MethodPost, "/agent/v1/runs", map[string]any{
 		"hostname": hostname,
 		"root":     root,
-		"job_name": jobName,
 	}, &created); err != nil {
 		return err
 	}

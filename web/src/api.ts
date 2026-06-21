@@ -332,7 +332,7 @@ export const api = {
     }),
   credentials: () => request<{ credentials: Credential[] }>('/api/v1/credentials'),
   createCredential: (payload: { name: string; type: string; payload: Record<string, unknown> }) =>
-    request<{ credential: Credential; client_secret?: string }>('/api/v1/credentials', {
+    request<{ credential: Credential }>('/api/v1/credentials', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)

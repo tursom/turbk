@@ -161,7 +161,7 @@ func TestCredentialsAreEncryptedAtRest(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	payload := []byte(`{"address":"127.0.0.1:22","username":"root","password":"super-secret"}`)
+	payload := []byte(`{"username":"root","password":"super-secret"}`)
 	credential, err := store.CreateCredential(ctx, CreateCredentialInput{
 		Name:    "sftp root",
 		Type:    "sftp",
@@ -263,6 +263,76 @@ func TestAgentCredentialIndexedLookup(t *testing.T) {
 	}
 	if _, err := store.FindAgentCredentialByClientSecret(ctx, clientID, "wrong"); !errors.Is(err, ErrAgentCredentialNotFound) {
 		t.Fatalf("wrong secret error = %v, want ErrAgentCredentialNotFound", err)
+	}
+}
+
+func TestAgentJobIsOneToOneWithHost(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+
+	store, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	clientID := "agt_one_to_one"
+	clientSecret := "ags_one_to_one"
+	secretHash := HashAgentSecret(clientID, clientSecret)
+	payload := []byte(`{"client_id":"agt_one_to_one","client_secret":"ags_one_to_one","secret_hash":"` + secretHash + `","subject":"agent-host"}`)
+	host, credential, err := store.CreateAgentHost(ctx, CreateAgentHostInput{
+		Name:         "agent-host",
+		Payload:      payload,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		SecretHash:   secretHash,
+		Subject:      "agent-host",
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentHost() error = %v", err)
+	}
+
+	first, created, err := store.FindOrCreateAgentJob(ctx, AgentJobInput{
+		HostID:       host.ID,
+		CredentialID: credential.ID,
+		Name:         "server generated one",
+		SourceConfig: []byte(`{"root":"/srv/one"}`),
+	})
+	if err != nil {
+		t.Fatalf("FindOrCreateAgentJob(first) error = %v", err)
+	}
+	if !created {
+		t.Fatal("first agent job was not created")
+	}
+	second, created, err := store.FindOrCreateAgentJob(ctx, AgentJobInput{
+		HostID:       host.ID,
+		CredentialID: credential.ID,
+		Name:         "server generated two",
+		SourceConfig: []byte(`{"root":"/srv/two"}`),
+	})
+	if err != nil {
+		t.Fatalf("FindOrCreateAgentJob(second) error = %v", err)
+	}
+	if created {
+		t.Fatal("second agent job created a duplicate for the same host")
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second agent job ID = %d, want %d", second.ID, first.ID)
+	}
+	if second.Name != "server generated two" || second.SourceConfig != `{"root":"/srv/two"}` {
+		t.Fatalf("agent job was not updated from server-owned fields: %+v", second)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs() error = %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("agent host has %d jobs, want 1: %+v", len(jobs), jobs)
 	}
 }
 

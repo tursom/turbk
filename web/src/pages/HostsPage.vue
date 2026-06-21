@@ -27,25 +27,19 @@ const {
   selectedHostId,
   agentSetupHostName,
   agentSetupSourceDir,
-  agentSetupRoot,
-  agentSetupJobName,
   copyActionMessage,
   credentialName,
   credentialType,
-  credentialAddress,
   credentialUsername,
   credentialPassword,
   credentialPrivateKey,
   credentialBearerToken,
-  credentialSubject,
   credentialExplicitTLS,
   credentialSkipTLSVerify,
   agentCredentialClientId,
   agentCredentialSecret,
   jobName,
-  jobSourceType,
   jobRoot,
-  jobCredentialId,
   jobSchedule,
   jobTimezone,
   jobMaxRuntimeSeconds,
@@ -91,8 +85,9 @@ const {
   currentServerURL,
   agentSetupClientId,
   agentSetupClientSecret,
-  agentComposeEnv,
-  agentDockerCommand,
+  agentSetupMethod,
+  agentSetupMethods,
+  selectedAgentSetupSnippet,
   formatTime,
   formatBytes,
   formatPercent,
@@ -179,7 +174,7 @@ const {
         <span>{{ t('field.name') }}</span>
         <input v-model="hostName" type="text" required />
       </label>
-      <label v-if="hostSourceType !== 'agent'" class="field">
+      <label v-if="!['agent', 'local'].includes(hostSourceType)" class="field">
         <span>{{ t('field.address') }}</span>
         <input v-model="hostAddress" type="text" :placeholder="hostAddressPlaceholder(hostSourceType)" />
       </label>
@@ -192,24 +187,6 @@ const {
           </option>
         </select>
       </label>
-      <template v-if="hostSourceType === 'agent'">
-        <label class="field">
-          <span>{{ t('hosts.serverURL') }}</span>
-          <input :value="currentServerURL" type="text" readonly />
-        </label>
-        <label class="field">
-          <span>{{ t('hosts.sourceDir') }}</span>
-          <input v-model="agentSetupSourceDir" type="text" placeholder="/srv/data" />
-        </label>
-        <label class="field">
-          <span>{{ t('hosts.agentRoot') }}</span>
-          <input v-model="agentSetupRoot" type="text" placeholder="/backup/source" />
-        </label>
-        <label class="field">
-          <span>{{ t('hosts.jobName') }}</span>
-          <input v-model="agentSetupJobName" type="text" placeholder="agent-srv-data" />
-        </label>
-      </template>
       <div class="form-actions">
         <button class="text-button primary" type="submit">
           <Server :size="16" />
@@ -316,14 +293,14 @@ const {
         </div>
 
         <div class="host-section">
-          <h2>{{ t('hosts.compatibleCredentials') }}</h2>
+          <h2>{{ t('hosts.boundCredential') }}</h2>
           <ul v-if="selectedHostCredentials.length > 0" class="compact-list">
             <li v-for="credential in selectedHostCredentials" :key="credential.id">
               <span>{{ credential.name }}</span>
               <code>{{ sourceTypeLabel(credential.type) }}</code>
             </li>
           </ul>
-          <p v-else class="muted">{{ t('hosts.noCompatibleCredentials') }}</p>
+          <p v-else class="muted">{{ t('hosts.noBoundCredential') }}</p>
         </div>
 
         <div class="host-section">
@@ -375,36 +352,35 @@ const {
         <span>{{ t('hosts.sourceDir') }}</span>
         <input v-model="agentSetupSourceDir" type="text" />
       </label>
-      <label class="field">
-        <span>{{ t('hosts.agentRoot') }}</span>
-        <input v-model="agentSetupRoot" type="text" />
-      </label>
-      <label class="field">
-        <span>{{ t('hosts.jobName') }}</span>
-        <input v-model="agentSetupJobName" type="text" />
-      </label>
     </div>
 
-    <div class="code-grid">
-      <div class="code-block">
-        <div class="code-title">
-          <span>{{ t('hosts.composeEnv') }}</span>
-          <button class="text-button" type="button" @click="copyText(agentComposeEnv)">
-            <Copy :size="16" />
-            <span>{{ t('hosts.copyEnv') }}</span>
-          </button>
-        </div>
-        <pre>{{ agentComposeEnv }}</pre>
+    <div class="agent-method-layout">
+      <div class="agent-method-selector" role="tablist" :aria-label="t('hosts.agentSetupMethod')">
+        <button
+          v-for="method in agentSetupMethods"
+          :key="method.value"
+          class="agent-method-option"
+          :class="{ active: agentSetupMethod === method.value }"
+          type="button"
+          role="tab"
+          :aria-selected="agentSetupMethod === method.value"
+          @click="agentSetupMethod = method.value"
+        >
+          <strong>{{ method.title }}</strong>
+          <small>{{ method.description }}</small>
+        </button>
       </div>
-      <div class="code-block">
+
+      <div class="code-block agent-method-code">
         <div class="code-title">
-          <span>{{ t('hosts.dockerCommand') }}</span>
-          <button class="text-button" type="button" @click="copyText(agentDockerCommand)">
+          <span>{{ selectedAgentSetupSnippet.title }}</span>
+          <button class="text-button" type="button" @click="copyText(selectedAgentSetupSnippet.code)">
             <Copy :size="16" />
-            <span>{{ t('hosts.copyCommand') }}</span>
+            <span>{{ t('hosts.copySetup') }}</span>
           </button>
         </div>
-        <pre>{{ agentDockerCommand }}</pre>
+        <p class="code-description">{{ selectedAgentSetupSnippet.description }}</p>
+        <pre>{{ selectedAgentSetupSnippet.code }}</pre>
       </div>
     </div>
   </section>

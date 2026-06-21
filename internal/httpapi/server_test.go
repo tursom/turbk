@@ -996,9 +996,46 @@ func TestHostAPIAndAgentHeartbeatPublishesHostStatus(t *testing.T) {
 	}
 
 	status, body = postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "local with address",
+		"source_type": "local",
+		"address":     "/mnt/source",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("local host with address status = %d body=%s", status, string(body))
+	}
+
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "server local",
+		"source_type": "local",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create local host status = %d body=%s", status, string(body))
+	}
+	var createdLocalHost struct {
+		Host state.Host `json:"host"`
+	}
+	if err := json.Unmarshal(body, &createdLocalHost); err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/hosts/"+strconv.FormatInt(createdLocalHost.Host.ID, 10), cookie, map[string]any{
+		"address": "/mnt/other",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("patch local host address status = %d body=%s", status, string(body))
+	}
+
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
 		"name":        "agent-subject",
 		"source_type": "agent",
 		"address":     "should-not-be-stored",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("agent host with address status = %d body=%s", status, string(body))
+	}
+
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "agent-subject",
+		"source_type": "agent",
 	})
 	if status != http.StatusCreated {
 		t.Fatalf("create agent host status = %d body=%s", status, string(body))
@@ -1019,6 +1056,12 @@ func TestHostAPIAndAgentHeartbeatPublishesHostStatus(t *testing.T) {
 	}
 	if createdAgentHost.Agent.ClientID == "" || createdAgentHost.Agent.ClientSecret == "" || !createdAgentHost.Host.CredentialID.Valid {
 		t.Fatalf("agent credential missing client credentials: %s", string(body))
+	}
+	status, body = requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/hosts/"+strconv.FormatInt(createdAgentHost.Host.ID, 10), cookie, map[string]any{
+		"address": "manual-agent-hostname",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("patch agent host address status = %d body=%s", status, string(body))
 	}
 	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/heartbeat", createdAgentHost.Agent.ClientID, createdAgentHost.Agent.ClientSecret, map[string]any{
 		"hostname": "agent-hostname",
@@ -1110,6 +1153,26 @@ func TestCredentialAPIEncryptsAndPullJobReferencesCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs", cookie, map[string]any{
+		"name":          "legacy source type",
+		"host_id":       createdHost.Host.ID,
+		"source_type":   "sftp",
+		"source_config": map[string]any{"root": "/srv"},
+		"enabled":       true,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("create job with source_type status = %d body=%s", status, string(body))
+	}
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs", cookie, map[string]any{
+		"name":          "legacy credential",
+		"host_id":       createdHost.Host.ID,
+		"credential_id": created.Credential.ID,
+		"source_config": map[string]any{"root": "/srv"},
+		"enabled":       true,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("create job with credential_id status = %d body=%s", status, string(body))
+	}
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs", cookie, map[string]any{
 		"name":          "pull sftp",
 		"host_id":       createdHost.Host.ID,
 		"source_config": map[string]any{"root": "/srv"},
@@ -1121,12 +1184,102 @@ func TestCredentialAPIEncryptsAndPullJobReferencesCredential(t *testing.T) {
 	if bytes.Contains(body, []byte("super-secret")) {
 		t.Fatalf("job response leaked secret: %s", string(body))
 	}
+	var createdJob struct {
+		Job state.Job `json:"job"`
+	}
+	if err := json.Unmarshal(body, &createdJob); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{
+			name:    "host_id",
+			payload: map[string]any{"host_id": createdHost.Host.ID},
+		},
+		{
+			name:    "source_type",
+			payload: map[string]any{"source_type": "sftp"},
+		},
+		{
+			name:    "credential_id",
+			payload: map[string]any{"credential_id": created.Credential.ID},
+		},
+	} {
+		t.Run("reject patch "+tc.name, func(t *testing.T) {
+			status, body := requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/jobs/"+strconv.FormatInt(createdJob.Job.ID, 10), cookie, tc.payload)
+			if status != http.StatusBadRequest {
+				t.Fatalf("patch job with %s status = %d body=%s", tc.name, status, string(body))
+			}
+		})
+	}
 	counts, err := store.Counts(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if counts.Credentials != 1 || counts.Hosts != 1 || counts.Jobs != 1 {
 		t.Fatalf("unexpected counts: %+v", counts)
+	}
+}
+
+func TestCredentialAPIRejectsEndpointFields(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+
+	for _, tc := range []struct {
+		name           string
+		credentialType string
+		payload        map[string]any
+	}{
+		{
+			name:           "address",
+			credentialType: "sftp",
+			payload: map[string]any{
+				"address":  "10.0.0.10:22",
+				"username": "root",
+				"password": "secret",
+			},
+		},
+		{
+			name:           "base_url",
+			credentialType: "webdav",
+			payload: map[string]any{
+				"base_url":     "https://storage.example.com/dav",
+				"bearer_token": "secret",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := postJSONAuthed(t, server.URL+"/api/v1/credentials", cookie, map[string]any{
+				"name":    "invalid endpoint field",
+				"type":    tc.credentialType,
+				"payload": tc.payload,
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("create credential status = %d body=%s", status, string(body))
+			}
+			if !bytes.Contains(body, []byte("must not include")) {
+				t.Fatalf("create credential error did not mention endpoint field: %s", string(body))
+			}
+		})
 	}
 }
 
@@ -1328,6 +1481,16 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 		t.Fatalf("credential list exposed agent subject: %s", string(body))
 	}
 
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs", cookie, map[string]any{
+		"name":          "manual agent job",
+		"host_id":       createdAgent.Host.ID,
+		"source_config": map[string]any{"root": "/srv/data"},
+		"enabled":       true,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("manual agent job status = %d body=%s", status, string(body))
+	}
+
 	status, body = requestJSON(t, http.MethodPost, server.URL+"/agent/v1/runs", "dev-token", map[string]any{
 		"hostname": "agent-host",
 		"root":     "/srv/data",
@@ -1346,6 +1509,7 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 		t.Fatalf("create agent run status = %d body=%s", status, string(body))
 	}
 	var createdRun struct {
+		Job state.Job `json:"job"`
 		Run state.Run `json:"run"`
 	}
 	if err := json.Unmarshal(body, &createdRun); err != nil {
@@ -1353,6 +1517,9 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	}
 	if createdRun.Run.ID == 0 {
 		t.Fatalf("created run missing ID: %+v", createdRun.Run)
+	}
+	if createdRun.Job.Name != "Agent backup - dev-host" {
+		t.Fatalf("agent job name = %q, want server-derived name", createdRun.Job.Name)
 	}
 	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs/"+strconv.FormatInt(createdRun.Run.ID, 10)+"/progress", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
 		"phase":           "uploading",
@@ -1367,12 +1534,13 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
 		"hostname": "agent-host",
 		"root":     "/srv/data",
-		"job_name": "agent smoke",
+		"job_name": "agent smoke should be ignored",
 	})
 	if status != http.StatusOK {
 		t.Fatalf("idempotent create agent run status = %d body=%s", status, string(body))
 	}
 	var resumedRun struct {
+		Job state.Job `json:"job"`
 		Run state.Run `json:"run"`
 	}
 	if err := json.Unmarshal(body, &resumedRun); err != nil {
@@ -1380,6 +1548,9 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	}
 	if resumedRun.Run.ID != createdRun.Run.ID {
 		t.Fatalf("resumed run ID = %d, want %d", resumedRun.Run.ID, createdRun.Run.ID)
+	}
+	if resumedRun.Job.ID != createdRun.Job.ID || resumedRun.Job.Name != createdRun.Job.Name {
+		t.Fatalf("resumed job = %+v, want %+v", resumedRun.Job, createdRun.Job)
 	}
 
 	data := bytes.Repeat([]byte("agent-push-data-"), 400)

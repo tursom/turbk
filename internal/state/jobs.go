@@ -199,14 +199,14 @@ func (s *Store) FindOrCreateAgentJob(ctx context.Context, input AgentJobInput) (
 	err = tx.QueryRowContext(ctx, `
 		SELECT id
 		FROM jobs
-		WHERE source_type = 'agent' AND host_id = ? AND name = ?
-		ORDER BY id DESC
-		LIMIT 1`, input.HostID, input.Name).Scan(&id)
+		WHERE source_type = 'agent' AND host_id = ?
+		ORDER BY id ASC
+		LIMIT 1`, input.HostID).Scan(&id)
 	if err == nil {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
-			SET source_config = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ?`, string(input.SourceConfig), id); err != nil {
+			SET credential_id = ?, name = ?, source_config = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?`, input.CredentialID, input.Name, string(input.SourceConfig), id); err != nil {
 			return Job{}, false, fmt.Errorf("update agent job: %w", err)
 		}
 		if err := tx.Commit(); err != nil {

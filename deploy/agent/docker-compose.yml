@@ -15,13 +15,13 @@ services:
       TURBK_SERVER_URL: "${TURBK_SERVER_URL:?set TURBK_SERVER_URL}"
       TURBK_AGENT_ID: "${TURBK_AGENT_ID:?set TURBK_AGENT_ID}"
       TURBK_AGENT_SECRET: "${TURBK_AGENT_SECRET:?set TURBK_AGENT_SECRET}"
-      TURBK_AGENT_ROOT: "${TURBK_AGENT_ROOT:-/backup/source}"
-      TURBK_AGENT_JOB_NAME: "${TURBK_AGENT_JOB_NAME:-}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-}"
     volumes:
-      - "${TURBK_AGENT_SOURCE_DIR:?set TURBK_AGENT_SOURCE_DIR}:${TURBK_AGENT_ROOT:-/backup/source}:ro"
+      - "${TURBK_AGENT_SOURCE_DIR:?set TURBK_AGENT_SOURCE_DIR}:/backup/source:ro"
     command:
+      - "-root"
+      - "/backup/source"
       - "-once"
     restart: "no"

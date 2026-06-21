@@ -813,6 +813,57 @@ a.text-button {
   gap: 12px;
 }
 
+.agent-method-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.36fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.agent-method-selector {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-method-option {
+  width: 100%;
+  min-height: 74px;
+  border: 1px solid #d9e1ea;
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 5px;
+  text-align: left;
+  background: #ffffff;
+  color: #344054;
+  cursor: pointer;
+}
+
+.agent-method-option strong,
+.agent-method-option small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-method-option strong {
+  color: #101828;
+}
+
+.agent-method-option small {
+  color: #667085;
+  line-height: 1.35;
+}
+
+.agent-method-option.active {
+  border-color: #1570ef;
+  background: #eff8ff;
+  box-shadow: inset 3px 0 0 #1570ef;
+}
+
+.agent-method-code {
+  min-height: 100%;
+}
+
 .code-block {
   min-width: 0;
   border: 1px solid #d9e1ea;
@@ -844,14 +895,23 @@ a.text-button {
   color: #ffffff;
 }
 
+.code-description {
+  margin: 0;
+  padding: 10px 12px;
+  color: #cbd5e1;
+  font-size: 13px;
+  line-height: 1.45;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
 .code-block pre {
   margin: 0;
   padding: 12px;
   color: #e5e7eb;
   font-size: 12px;
   line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+  overflow-x: auto;
 }
 
 .table-wrap {
@@ -983,6 +1043,7 @@ td {
   .host-management-layout,
   .credential-management-layout,
   .agent-setup-grid,
+  .agent-method-layout,
   .code-grid {
     grid-template-columns: 1fr;
   }

@@ -19,6 +19,22 @@ import {
 import { en, locale, setLocale, t, type MessageKey } from '../i18n';
 import { pages, type PageKey } from '../navigation';
 
+const agentContainerRoot = '/backup/source';
+type AgentSetupMethod = 'compose' | 'docker' | 'binary' | 'systemd';
+
+function shellQuote(value: string) {
+  if (value === '') return "''";
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function yamlQuote(value: string) {
+  return `'${value.replace(/'/g, `''`)}'`;
+}
+
+function systemdQuote(value: string) {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
+}
+
 export function useBackupApp() {
   const pageKeys = new Set<PageKey>(pages.map((page) => page.key));
 
@@ -62,17 +78,14 @@ export function useBackupApp() {
   const selectedHostId = ref<number | null>(null);
   const agentSetupHostName = ref('');
   const agentSetupSourceDir = ref('/srv/data');
-  const agentSetupRoot = ref('/backup/source');
-  const agentSetupJobName = ref('');
+  const agentSetupMethod = ref<AgentSetupMethod>('compose');
   const copyActionMessage = ref('');
   const credentialName = ref('');
   const credentialType = ref('sftp');
-  const credentialAddress = ref('');
   const credentialUsername = ref('');
   const credentialPassword = ref('');
   const credentialPrivateKey = ref('');
   const credentialBearerToken = ref('');
-  const credentialSubject = ref('');
   const credentialExplicitTLS = ref(true);
   const credentialSkipTLSVerify = ref(false);
   const showCredentialCreate = ref(false);
@@ -80,10 +93,8 @@ export function useBackupApp() {
   const agentCredentialClientId = ref('');
   const agentCredentialSecret = ref('');
   const jobName = ref('');
-  const jobSourceType = ref('local');
   const jobRoot = ref('');
   const jobHostId = ref<number | ''>('');
-  const jobCredentialId = ref<number | ''>('');
   const jobSchedule = ref('');
   const jobTimezone = ref('Asia/Shanghai');
   const jobMaxRuntimeSeconds = ref(0);
@@ -289,18 +300,38 @@ export function useBackupApp() {
 
   const agentSetupClientId = computed(() => activeAgentCredential.value?.client_id || agentCredentialClientId.value || 'agt_replace_me');
   const agentSetupClientSecret = computed(() => activeAgentCredential.value?.client_secret || agentCredentialSecret.value || 'ags_replace_me');
-  const agentSetupDisplayName = computed(() => agentSetupHostName.value || selectedHost.value?.name || activeAgentCredential.value?.subject || 'agent-source');
   const jobHostOptions = computed(() => hosts.value.filter((host) => host.source_type !== 'agent'));
-  const effectiveAgentSetupJobName = computed(() => agentSetupJobName.value.trim() || `${agentSetupDisplayName.value}-backup`);
 
   const agentComposeEnv = computed(() =>
     [
       `TURBK_SERVER_URL=${currentServerURL.value}`,
       `TURBK_AGENT_ID=${agentSetupClientId.value}`,
       `TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`,
-      `TURBK_AGENT_SOURCE_DIR=${agentSetupSourceDir.value}`,
-      `TURBK_AGENT_ROOT=${agentSetupRoot.value}`,
-      `TURBK_AGENT_JOB_NAME=${effectiveAgentSetupJobName.value}`
+      `TURBK_AGENT_SOURCE_DIR=${agentSetupSourceDir.value}`
+    ].join('\n')
+  );
+
+  const agentComposeSetup = computed(() =>
+    [
+      'mkdir -p turbk-agent && cd turbk-agent',
+      "cat > compose.yaml <<'YAML'",
+      'services:',
+      '  turbk-agent:',
+      '    image: ghcr.io/tursom/turbk-agent:latest',
+      '    user: "0:0"',
+      '    environment:',
+      `      TURBK_SERVER_URL: ${yamlQuote(currentServerURL.value)}`,
+      `      TURBK_AGENT_ID: ${yamlQuote(agentSetupClientId.value)}`,
+      `      TURBK_AGENT_SECRET: ${yamlQuote(agentSetupClientSecret.value)}`,
+      '    volumes:',
+      `      - ${yamlQuote(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)}`,
+      '    command:',
+      '      - "-root"',
+      `      - ${yamlQuote(agentContainerRoot)}`,
+      '      - "-once"',
+      '    restart: "no"',
+      'YAML',
+      'docker compose run --rm turbk-agent'
     ].join('\n')
   );
 
@@ -310,13 +341,105 @@ export function useBackupApp() {
       `  -e TURBK_SERVER_URL=${JSON.stringify(currentServerURL.value)} \\`,
       `  -e TURBK_AGENT_ID=${JSON.stringify(agentSetupClientId.value)} \\`,
       `  -e TURBK_AGENT_SECRET=${JSON.stringify(agentSetupClientSecret.value)} \\`,
-      `  -e TURBK_AGENT_ROOT=${JSON.stringify(agentSetupRoot.value)} \\`,
-      `  -e TURBK_AGENT_JOB_NAME=${JSON.stringify(effectiveAgentSetupJobName.value)} \\`,
-      `  -v ${JSON.stringify(`${agentSetupSourceDir.value}:${agentSetupRoot.value}:ro`)} \\`,
+      `  -v ${JSON.stringify(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)} \\`,
       '  ghcr.io/tursom/turbk-agent:latest \\',
+      `  -root ${JSON.stringify(agentContainerRoot)} \\`,
       '  -once'
     ].join('\n')
   );
+
+  const agentBinaryCommand = computed(() =>
+    [
+      '# Put the turbk-agent binary on this host, then run:',
+      `export TURBK_SERVER_URL=${shellQuote(currentServerURL.value)}`,
+      `export TURBK_AGENT_ID=${shellQuote(agentSetupClientId.value)}`,
+      `export TURBK_AGENT_SECRET=${shellQuote(agentSetupClientSecret.value)}`,
+      `./turbk-agent -root ${shellQuote(agentSetupSourceDir.value)} -once`
+    ].join('\n')
+  );
+
+  const agentSystemdTimer = computed(() =>
+    [
+      'sudo install -m 0755 ./turbk-agent /usr/local/bin/turbk-agent',
+      "sudo tee /etc/systemd/system/turbk-agent.service >/dev/null <<'UNIT'",
+      '[Unit]',
+      'Description=Turbk agent backup run',
+      'After=network-online.target',
+      'Wants=network-online.target',
+      '',
+      '[Service]',
+      'Type=oneshot',
+      `Environment=${systemdQuote(`TURBK_SERVER_URL=${currentServerURL.value}`)}`,
+      `Environment=${systemdQuote(`TURBK_AGENT_ID=${agentSetupClientId.value}`)}`,
+      `Environment=${systemdQuote(`TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`)}`,
+      `ExecStart=/usr/local/bin/turbk-agent -root ${systemdQuote(agentSetupSourceDir.value)} -once`,
+      'UNIT',
+      '',
+      "sudo tee /etc/systemd/system/turbk-agent.timer >/dev/null <<'UNIT'",
+      '[Unit]',
+      'Description=Run Turbk agent backup every day',
+      '',
+      '[Timer]',
+      'OnCalendar=*-*-* 02:00:00',
+      'Persistent=true',
+      'Unit=turbk-agent.service',
+      '',
+      '[Install]',
+      'WantedBy=timers.target',
+      'UNIT',
+      '',
+      'sudo systemctl daemon-reload',
+      'sudo systemctl enable --now turbk-agent.timer'
+    ].join('\n')
+  );
+
+  const agentSetupMethods = computed(() => [
+    {
+      value: 'compose' as const,
+      title: t('hosts.agentMethodCompose'),
+      description: t('hosts.agentMethodComposeDesc')
+    },
+    {
+      value: 'docker' as const,
+      title: t('hosts.agentMethodDocker'),
+      description: t('hosts.agentMethodDockerDesc')
+    },
+    {
+      value: 'binary' as const,
+      title: t('hosts.agentMethodBinary'),
+      description: t('hosts.agentMethodBinaryDesc')
+    },
+    {
+      value: 'systemd' as const,
+      title: t('hosts.agentMethodSystemd'),
+      description: t('hosts.agentMethodSystemdDesc')
+    }
+  ]);
+
+  const agentSetupSnippets = computed<Record<AgentSetupMethod, { title: string; description: string; code: string }>>(() => ({
+    compose: {
+      title: t('hosts.agentMethodCompose'),
+      description: t('hosts.agentMethodComposeDesc'),
+      code: agentComposeSetup.value
+    },
+    docker: {
+      title: t('hosts.agentMethodDocker'),
+      description: t('hosts.agentMethodDockerDesc'),
+      code: agentDockerCommand.value
+    },
+    binary: {
+      title: t('hosts.agentMethodBinary'),
+      description: t('hosts.agentMethodBinaryDesc'),
+      code: agentBinaryCommand.value
+    },
+    systemd: {
+      title: t('hosts.agentMethodSystemd'),
+      description: t('hosts.agentMethodSystemdDesc'),
+      code: agentSystemdTimer.value
+    }
+  }));
+
+  const selectedAgentSetupSnippet = computed(() => agentSetupSnippets.value[agentSetupMethod.value]);
 
   watch(hosts, (nextHosts) => {
     if (nextHosts.length === 0) {
@@ -355,7 +478,7 @@ export function useBackupApp() {
   });
 
   watch(hostSourceType, (nextSourceType) => {
-    if (nextSourceType === 'agent') hostAddress.value = '';
+    if (['agent', 'local'].includes(nextSourceType)) hostAddress.value = '';
     if (['agent', 'local'].includes(nextSourceType)) {
       hostCredentialId.value = '';
       return;
@@ -768,12 +891,10 @@ export function useBackupApp() {
       actionMessage.value = t('message.credentialCreated');
       showCredentialCreate.value = false;
       credentialName.value = '';
-      credentialAddress.value = '';
       credentialUsername.value = '';
       credentialPassword.value = '';
       credentialPrivateKey.value = '';
       credentialBearerToken.value = '';
-      credentialSubject.value = '';
       await refresh();
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err);
@@ -794,7 +915,7 @@ export function useBackupApp() {
         name,
         source_type: sourceType
       };
-      if (sourceType !== 'agent') {
+      if (!['agent', 'local'].includes(sourceType)) {
         payload.address = hostAddress.value.trim();
       }
       if (!['agent', 'local'].includes(sourceType)) {
@@ -804,7 +925,6 @@ export function useBackupApp() {
       selectedHostId.value = created.host.id;
       if (sourceType === 'agent') {
         agentSetupHostName.value = name;
-        if (agentSetupJobName.value.trim() === '') agentSetupJobName.value = `${name}-backup`;
         agentCredentialClientId.value = created.agent?.client_id ?? created.host.agent?.client_id ?? '';
         agentCredentialSecret.value = created.agent?.client_secret ?? created.host.agent?.client_secret ?? '';
         actionMessage.value = t('message.agentClientCreated');
@@ -1068,17 +1188,14 @@ export function useBackupApp() {
     selectedHostId,
     agentSetupHostName,
     agentSetupSourceDir,
-    agentSetupRoot,
-    agentSetupJobName,
+    agentSetupMethod,
     copyActionMessage,
     credentialName,
     credentialType,
-    credentialAddress,
     credentialUsername,
     credentialPassword,
     credentialPrivateKey,
     credentialBearerToken,
-    credentialSubject,
     credentialExplicitTLS,
     credentialSkipTLSVerify,
     showCredentialCreate,
@@ -1086,10 +1203,8 @@ export function useBackupApp() {
     agentCredentialClientId,
     agentCredentialSecret,
     jobName,
-    jobSourceType,
     jobRoot,
     jobHostId,
-    jobCredentialId,
     jobSchedule,
     jobTimezone,
     jobMaxRuntimeSeconds,
@@ -1143,7 +1258,12 @@ export function useBackupApp() {
     agentSetupClientId,
     agentSetupClientSecret,
     agentComposeEnv,
+    agentComposeSetup,
     agentDockerCommand,
+    agentBinaryCommand,
+    agentSystemdTimer,
+    agentSetupMethods,
+    selectedAgentSetupSnippet,
     refresh,
     checkSession,
     login,

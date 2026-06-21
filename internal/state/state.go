@@ -669,6 +669,7 @@ var schema = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_agent_credentials_client_id ON agent_credentials(client_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_jobs_host_id ON jobs(host_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_agent_host_id ON jobs(host_id) WHERE source_type = 'agent' AND host_id IS NOT NULL`,
 	`CREATE INDEX IF NOT EXISTS idx_hosts_credential_id ON hosts(credential_id)`,
 	`CREATE TABLE IF NOT EXISTS runs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

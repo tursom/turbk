@@ -42,20 +42,26 @@ curl -b /tmp/turbk.cookie -X PATCH http://localhost:8080/api/v1/settings \
   --data '{"admin_username":"operator","current_password":"admin","admin_password":"new-admin-secret","session_ttl_hours":12,"retention":{"keep_last":30,"keep_daily":30,"keep_weekly":12}}'
 ```
 
-创建手工管理的主机记录：
+下面示例里的 `credential_id`、`host_id` 需要替换为上一步 API 返回的实际 ID，数字只用于展示字段位置。
 
-```bash
-curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
-  -H 'Content-Type: application/json' \
-  --data '{"name":"sftp-prod","source_type":"sftp","address":"10.0.0.10:22"}'
-```
-
-创建 Agent 客户端凭据。`client_secret` 会加密保存，之后也可以在 Credentials 页面或凭据列表 API 中查看：
+创建一个 Pull 凭据和主机记录。凭据只保存认证材料，主机保存上游地址并绑定凭据：
 
 ```bash
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/credentials \
   -H 'Content-Type: application/json' \
-  --data '{"name":"agent-dev","type":"agent","payload":{"subject":"dev-host"}}'
+  --data '{"name":"sftp-prod-login","type":"sftp","payload":{"username":"root","password":"secret"}}'
+
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"sftp-prod","source_type":"sftp","address":"10.0.0.10:22","credential_id":1}'
+```
+
+创建 Agent 主机。服务端会同时生成 Client ID 和 Secret；客户端凭据不出现在 Credentials 页面，只在对应 Host 详情中管理：
+
+```bash
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"dev-host","source_type":"agent"}'
 ```
 
 Agent 心跳 smoke test：
@@ -68,7 +74,7 @@ go run ./cmd/turbk-agent \
   -once
 ```
 
-Agent 心跳会同步更新 Hosts 页中的 `agent` 主机状态，`name` 使用凭据 subject，`address` 使用 agent 上报的 hostname。
+Agent 心跳会更新对应 Host 的状态、最后心跳时间和 `address`，其中 `address` 使用 agent 上报的 hostname。
 
 Agent Push 备份：
 
@@ -78,16 +84,19 @@ go run ./cmd/turbk-agent \
   -client-id "$TURBK_AGENT_ID" \
   -client-secret "$TURBK_AGENT_SECRET" \
   -root /data/source \
-  -job-name "agent dev /data/source" \
   -once
 ```
 
-创建并运行一个本地备份任务：
+创建并运行一个本地备份任务。本地来源也先创建 Host，具体备份路径放在 Job 的 `source_config.root`：
 
 ```bash
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"server-local","source_type":"local"}'
+
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs \
   -H 'Content-Type: application/json' \
-  --data '{"name":"local demo","source_type":"local","source_config":{"root":"/data/source"},"enabled":true}'
+  --data '{"name":"local demo","host_id":2,"source_config":{"root":"/data/source"},"enabled":true}'
 
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs/1/run
 ```
@@ -99,10 +108,10 @@ curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs/1/run
 ```bash
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs \
   -H 'Content-Type: application/json' \
-  --data '{"name":"nightly local","source_type":"local","source_config":{"root":"/data/source"},"enabled":true,"schedule":"0 2 * * *","timezone":"Asia/Shanghai","max_runtime_seconds":7200,"retry_attempts":2}'
+  --data '{"name":"nightly local","host_id":2,"source_config":{"root":"/data/source"},"enabled":true,"schedule":"0 2 * * *","timezone":"Asia/Shanghai","max_runtime_seconds":7200,"retry_attempts":2}'
 ```
 
-服务端内置调度器每 30 秒检查一次 due job，同一 job 同一时间只允许一个 active run，失败后会在同一个 cron 命中窗口内按 `retry_attempts` 补跑。`max_runtime_seconds` 为 0 表示不限制运行时长，`retry_attempts` 为 0 表示失败不自动重试。Agent job 仍由 `turbk-agent` 主动发起。
+服务端内置调度器每 30 秒检查一次 due job，同一 job 同一时间只允许一个 active run，失败后会在同一个 cron 命中窗口内按 `retry_attempts` 补跑。`max_runtime_seconds` 为 0 表示不限制运行时长，`retry_attempts` 为 0 表示失败不自动重试。Agent job 与 Agent host 一对一绑定，仍由 `turbk-agent` 主动发起。
 
 更新任务调度或启停状态：
 
@@ -112,26 +121,34 @@ curl -b /tmp/turbk.cookie -X PATCH http://localhost:8080/api/v1/jobs/1 \
   --data '{"enabled":false,"schedule":"","timezone":"Asia/Shanghai","max_runtime_seconds":0,"retry_attempts":0}'
 ```
 
-创建一个 SFTP Pull 凭据和任务：
+创建一个 SFTP Pull 凭据、主机和任务：
 
 ```bash
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/credentials \
   -H 'Content-Type: application/json' \
-  --data '{"name":"sftp-prod","type":"sftp","payload":{"address":"10.0.0.10:22","username":"root","password":"secret"}}'
+  --data '{"name":"sftp-prod-login","type":"sftp","payload":{"username":"root","password":"secret"}}'
+
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"sftp-prod","source_type":"sftp","address":"10.0.0.10:22","credential_id":1}'
 
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/jobs \
   -H 'Content-Type: application/json' \
-  --data '{"name":"sftp pull","source_type":"sftp","credential_id":1,"source_config":{"root":"/srv/data"},"enabled":true}'
+  --data '{"name":"sftp pull","host_id":1,"source_config":{"root":"/srv/data"},"enabled":true}'
 ```
 
-凭据 payload 会在 SQLite 中以 AES-256-GCM 加密保存。Pull 凭据列表只返回元数据；Agent 凭据会额外返回 `client_id` 和可重复查看的 `client_secret`，用于客户端配置。
+凭据 payload 会在 SQLite 中以 AES-256-GCM 加密保存。Pull 凭据列表只返回元数据；Agent 凭据由 Host 创建流程生成，并在对应 Host 详情中展示 `client_id` 和可重复查看的 `client_secret`。
 
 FTP/FTPS Pull 凭据使用相同的凭据 API。FTPS 可按服务端类型选择显式 TLS，并在自签证书环境中临时跳过证书校验：
 
 ```bash
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/credentials \
   -H 'Content-Type: application/json' \
-  --data '{"name":"ftps-prod","type":"ftps","payload":{"address":"10.0.0.20:21","username":"backup","password":"secret","tls":true,"explicit_tls":true,"skip_tls_verify":true}}'
+  --data '{"name":"ftps-prod-login","type":"ftps","payload":{"username":"backup","password":"secret","tls":true,"explicit_tls":true,"skip_tls_verify":true}}'
+
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/hosts \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"ftps-prod","source_type":"ftps","address":"10.0.0.20:21","credential_id":3}'
 ```
 
 执行仓库维护和保留策略：
@@ -271,6 +288,8 @@ docker compose run --rm turbk-agent
 ```
 
 agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 agent 是一次性执行模型；需要定时备份时，在被备份主机上用 cron 或 systemd timer 定时运行 `docker compose run --rm turbk-agent`。
+
+Web UI 的主机详情页会为 Agent 主机生成多种接入方式：Docker Compose、Docker run、Linux 二进制和 systemd timer。推荐优先从页面复制对应配置，避免手工拼写 Client ID、Secret 和服务端地址。
 
 ## 开发验证
 
