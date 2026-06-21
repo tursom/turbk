@@ -26,7 +26,7 @@ go run ./cmd/turbk -config configs/turbk.example.yaml
 - Health API: `http://localhost:8080/api/v1/health`
 - Storage API: `http://localhost:8080/api/v1/storage/health`
 
-管理后台默认账号为 `admin` / `admin`，生产部署应通过 `TURBK_ADMIN_USERNAME`、`TURBK_ADMIN_PASSWORD` 和 `TURBK_SESSION_TTL_HOURS` 覆盖。命令行访问管理 API 时先登录保存 Cookie：
+管理后台默认账号为 `admin` / `admin`，生产部署应在配置文件的 `auth` 段修改 `username`、`password` 和 `session_ttl_hours`。命令行访问管理 API 时先登录保存 Cookie：
 
 ```bash
 curl -c /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/auth/login \
@@ -184,7 +184,9 @@ curl -b /tmp/turbk.cookie http://localhost:8080/api/v1/runs/1/logs
 
 ```bash
 cp .env.example .env
-# 修改 .env 中的 TURBK_ADMIN_PASSWORD 等部署参数
+cp deploy/server/config.example.yaml config.yaml
+# 修改 config.yaml 中的 auth.password、server.public_url 和仓库参数
+# 按需修改 .env 中的 TURBK_HTTP_PORT 与宿主机挂载目录
 docker compose build
 docker compose up -d
 ```
@@ -200,18 +202,43 @@ docker compose up -d
 
 ```bash
 cp .env.example .env
-# 修改 .env 中的 TURBK_ADMIN_PASSWORD 等部署参数
+cp deploy/server/config.example.yaml config.yaml
+# 修改 config.yaml 中的 auth.password、server.public_url 和仓库参数
+# 按需修改 .env 中的 TURBK_HTTP_PORT 与宿主机挂载目录
 docker compose pull
 docker compose up -d --no-build
 ```
 
 GitHub Actions 会在 push 和 tag 时构建并推送服务端镜像 `ghcr.io/tursom/turbk` 和 agent 镜像 `ghcr.io/tursom/turbk-agent`；PR 只构建不推送。
 
-compose 默认绑定挂载：
+服务端应用配置默认来自根目录 `config.yaml`。先从 `deploy/server/config.example.yaml` 复制一份本地配置，Compose 会把它挂载到容器内 `/etc/turbk/config.yaml`，并以 `-config /etc/turbk/config.yaml` 启动。这个 YAML 覆盖完整应用配置：
 
+- `configs/turbk.example.yaml` 用于本地源码运行，路径默认是相对仓库目录。
+- `deploy/server/config.example.yaml` 用于 Docker 服务端部署，路径默认是容器内路径。
+
+- `server.listen`、`server.public_url`、`server.web_dir`
+- `auth.username`、`auth.password`、`auth.session_ttl_hours`
+- `paths.state_dir`、`paths.repo_dir`、`paths.restore_roots`
+- `repository.segment_size`、`repository.chunk_avg_size`、`repository.compression`、`repository.encryption`
+- `scheduler.timezone`、`scheduler.max_concurrent_runs`
+- `retention.keep_last`、`retention.keep_daily`、`retention.keep_weekly`
+
+`.env` 只保留 Compose 层参数，例如镜像 tag、宿主机端口、构建参数和宿主机目录。默认绑定挂载：
+
+- `${TURBK_CONFIG_FILE:-./config.yaml}` -> `/etc/turbk/config.yaml`
 - `${TURBK_STATE_DIR:-./data/state}` -> `/var/lib/turbk/state`
 - `${TURBK_REPO_DIR:-./data/repo}` -> `/var/lib/turbk/repo`
 - `${TURBK_RESTORE_DIR:-./data/restore}` -> `/var/lib/turbk/restore`
+
+注意区分两层路径：`.env` 中的 `TURBK_STATE_DIR`、`TURBK_REPO_DIR`、`TURBK_RESTORE_DIR` 是宿主机路径；`config.yaml` 中的 `paths.*` 是容器内路径，通常保持 `/var/lib/turbk/...`。
+
+主机管理 SMR 磁盘建议把 `repository.segment_size` 设置为 zone size。若 `lsblk` 显示 `ZONE-SZ=256M`，配置为：
+
+```yaml
+repository:
+  segment_size: "256MiB"
+  chunk_avg_size: "1MiB"
+```
 
 如果要让容器内的 `local` 备份任务读取宿主机目录，需要在 `docker-compose.yml` 的 `volumes` 中额外挂载源目录，例如：
 
@@ -221,7 +248,7 @@ compose 默认绑定挂载：
 
 容器默认以 `root` 运行，便于读写宿主机挂载进来的备份源、仓库盘和恢复目录。
 镜像 runtime 使用 `alpine:3.22`，构建阶段使用 `golang:1.26-alpine` 和 `node:22-alpine`。
-部署时必须覆盖 `TURBK_ADMIN_PASSWORD`，不要沿用开发默认密码。
+部署时必须修改 `config.yaml` 里的 `auth.password`，不要沿用示例密码。
 
 ## Agent Docker
 

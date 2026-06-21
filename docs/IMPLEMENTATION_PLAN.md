@@ -504,6 +504,12 @@ compact 会产生顺序读和顺序写，必须作为维护窗口任务运行，
 server:
   listen: ":8080"
   public_url: "https://backup.example.com"
+  web_dir: "/app/web/dist"
+
+auth:
+  username: "admin"
+  password: "change-me"
+  session_ttl_hours: 24
 
 paths:
   state_dir: "/var/lib/turbk/state"

@@ -25,18 +25,12 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata \
- && mkdir -p /var/lib/turbk/state /var/lib/turbk/repo /var/lib/turbk/restore /app/web/dist
+ && mkdir -p /etc/turbk /var/lib/turbk/state /var/lib/turbk/repo /var/lib/turbk/restore /app/web/dist
 COPY --from=go-build /out/turbk /usr/local/bin/turbk
 COPY --from=web-build /src/web/dist /app/web/dist
+COPY deploy/server/config.example.yaml /etc/turbk/config.yaml
 
 USER root
 EXPOSE 8080
-ENV TURBK_LISTEN=:8080 \
-    TURBK_PUBLIC_URL=http://localhost:8080 \
-    TURBK_WEB_DIR=/app/web/dist \
-    TURBK_ADMIN_USERNAME=admin \
-    TURBK_SESSION_TTL_HOURS=24 \
-    TURBK_STATE_DIR=/var/lib/turbk/state \
-    TURBK_REPO_DIR=/var/lib/turbk/repo \
-    TURBK_RESTORE_ROOTS=/var/lib/turbk/restore
 ENTRYPOINT ["/usr/local/bin/turbk"]
+CMD ["-config", "/etc/turbk/config.yaml"]

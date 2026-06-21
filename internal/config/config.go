@@ -179,6 +179,8 @@ func applyEnv(c *Config) {
 	}
 	applyString("TURBK_SEGMENT_SIZE", &c.Repository.SegmentSize)
 	applyString("TURBK_CHUNK_AVG_SIZE", &c.Repository.ChunkAvgSize)
+	applyString("TURBK_COMPRESSION", &c.Repository.Compression)
+	applyString("TURBK_ENCRYPTION", &c.Repository.Encryption)
 	applyString("TURBK_TIMEZONE", &c.Scheduler.Timezone)
 	applyInt("TURBK_MAX_CONCURRENT_RUNS", &c.Scheduler.MaxConcurrentRuns)
 	applyInt("TURBK_KEEP_LAST", &c.Retention.KeepLast)
