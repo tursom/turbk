@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/tursom/turbk/internal/fsfilter"
 )
 
 type Local struct{}
@@ -17,6 +19,10 @@ func NewLocal() *Local {
 
 func (l *Local) Walk(ctx context.Context, root string, fn func(Entry) error) error {
 	root = filepath.Clean(root)
+	if fsName, ok, err := fsfilter.PseudoFilesystemName(root); err == nil && ok {
+		return fmt.Errorf("root %q is on unsupported pseudo filesystem %s", root, fsName)
+	}
+	scanOptions := fsfilter.Options{SkipPseudoFilesystems: true}
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -27,6 +33,12 @@ func (l *Local) Walk(ctx context.Context, root string, fn func(Entry) error) err
 		info, err := os.Lstat(path)
 		if err != nil {
 			return fmt.Errorf("stat local path %q: %w", path, err)
+		}
+		if _, skip := fsfilter.ShouldSkip(root, path, info, scanOptions); skip {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		entry := Entry{
 			Path:    filepath.ToSlash(filepath.Clean(path)),

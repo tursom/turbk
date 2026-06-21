@@ -38,3 +38,15 @@ retention:
   keep_last: 30
   keep_daily: 30
   keep_weekly: 12
+
+maintenance:
+  enabled: true
+  timezone: "Asia/Shanghai"
+  cleanup_schedule: "0 3 * * *"
+  compact_enabled: true
+  compact_schedule: "30 3 * * 0"
+  error_grace_period: "24h"
+  stale_run_after: "6h"
+  keep_deleted_metadata_days: 30
+  compact_min_reclaim_ratio: 0.15
+  compact_min_reclaim_bytes: "1GiB"

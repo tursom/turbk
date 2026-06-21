@@ -419,6 +419,57 @@ func TestScheduledJobRetriesFailedRunsWithinLimit(t *testing.T) {
 	}
 }
 
+func TestScheduledMaintenanceRecordsCleanupAndCompactSkip(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Maintenance.CleanupSchedule = "* * * * *"
+	cfg.Maintenance.CompactSchedule = "* * * * *"
+	cfg.Maintenance.CompactMinReclaimRatio = 1
+	cfg.Maintenance.CompactMinReclaimBytes = "1TiB"
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := New(cfg, store, repo, nil)
+	now := time.Date(2026, 6, 21, 3, 30, 0, 0, time.UTC)
+	if scheduled := server.runDueMaintenance(context.Background(), now); scheduled != 2 {
+		t.Fatalf("scheduled maintenance = %d, want cleanup and compact", scheduled)
+	}
+	if scheduled := server.runDueMaintenance(context.Background(), now); scheduled != 0 {
+		t.Fatalf("same-minute scheduled maintenance = %d, want 0", scheduled)
+	}
+	waitFor(t, time.Second, func() bool {
+		runs, err := store.ListMaintenanceRuns(context.Background(), 10)
+		if err != nil || len(runs) < 3 {
+			return false
+		}
+		seenRetention := false
+		seenCleanup := false
+		seenCompactSkip := false
+		for _, run := range runs {
+			switch run.Mode {
+			case "retention":
+				seenRetention = run.Status == "completed"
+			case "cleanup-errors":
+				seenCleanup = run.Status == "completed"
+			case "compact":
+				seenCompactSkip = run.Status == "skipped" && run.SkippedReason.String == "compact reclaim threshold not met"
+			}
+		}
+		return seenRetention && seenCleanup && seenCompactSkip
+	})
+}
+
 func TestStorageMaintenanceExpiresOldSnapshotsAndReportsUtilization(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -536,6 +587,13 @@ func TestStorageMaintenanceExpiresOldSnapshotsAndReportsUtilization(t *testing.T
 	if report.Verify.VerifiedChunks == 0 || report.Verify.MissingIndex != 0 || report.Verify.CorruptChunks != 0 || len(report.Verify.Errors) != 0 {
 		t.Fatalf("unexpected clean verify report: %+v", report.Verify)
 	}
+	snapshots, err = store.ListSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 1 || snapshots[0].Health != "healthy" || !snapshots[0].VerifiedAt.Valid {
+		t.Fatalf("clean verify did not mark snapshot healthy: %+v", snapshots)
+	}
 	status, body = postJSONAuthed(t, server.URL+"/api/v1/storage/maintenance", cookie, map[string]any{"mode": "compact"})
 	if status != http.StatusOK {
 		t.Fatalf("compact status = %d body=%s", status, string(body))
@@ -598,6 +656,169 @@ func TestStorageMaintenanceExpiresOldSnapshotsAndReportsUtilization(t *testing.T
 	}
 	if report.Verify.CorruptChunks == 0 || len(report.Verify.Errors) == 0 {
 		t.Fatalf("corrupt verify report did not flag errors: %+v", report.Verify)
+	}
+	snapshots, err = store.ListSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 1 || snapshots[0].Health != "corrupt" || !snapshots[0].HealthMessage.Valid {
+		t.Fatalf("corrupt verify did not mark snapshot corrupt: %+v", snapshots)
+	}
+}
+
+func TestSnapshotDeleteAPISoftDeletesAndIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+
+	snapshot, err := store.CreateSnapshot(context.Background(), state.CreateSnapshotInput{
+		SourceType:  "local",
+		ManifestRef: "delete-api",
+		FileCount:   1,
+		TotalSize:   128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateRestoreTask(context.Background(), state.CreateRestoreTaskInput{
+		SnapshotID: snapshot.ID,
+		TargetPath: filepath.Join(cfg.Paths.RestoreRoots[0], "target"),
+		Status:     "running",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteURL := server.URL + "/api/v1/snapshots/" + strconv.FormatInt(snapshot.ID, 10)
+	status, body := requestJSONAuthed(t, http.MethodDelete, deleteURL, cookie, nil)
+	if status != http.StatusConflict {
+		t.Fatalf("delete active restore snapshot status = %d body=%s", status, string(body))
+	}
+	if _, err := store.UpdateRestoreTaskStatus(context.Background(), task.ID, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAuthed(t, http.MethodDelete, deleteURL, cookie, nil)
+	if status != http.StatusOK {
+		t.Fatalf("delete snapshot status = %d body=%s", status, string(body))
+	}
+	if !bytes.Contains(body, []byte(`"status":"deleted"`)) || !bytes.Contains(body, []byte(`"requires_compact":true`)) {
+		t.Fatalf("delete response missing deletion status or compact hint: %s", string(body))
+	}
+	status, body = getAuthed(t, server.URL+"/api/v1/snapshots", cookie)
+	if status != http.StatusOK {
+		t.Fatalf("list snapshots status = %d body=%s", status, string(body))
+	}
+	if !bytes.Contains(body, []byte(`"snapshots":[]`)) {
+		t.Fatalf("deleted snapshot still visible: %s", string(body))
+	}
+	status, body = requestJSONAuthed(t, http.MethodDelete, deleteURL, cookie, nil)
+	if status != http.StatusOK {
+		t.Fatalf("idempotent delete status = %d body=%s", status, string(body))
+	}
+	if !bytes.Contains(body, []byte(`"deleted":false`)) {
+		t.Fatalf("idempotent delete did not report deleted=false: %s", string(body))
+	}
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/snapshots/delete", cookie, map[string]any{"snapshot_ids": []int64{snapshot.ID, 999999}})
+	if status != http.StatusOK {
+		t.Fatalf("batch delete status = %d body=%s", status, string(body))
+	}
+	if !bytes.Contains(body, []byte(`"results"`)) || !bytes.Contains(body, []byte(`snapshot 999999 not found`)) {
+		t.Fatalf("batch delete did not include partial failure: %s", string(body))
+	}
+}
+
+func TestCleanupErrorsRemovesOrphanChunkAndManifest(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Maintenance.ErrorGracePeriod = "0s"
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	if _, existed, err := repo.PutChunk(context.Background(), []byte("orphan chunk")); err != nil {
+		t.Fatal(err)
+	} else if existed {
+		t.Fatal("unexpected duplicate orphan chunk")
+	}
+	manifestID := "orphan-cleanup"
+	if err := repo.WriteManifest(&repository.SnapshotManifest{
+		ID:         manifestID,
+		CreatedAt:  time.Now().Add(-time.Hour).UTC(),
+		SourceType: "local",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(cfg.Paths.StateDir, "manifests", manifestID+".json")
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(manifestPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/storage/maintenance", cookie, map[string]any{"mode": "cleanup-errors"})
+	if status != http.StatusOK {
+		t.Fatalf("cleanup-errors status = %d body=%s", status, string(body))
+	}
+	var report struct {
+		Cleanup struct {
+			RemovedChunks        int64 `json:"removed_chunks"`
+			RemovedManifests     int   `json:"removed_manifests"`
+			RemovedManifestBytes int64 `json:"removed_manifest_bytes"`
+		} `json:"cleanup"`
+		Chunks struct {
+			Indexed int64 `json:"indexed"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Cleanup.RemovedChunks != 1 || report.Cleanup.RemovedManifests != 1 || report.Cleanup.RemovedManifestBytes == 0 || report.Chunks.Indexed != 0 {
+		t.Fatalf("unexpected cleanup report: %+v", report)
+	}
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan manifest still exists or stat failed with non-ENOENT: %v", err)
+	}
+	stats, err := repo.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Chunks != 0 {
+		t.Fatalf("orphan chunk index count = %d, want 0", stats.Chunks)
+	}
+	status, body = getAuthed(t, server.URL+"/api/v1/storage/maintenance/runs", cookie)
+	if status != http.StatusOK {
+		t.Fatalf("maintenance history status = %d body=%s", status, string(body))
+	}
+	if !bytes.Contains(body, []byte(`"mode":"cleanup-errors"`)) {
+		t.Fatalf("maintenance history missing cleanup run: %s", string(body))
 	}
 }
 

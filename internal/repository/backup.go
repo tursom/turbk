@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/source"
 )
 
@@ -32,6 +33,9 @@ func (r *Repository) BackupLocalTree(ctx context.Context, snapshotID, sourceType
 
 func (r *Repository) BackupLocalTreeIncremental(ctx context.Context, snapshotID, sourceType, root string, previous *SnapshotManifest, progressFn BackupProgressFunc) (*SnapshotManifest, error) {
 	root = filepath.Clean(root)
+	if fsName, ok, err := fsfilter.PseudoFilesystemName(root); err == nil && ok {
+		return nil, fmt.Errorf("root %q is on unsupported pseudo filesystem %s", root, fsName)
+	}
 	manifest := &SnapshotManifest{
 		ID:         snapshotID,
 		CreatedAt:  time.Now().UTC(),
@@ -44,6 +48,7 @@ func (r *Repository) BackupLocalTreeIncremental(ctx context.Context, snapshotID,
 	progress.Phase = "scanning"
 	reportBackupProgress(progressFn, progress)
 
+	scanOptions := fsfilter.Options{SkipPseudoFilesystems: true}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -54,6 +59,14 @@ func (r *Repository) BackupLocalTreeIncremental(ctx context.Context, snapshotID,
 		info, err := os.Lstat(path)
 		if err != nil {
 			return fmt.Errorf("stat %q: %w", path, err)
+		}
+		if event, skip := fsfilter.ShouldSkip(root, path, info, scanOptions); skip {
+			progress.Message = "skipped " + event.Rel + ": " + event.Reason
+			reportBackupProgress(progressFn, progress)
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {

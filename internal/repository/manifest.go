@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -144,6 +145,44 @@ func countManifests(stateDir string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func (r *Repository) DeleteManifestsExceptOlderThan(ctx context.Context, keep map[string]struct{}, cutoff time.Time) (int, int64, error) {
+	entries, err := os.ReadDir(manifestsDir(r.opts.StateDir))
+	if os.IsNotExist(err) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("list manifests: %w", err)
+	}
+	var removed int
+	var removedBytes int64
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return removed, removedBytes, err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if _, ok := keep[id]; ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return removed, removedBytes, fmt.Errorf("stat manifest %q: %w", entry.Name(), err)
+		}
+		if !cutoff.IsZero() && info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(manifestsDir(r.opts.StateDir), entry.Name())
+		if err := os.Remove(path); err != nil {
+			return removed, removedBytes, fmt.Errorf("delete manifest %q: %w", id, err)
+		}
+		removed++
+		removedBytes += info.Size()
+	}
+	return removed, removedBytes, nil
 }
 
 func cleanManifestPath(path string) string {

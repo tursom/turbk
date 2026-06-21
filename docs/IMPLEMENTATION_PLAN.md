@@ -300,11 +300,14 @@ compact 会产生顺序读和顺序写，必须作为维护窗口任务运行，
 - `GET /api/v1/runs`
 - `GET /api/v1/runs/:id/logs`
 - `GET /api/v1/snapshots`
+- `DELETE /api/v1/snapshots/:id`
+- `POST /api/v1/snapshots/delete`
 - `GET /api/v1/snapshots/:id/tree`
 - `GET /api/v1/snapshots/:id/files/*path`
 - `POST /api/v1/restore`
 - `GET /api/v1/restore/tasks`
 - `GET /api/v1/storage/health`
+- `GET /api/v1/storage/maintenance/runs`
 - `POST /api/v1/storage/maintenance`
 
 ### 10.2 Agent API
@@ -399,8 +402,10 @@ compact 会产生顺序读和顺序写，必须作为维护窗口任务运行，
 - 失败重试限制在同一个 cron 命中窗口内，已完成或仍有 active run 时不会重复触发。
 - 同一 job 的 active run 由状态层锁定；调度器额外受 `scheduler.max_concurrent_runs` 全局并发限制。
 - 保留策略通过 `deleted_at` 软删除过期 snapshot，不改写 segment。
-- `POST /api/v1/storage/maintenance` 支持 `retention`、`verify` 和 `compact`；retention 返回 segment 利用率、active/deleted snapshot 数量和 orphan chunk 估算，verify 只读校验 active manifest 引用的 chunk index 和 segment record，compact 在无 active run 时顺序重写 active chunk、更新 manifest/index 并删除不再引用的旧 segment。
+- `DELETE /api/v1/snapshots/:id` 和 `POST /api/v1/snapshots/delete` 支持手动软删除 snapshot；删除后恢复入口不再返回该 snapshot，物理空间由后续 compact 回收。
+- `POST /api/v1/storage/maintenance` 支持 `retention`、`verify`、`cleanup-errors`、`compact` 和 `full-cleanup`；retention 返回 segment 利用率、active/deleted snapshot 数量和 orphan chunk 估算，verify 只读校验 active manifest 引用的 chunk index 和 segment record，cleanup-errors 清理 stale run、orphan manifest 和 orphan chunk index，compact/full-cleanup 在无 active run 时顺序重写 active chunk、更新 manifest/index 并删除不再引用的旧 segment。
 - compact 与常规备份写入互斥：手动 run、定时 run、Agent run 创建和 Agent chunk 上传进入备份写入 gate；compact 进入维护 gate，发现已有备份写入或 active run 时跳过，避免维护窗口内混入新 segment 写入。
+- 自动维护默认启用：每天执行 retention + cleanup-errors，每周执行 compact；自动 compact 会在预计回收收益低于阈值时跳过并记录维护历史。
 
 验收：
 

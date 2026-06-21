@@ -352,3 +352,120 @@ func TestRetentionPolicyExpiresOlderSnapshots(t *testing.T) {
 		t.Fatalf("expired IDs = %+v, want [2 1]", expired)
 	}
 }
+
+func TestDeleteSnapshotSoftDeletesAndIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+
+	store, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	snapshot, err := store.CreateSnapshot(ctx, CreateSnapshotInput{
+		SourceType:  "local",
+		ManifestRef: "delete-test",
+		FileCount:   1,
+		TotalSize:   42,
+	})
+	if err != nil {
+		t.Fatalf("CreateSnapshot() error = %v", err)
+	}
+	task, err := store.CreateRestoreTask(ctx, CreateRestoreTaskInput{
+		SnapshotID: snapshot.ID,
+		TargetPath: filepath.Join(cfg.Paths.RestoreRoots[0], "target"),
+		Status:     "running",
+	})
+	if err != nil {
+		t.Fatalf("CreateRestoreTask() error = %v", err)
+	}
+	if _, _, err := store.DeleteSnapshot(ctx, DeleteSnapshotInput{ID: snapshot.ID}); !errors.Is(err, ErrSnapshotInUse) {
+		t.Fatalf("DeleteSnapshot() error = %v, want ErrSnapshotInUse", err)
+	}
+	if _, err := store.UpdateRestoreTaskStatus(ctx, task.ID, "completed"); err != nil {
+		t.Fatalf("UpdateRestoreTaskStatus() error = %v", err)
+	}
+	deletedAt := time.Date(2026, 6, 21, 3, 0, 0, 0, time.UTC)
+	deleted, changed, err := store.DeleteSnapshot(ctx, DeleteSnapshotInput{
+		ID:        snapshot.ID,
+		Reason:    "manual",
+		DeletedBy: "admin",
+		Now:       deletedAt,
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot() error = %v", err)
+	}
+	if !changed || !deleted.DeletedAt.Valid || !deleted.DeletedAt.Time.Equal(deletedAt) || deleted.DeleteReason.String != "manual" || deleted.DeletedBy.String != "admin" {
+		t.Fatalf("unexpected deleted snapshot: changed=%v snapshot=%+v", changed, deleted)
+	}
+	active, err := store.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots() error = %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active snapshots after delete = %+v, want empty", active)
+	}
+	again, changed, err := store.DeleteSnapshot(ctx, DeleteSnapshotInput{ID: snapshot.ID})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot(idempotent) error = %v", err)
+	}
+	if changed || !again.DeletedAt.Valid {
+		t.Fatalf("idempotent delete changed=%v snapshot=%+v", changed, again)
+	}
+}
+
+func TestMarkStaleRunsFailed(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+
+	store, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	host, err := store.CreateHost(ctx, CreateHostInput{Name: "local", SourceType: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.CreateJob(ctx, CreateJobInput{
+		Name:         "stale",
+		HostID:       host.ID,
+		SourceConfig: []byte(`{"root":"/tmp/source"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(ctx, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	if _, err := store.db.ExecContext(ctx, `UPDATE runs SET created_at = ? WHERE id = ?`, old, run.ID); err != nil {
+		t.Fatalf("backdate run: %v", err)
+	}
+	changed, err := store.MarkStaleRunsFailed(ctx, now.Add(-6*time.Hour), now.Add(-time.Hour), now)
+	if err != nil {
+		t.Fatalf("MarkStaleRunsFailed() error = %v", err)
+	}
+	if changed != 1 {
+		t.Fatalf("stale runs changed = %d, want 1", changed)
+	}
+	loaded, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != "failed" || !loaded.FinishedAt.Valid || loaded.ErrorMessage.String != "stale run expired by maintenance" {
+		t.Fatalf("unexpected stale run: %+v", loaded)
+	}
+}

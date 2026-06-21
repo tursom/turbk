@@ -28,15 +28,17 @@ import (
 )
 
 type Server struct {
-	cfg          config.Config
-	store        *state.Store
-	repo         *repository.Repository
-	logger       *slog.Logger
-	mux          *http.ServeMux
-	schedulerSem chan struct{}
-	runGate      sync.RWMutex
-	settingsMu   sync.RWMutex
-	settings     runtimeSettings
+	cfg             config.Config
+	store           *state.Store
+	repo            *repository.Repository
+	logger          *slog.Logger
+	mux             *http.ServeMux
+	schedulerSem    chan struct{}
+	runGate         sync.RWMutex
+	maintenanceMu   sync.Mutex
+	lastMaintenance map[string]time.Time
+	settingsMu      sync.RWMutex
+	settings        runtimeSettings
 }
 
 func New(cfg config.Config, store *state.Store, repo *repository.Repository, logger *slog.Logger) *Server {
@@ -48,13 +50,14 @@ func New(cfg config.Config, store *state.Store, repo *repository.Repository, log
 		maxScheduledRuns = 1
 	}
 	s := &Server{
-		cfg:          cfg,
-		store:        store,
-		repo:         repo,
-		logger:       logger,
-		mux:          http.NewServeMux(),
-		schedulerSem: make(chan struct{}, maxScheduledRuns),
-		settings:     loadRuntimeSettings(context.Background(), cfg, store, logger),
+		cfg:             cfg,
+		store:           store,
+		repo:            repo,
+		logger:          logger,
+		mux:             http.NewServeMux(),
+		schedulerSem:    make(chan struct{}, maxScheduledRuns),
+		lastMaintenance: make(map[string]time.Time),
+		settings:        loadRuntimeSettings(context.Background(), cfg, store, logger),
 	}
 	s.routes()
 	return s
@@ -84,12 +87,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/runs", s.handleRuns)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}/logs", s.handleRunLogs)
 	s.mux.HandleFunc("GET /api/v1/snapshots", s.handleSnapshots)
+	s.mux.HandleFunc("POST /api/v1/snapshots/delete", s.handleDeleteSnapshots)
+	s.mux.HandleFunc("DELETE /api/v1/snapshots/{id}", s.handleDeleteSnapshot)
 	s.mux.HandleFunc("GET /api/v1/snapshots/{id}/tree", s.handleSnapshotTree)
 	s.mux.HandleFunc("GET /api/v1/snapshots/{id}/files", s.handleSnapshotDownload)
 	s.mux.HandleFunc("GET /api/v1/snapshots/{id}/files/{path...}", s.handleSnapshotDownload)
 	s.mux.HandleFunc("GET /api/v1/restore/tasks", s.handleRestoreTasks)
 	s.mux.HandleFunc("POST /api/v1/restore", s.handleRestore)
 	s.mux.HandleFunc("GET /api/v1/storage/health", s.handleStorageHealth)
+	s.mux.HandleFunc("GET /api/v1/storage/maintenance/runs", s.handleMaintenanceRuns)
 	s.mux.HandleFunc("POST /api/v1/storage/maintenance", s.handleStorageMaintenance)
 	s.mux.HandleFunc("POST /agent/v1/heartbeat", s.handleAgentHeartbeat)
 	s.mux.HandleFunc("POST /agent/v1/runs", s.handleAgentCreateRun)
@@ -141,9 +147,10 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 			"repo_dir":      s.cfg.Paths.RepoDir,
 			"restore_roots": s.cfg.Paths.RestoreRoots,
 		},
-		"repository": s.cfg.Repository,
-		"scheduler":  s.cfg.Scheduler,
-		"retention":  settings.Retention,
+		"repository":  s.cfg.Repository,
+		"scheduler":   s.cfg.Scheduler,
+		"retention":   settings.Retention,
+		"maintenance": settings.Maintenance,
 		"auth": map[string]any{
 			"username":          settings.AuthUsername,
 			"session_ttl_hours": settings.SessionTTLHours,
@@ -663,6 +670,21 @@ func (s *Server) handleStorageHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	settings := s.currentSettings()
+	maintenanceLocation, err := time.LoadLocation(settings.Maintenance.Timezone)
+	if err != nil {
+		maintenanceLocation = time.Local
+	}
+	var nextCleanup any
+	if next, ok := nextCronTime(settings.Maintenance.CleanupSchedule, maintenanceLocation, time.Now().UTC()); ok {
+		nextCleanup = next
+	}
+	var nextCompact any
+	if settings.Maintenance.CompactEnabled {
+		if next, ok := nextCronTime(settings.Maintenance.CompactSchedule, maintenanceLocation, time.Now().UTC()); ok {
+			nextCompact = next
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
 		"repo": map[string]any{
@@ -690,6 +712,15 @@ func (s *Server) handleStorageHealth(w http.ResponseWriter, r *http.Request) {
 		},
 		"manifests": map[string]any{
 			"count": repoStats.ManifestCount,
+		},
+		"maintenance": map[string]any{
+			"enabled":          settings.Maintenance.Enabled,
+			"timezone":         settings.Maintenance.Timezone,
+			"cleanup_schedule": settings.Maintenance.CleanupSchedule,
+			"next_cleanup_at":  nextCleanup,
+			"compact_enabled":  settings.Maintenance.CompactEnabled,
+			"compact_schedule": settings.Maintenance.CompactSchedule,
+			"next_compact_at":  nextCompact,
 		},
 	})
 }

@@ -35,3 +35,9 @@ type Stats struct {
 	ManifestCount     int   `json:"manifest_count"`
 	AppendOnlyRecords bool  `json:"append_only_records"`
 }
+
+type CleanupStats struct {
+	Count           int64 `json:"count"`
+	LogicalBytes    int64 `json:"logical_bytes"`
+	CompressedBytes int64 `json:"compressed_bytes"`
+}

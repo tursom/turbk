@@ -7,6 +7,8 @@ import {
   type Health,
   type Host,
   type Job,
+  type MaintenanceSettings,
+  type MaintenanceRun,
   type RestoreResult,
   type RestoreTask,
   type Run,
@@ -66,7 +68,12 @@ export function useBackupApp() {
   const runs = ref<Run[]>([]);
   const snapshots = ref<Snapshot[]>([]);
   const restoreTasks = ref<RestoreTask[]>([]);
+  const maintenanceRuns = ref<MaintenanceRun[]>([]);
   const selectedSnapshot = ref<Snapshot | null>(null);
+  const selectedSnapshotIds = ref<number[]>([]);
+  const snapshotDeleteTarget = ref<Snapshot | null>(null);
+  const snapshotDeleteMany = ref(false);
+  const deletingSnapshots = ref(false);
   const snapshotTreePath = ref('.');
   const snapshotTreeEntries = ref<SnapshotTreeEntry[]>([]);
   const hostName = ref('');
@@ -136,6 +143,16 @@ export function useBackupApp() {
   const settingsKeepLast = ref(30);
   const settingsKeepDaily = ref(30);
   const settingsKeepWeekly = ref(12);
+  const settingsMaintenanceEnabled = ref(true);
+  const settingsMaintenanceTimezone = ref('Asia/Shanghai');
+  const settingsCleanupSchedule = ref('0 3 * * *');
+  const settingsCompactEnabled = ref(true);
+  const settingsCompactSchedule = ref('30 3 * * 0');
+  const settingsErrorGracePeriod = ref('24h');
+  const settingsStaleRunAfter = ref('6h');
+  const settingsKeepDeletedMetadataDays = ref(30);
+  const settingsCompactMinReclaimRatio = ref(0.15);
+  const settingsCompactMinReclaimBytes = ref('1GiB');
   const savingSettings = ref(false);
 
   const activeMeta = computed(() => pages.find((page) => page.key === activePage.value) ?? pages[0]);
@@ -168,6 +185,18 @@ export function useBackupApp() {
         keep_last: value.retention?.keep_last ?? 30,
         keep_daily: value.retention?.keep_daily ?? 30,
         keep_weekly: value.retention?.keep_weekly ?? 12
+      },
+      maintenance: {
+        enabled: value.maintenance?.enabled ?? true,
+        timezone: value.maintenance?.timezone ?? 'Asia/Shanghai',
+        cleanup_schedule: value.maintenance?.cleanup_schedule ?? '0 3 * * *',
+        compact_enabled: value.maintenance?.compact_enabled ?? true,
+        compact_schedule: value.maintenance?.compact_schedule ?? '30 3 * * 0',
+        error_grace_period: value.maintenance?.error_grace_period ?? '24h',
+        stale_run_after: value.maintenance?.stale_run_after ?? '6h',
+        keep_deleted_metadata_days: value.maintenance?.keep_deleted_metadata_days ?? 30,
+        compact_min_reclaim_ratio: value.maintenance?.compact_min_reclaim_ratio ?? 0.15,
+        compact_min_reclaim_bytes: value.maintenance?.compact_min_reclaim_bytes ?? '1GiB'
       }
     };
   }
@@ -492,10 +521,11 @@ export function useBackupApp() {
     loading.value = true;
     error.value = '';
     try {
-      const [nextHealth, nextBootstrap, nextStorage, hostResp, credentialResp, jobResp, runResp, snapshotResp, restoreTaskResp] = await Promise.all([
+      const [nextHealth, nextBootstrap, nextStorage, maintenanceRunResp, hostResp, credentialResp, jobResp, runResp, snapshotResp, restoreTaskResp] = await Promise.all([
         api.health(),
         api.bootstrap(),
         api.storageHealth(),
+        api.maintenanceRuns(),
         api.hosts(),
         api.credentials(),
         api.jobs(),
@@ -508,11 +538,18 @@ export function useBackupApp() {
       bootstrap.value = normalizedBootstrap;
       hydrateSettingsForm(normalizedBootstrap);
       storageHealth.value = nextStorage;
+      maintenanceRuns.value = arrayOrEmpty(maintenanceRunResp.runs);
       hosts.value = arrayOrEmpty(hostResp.hosts);
       credentials.value = arrayOrEmpty(credentialResp.credentials);
       jobs.value = arrayOrEmpty(jobResp.jobs);
       runs.value = arrayOrEmpty(runResp.runs);
       snapshots.value = arrayOrEmpty(snapshotResp.snapshots);
+      selectedSnapshotIds.value = selectedSnapshotIds.value.filter((id) => snapshots.value.some((snapshot) => snapshot.id === id));
+      if (selectedSnapshot.value && !snapshots.value.some((snapshot) => snapshot.id === selectedSnapshot.value?.id)) {
+        selectedSnapshot.value = null;
+        snapshotTreeEntries.value = [];
+        snapshotTreePath.value = '.';
+      }
       restoreTasks.value = arrayOrEmpty(restoreTaskResp.tasks);
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err);
@@ -779,6 +816,9 @@ export function useBackupApp() {
   function compactSkippedText(reason?: string | null) {
     if (!reason) return '-';
     if (reason === 'active runs exist') return t('message.activeRunsExist');
+    if (reason === 'backup or chunk upload in progress') return t('message.backupWriteBusy');
+    if (reason === 'active manifest errors exist') return t('message.activeManifestErrors');
+    if (reason === 'compact reclaim threshold not met') return t('message.compactThresholdNotMet');
     return reason;
   }
 
@@ -788,6 +828,18 @@ export function useBackupApp() {
     settingsKeepLast.value = positiveInt(nextBootstrap.retention.keep_last, 30);
     settingsKeepDaily.value = nonNegativeInt(nextBootstrap.retention.keep_daily);
     settingsKeepWeekly.value = nonNegativeInt(nextBootstrap.retention.keep_weekly);
+    settingsMaintenanceEnabled.value = nextBootstrap.maintenance.enabled;
+    settingsMaintenanceTimezone.value = nextBootstrap.maintenance.timezone || 'Asia/Shanghai';
+    settingsCleanupSchedule.value = nextBootstrap.maintenance.cleanup_schedule || '0 3 * * *';
+    settingsCompactEnabled.value = nextBootstrap.maintenance.compact_enabled;
+    settingsCompactSchedule.value = nextBootstrap.maintenance.compact_schedule || '30 3 * * 0';
+    settingsErrorGracePeriod.value = nextBootstrap.maintenance.error_grace_period || '24h';
+    settingsStaleRunAfter.value = nextBootstrap.maintenance.stale_run_after || '6h';
+    settingsKeepDeletedMetadataDays.value = nonNegativeInt(nextBootstrap.maintenance.keep_deleted_metadata_days);
+    settingsCompactMinReclaimRatio.value = Number.isFinite(nextBootstrap.maintenance.compact_min_reclaim_ratio)
+      ? nextBootstrap.maintenance.compact_min_reclaim_ratio
+      : 0.15;
+    settingsCompactMinReclaimBytes.value = nextBootstrap.maintenance.compact_min_reclaim_bytes || '1GiB';
   }
 
   function sourceRoot(job: Job) {
@@ -857,6 +909,63 @@ export function useBackupApp() {
     restoreSnapshotId.value = snapshot.id;
     restoreEntryPath.value = path;
     navigatePage('restore');
+  }
+
+  function toggleSnapshotSelection(snapshot: Snapshot, selected: boolean) {
+    if (selected) {
+      if (!selectedSnapshotIds.value.includes(snapshot.id)) selectedSnapshotIds.value = [...selectedSnapshotIds.value, snapshot.id];
+      return;
+    }
+    selectedSnapshotIds.value = selectedSnapshotIds.value.filter((id) => id !== snapshot.id);
+  }
+
+  function toggleAllSnapshots(selected: boolean) {
+    selectedSnapshotIds.value = selected ? snapshots.value.map((snapshot) => snapshot.id) : [];
+  }
+
+  function requestDeleteSnapshot(snapshot: Snapshot) {
+    snapshotDeleteTarget.value = snapshot;
+    snapshotDeleteMany.value = false;
+  }
+
+  function requestDeleteSelectedSnapshots() {
+    if (selectedSnapshotIds.value.length === 0) return;
+    snapshotDeleteTarget.value = null;
+    snapshotDeleteMany.value = true;
+  }
+
+  function cancelSnapshotDelete() {
+    snapshotDeleteTarget.value = null;
+    snapshotDeleteMany.value = false;
+  }
+
+  async function confirmSnapshotDelete() {
+    error.value = '';
+    actionMessage.value = '';
+    deletingSnapshots.value = true;
+    try {
+      if (snapshotDeleteMany.value) {
+        const ids = [...selectedSnapshotIds.value];
+        const result = await api.deleteSnapshots(ids);
+        const failed = result.results.filter((item) => item.status === 'error');
+        selectedSnapshotIds.value = [];
+        actionMessage.value =
+          failed.length > 0
+            ? t('message.snapshotsDeletedPartial', { count: result.results.length - failed.length, failed: failed.length })
+            : t('message.snapshotsDeleted', { count: result.results.length });
+      } else if (snapshotDeleteTarget.value) {
+        const target = snapshotDeleteTarget.value;
+        const result = await api.deleteSnapshot(target.id);
+        selectedSnapshotIds.value = selectedSnapshotIds.value.filter((id) => id !== target.id);
+        actionMessage.value = result.deleted ? t('message.snapshotDeleted', { id: target.id }) : t('message.snapshotAlreadyDeleted', { id: target.id });
+      }
+      cancelSnapshotDelete();
+      await refresh();
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : String(err);
+    } finally {
+      deletingSnapshots.value = false;
+    }
   }
 
   async function createCredential() {
@@ -1026,11 +1135,16 @@ export function useBackupApp() {
       maintenanceReport.value = await api.storageMaintenance(mode);
       if (mode === 'verify') {
         actionMessage.value = t('message.verifiedChunks', { count: maintenanceReport.value.verify.verified_chunks });
-      } else if (mode === 'compact') {
+      } else if (mode === 'compact' || mode === 'full-cleanup') {
         actionMessage.value =
           compactSkippedText(maintenanceReport.value.compact.skipped_reason) !== '-'
             ? compactSkippedText(maintenanceReport.value.compact.skipped_reason)
             : t('message.compactedChunks', { count: maintenanceReport.value.compact.rewritten_chunks });
+      } else if (mode === 'cleanup-errors') {
+        actionMessage.value = t('message.cleanupRemoved', {
+          chunks: maintenanceReport.value.cleanup.removed_chunks,
+          manifests: maintenanceReport.value.cleanup.removed_manifests
+        });
       } else {
         actionMessage.value = t('message.maintenanceExpired', { count: maintenanceReport.value.retention.expired_snapshots });
       }
@@ -1057,6 +1171,7 @@ export function useBackupApp() {
           keep_daily: number;
           keep_weekly: number;
         };
+        maintenance: MaintenanceSettings;
       } = {
         admin_username: settingsAdminUsername.value.trim(),
         session_ttl_hours: positiveInt(settingsSessionTTLHours.value, 24),
@@ -1064,6 +1179,18 @@ export function useBackupApp() {
           keep_last: positiveInt(settingsKeepLast.value, 30),
           keep_daily: nonNegativeInt(settingsKeepDaily.value),
           keep_weekly: nonNegativeInt(settingsKeepWeekly.value)
+        },
+        maintenance: {
+          enabled: settingsMaintenanceEnabled.value,
+          timezone: settingsMaintenanceTimezone.value.trim() || 'Asia/Shanghai',
+          cleanup_schedule: settingsCleanupSchedule.value.trim() || '0 3 * * *',
+          compact_enabled: settingsCompactEnabled.value,
+          compact_schedule: settingsCompactSchedule.value.trim() || '30 3 * * 0',
+          error_grace_period: settingsErrorGracePeriod.value.trim() || '24h',
+          stale_run_after: settingsStaleRunAfter.value.trim() || '6h',
+          keep_deleted_metadata_days: nonNegativeInt(settingsKeepDeletedMetadataDays.value),
+          compact_min_reclaim_ratio: Number(settingsCompactMinReclaimRatio.value),
+          compact_min_reclaim_bytes: settingsCompactMinReclaimBytes.value.trim() || '1GiB'
         }
       };
       if (settingsNewPassword.value !== '') {
@@ -1176,7 +1303,12 @@ export function useBackupApp() {
     runs,
     snapshots,
     restoreTasks,
+    maintenanceRuns,
     selectedSnapshot,
+    selectedSnapshotIds,
+    snapshotDeleteTarget,
+    snapshotDeleteMany,
+    deletingSnapshots,
     snapshotTreePath,
     snapshotTreeEntries,
     hostName,
@@ -1239,6 +1371,16 @@ export function useBackupApp() {
     settingsKeepLast,
     settingsKeepDaily,
     settingsKeepWeekly,
+    settingsMaintenanceEnabled,
+    settingsMaintenanceTimezone,
+    settingsCleanupSchedule,
+    settingsCompactEnabled,
+    settingsCompactSchedule,
+    settingsErrorGracePeriod,
+    settingsStaleRunAfter,
+    settingsKeepDeletedMetadataDays,
+    settingsCompactMinReclaimRatio,
+    settingsCompactMinReclaimBytes,
     savingSettings,
     counts,
     statRows,
@@ -1303,6 +1445,12 @@ export function useBackupApp() {
     snapshotDownloadURL,
     browseSnapshot,
     selectRestore,
+    toggleSnapshotSelection,
+    toggleAllSnapshots,
+    requestDeleteSnapshot,
+    requestDeleteSelectedSnapshots,
+    cancelSnapshotDelete,
+    confirmSnapshotDelete,
     createCredential,
     createHost,
     createJob,

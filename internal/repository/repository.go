@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/tursom/turbk/internal/config"
@@ -180,6 +181,12 @@ func (r *Repository) DeleteUnreferencedChunks(_ context.Context, keep map[string
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.index.DeleteUnreferenced(keep)
+}
+
+func (r *Repository) DeleteUnreferencedChunksOlderThan(_ context.Context, keep map[string]struct{}, cutoff time.Time) (CleanupStats, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.index.DeleteUnreferencedOlderThan(keep, cutoff)
 }
 
 func (r *Repository) DeleteSegmentsExcept(_ context.Context, keep map[int64]struct{}) (int, int64, error) {

@@ -10,6 +10,7 @@ import (
 )
 
 var ErrActiveRunExists = errors.New("active run already exists for job")
+var ErrSnapshotInUse = errors.New("snapshot is used by an active restore task")
 
 type CreateJobInput struct {
 	Name              string          `json:"name"`
@@ -41,6 +42,13 @@ type CreateSnapshotInput struct {
 	ManifestRef string
 	FileCount   int64
 	TotalSize   int64
+}
+
+type DeleteSnapshotInput struct {
+	ID        int64
+	Reason    string
+	DeletedBy string
+	Now       time.Time
 }
 
 type AgentJobInput struct {
@@ -421,6 +429,29 @@ func (s *Store) CountActiveRuns(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+func (s *Store) MarkStaleRunsFailed(ctx context.Context, cutoff, processStartedAt, now time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'failed', finished_at = ?, error_message = 'stale run expired by maintenance'
+		WHERE status IN ('pending', 'running')
+			AND created_at < ?
+			AND created_at < ?
+			AND NOT EXISTS (
+				SELECT 1
+				FROM run_progress
+				WHERE run_progress.run_id = runs.id
+					AND run_progress.updated_at >= ?
+			)`, now.UTC(), cutoff.UTC(), processStartedAt.UTC(), cutoff.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("mark stale runs failed: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("get stale run rows affected: %w", err)
+	}
+	return changed, nil
+}
+
 func (s *Store) MarkRunRunning(ctx context.Context, id int64, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE runs
@@ -579,12 +610,10 @@ func (s *Store) CreateSnapshot(ctx context.Context, input CreateSnapshotInput) (
 }
 
 func (s *Store) GetSnapshot(ctx context.Context, id int64) (Snapshot, error) {
-	var snapshot Snapshot
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at
+	snapshot, err := scanSnapshot(s.db.QueryRowContext(ctx, `
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
 		FROM snapshots
-		WHERE id = ?`, id).
-		Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt)
+		WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return Snapshot{}, fmt.Errorf("snapshot %d not found", id)
 	}
@@ -595,14 +624,12 @@ func (s *Store) GetSnapshot(ctx context.Context, id int64) (Snapshot, error) {
 }
 
 func (s *Store) GetSnapshotByRun(ctx context.Context, runID int64) (Snapshot, bool, error) {
-	var snapshot Snapshot
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at
+	snapshot, err := scanSnapshot(s.db.QueryRowContext(ctx, `
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
 		FROM snapshots
 		WHERE run_id = ?
 		ORDER BY id DESC
-		LIMIT 1`, runID).
-		Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt)
+		LIMIT 1`, runID))
 	if err == sql.ErrNoRows {
 		return Snapshot{}, false, nil
 	}
@@ -613,14 +640,12 @@ func (s *Store) GetSnapshotByRun(ctx context.Context, runID int64) (Snapshot, bo
 }
 
 func (s *Store) GetLatestSnapshotForJob(ctx context.Context, jobID int64) (Snapshot, bool, error) {
-	var snapshot Snapshot
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at
+	snapshot, err := scanSnapshot(s.db.QueryRowContext(ctx, `
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
 		FROM snapshots
 		WHERE job_id = ? AND deleted_at IS NULL
 		ORDER BY created_at DESC, id DESC
-		LIMIT 1`, jobID).
-		Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt)
+		LIMIT 1`, jobID))
 	if err == sql.ErrNoRows {
 		return Snapshot{}, false, nil
 	}
@@ -632,7 +657,7 @@ func (s *Store) GetLatestSnapshotForJob(ctx context.Context, jobID int64) (Snaps
 
 func (s *Store) ListActiveSnapshots(ctx context.Context) ([]Snapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
 		FROM snapshots
 		WHERE deleted_at IS NULL
 		ORDER BY job_id ASC, created_at DESC, id DESC`)
@@ -643,13 +668,123 @@ func (s *Store) ListActiveSnapshots(ctx context.Context) ([]Snapshot, error) {
 
 	snapshots := make([]Snapshot, 0)
 	for rows.Next() {
-		var snapshot Snapshot
-		if err := rows.Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt); err != nil {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
 			return nil, err
 		}
 		snapshots = append(snapshots, snapshot)
 	}
 	return snapshots, rows.Err()
+}
+
+func (s *Store) ListDeletedSnapshots(ctx context.Context) ([]Snapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
+		FROM snapshots
+		WHERE deleted_at IS NOT NULL
+		ORDER BY deleted_at DESC, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list deleted snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	snapshots := make([]Snapshot, 0)
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots, rows.Err()
+}
+
+func scanSnapshot(row interface{ Scan(dest ...any) error }) (Snapshot, error) {
+	var snapshot Snapshot
+	err := row.Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt, &snapshot.DeleteReason, &snapshot.DeletedBy, &snapshot.Health, &snapshot.HealthMessage, &snapshot.VerifiedAt)
+	return snapshot, err
+}
+
+func (s *Store) DeleteSnapshot(ctx context.Context, input DeleteSnapshotInput) (Snapshot, bool, error) {
+	if input.ID <= 0 {
+		return Snapshot{}, false, errors.New("snapshot id is required")
+	}
+	if input.Reason == "" {
+		input.Reason = "manual"
+	}
+	if input.DeletedBy == "" {
+		input.DeletedBy = "admin"
+	}
+	if input.Now.IsZero() {
+		input.Now = time.Now().UTC()
+	}
+	snapshot, err := s.GetSnapshot(ctx, input.ID)
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	if snapshot.DeletedAt.Valid {
+		return snapshot, false, nil
+	}
+	inUse, err := s.snapshotHasActiveRestoreTask(ctx, input.ID)
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	if inUse {
+		return Snapshot{}, false, ErrSnapshotInUse
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE snapshots
+		SET deleted_at = ?, delete_reason = ?, deleted_by = ?
+		WHERE id = ? AND deleted_at IS NULL`, input.Now.UTC(), input.Reason, input.DeletedBy, input.ID)
+	if err != nil {
+		return Snapshot{}, false, fmt.Errorf("delete snapshot %d: %w", input.ID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Snapshot{}, false, fmt.Errorf("get delete snapshot rows affected: %w", err)
+	}
+	snapshot, err = s.GetSnapshot(ctx, input.ID)
+	return snapshot, changed > 0, err
+}
+
+func (s *Store) UpdateSnapshotHealth(ctx context.Context, id int64, health, message string, verifiedAt time.Time) error {
+	if id <= 0 {
+		return errors.New("snapshot id is required")
+	}
+	if health == "" {
+		health = "unknown"
+	}
+	var verified sql.NullTime
+	if !verifiedAt.IsZero() {
+		verified = sql.NullTime{Time: verifiedAt.UTC(), Valid: true}
+	}
+	msg := sql.NullString{String: message, Valid: message != ""}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE snapshots
+		SET health = ?, health_message = ?, verified_at = ?
+		WHERE id = ?`, health, msg, verified, id)
+	if err != nil {
+		return fmt.Errorf("update snapshot health: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get snapshot health rows affected: %w", err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("snapshot %d not found", id)
+	}
+	return nil
+}
+
+func (s *Store) snapshotHasActiveRestoreTask(ctx context.Context, snapshotID int64) (bool, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM restore_tasks
+		WHERE snapshot_id = ? AND status IN ('pending', 'running')`, snapshotID).Scan(&count); err != nil {
+		return false, fmt.Errorf("check active restore tasks for snapshot %d: %w", snapshotID, err)
+	}
+	return count > 0, nil
 }
 
 func (s *Store) ExpireSnapshots(ctx context.Context, ids []int64, now time.Time) (int64, error) {
@@ -666,8 +801,13 @@ func (s *Store) ExpireSnapshots(ctx context.Context, ids []int64, now time.Time)
 	for _, id := range ids {
 		result, err := tx.ExecContext(ctx, `
 			UPDATE snapshots
-			SET deleted_at = ?
-			WHERE id = ? AND deleted_at IS NULL`, now.UTC(), id)
+			SET deleted_at = ?, delete_reason = 'retention', deleted_by = 'maintenance'
+			WHERE id = ? AND deleted_at IS NULL
+				AND id NOT IN (
+					SELECT snapshot_id
+					FROM restore_tasks
+					WHERE status IN ('pending', 'running')
+				)`, now.UTC(), id)
 		if err != nil {
 			return 0, fmt.Errorf("expire snapshot %d: %w", id, err)
 		}

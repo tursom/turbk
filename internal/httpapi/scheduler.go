@@ -2,10 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/tursom/turbk/internal/config"
 	"github.com/tursom/turbk/internal/state"
 )
 
@@ -22,12 +24,14 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	go func() {
 		defer ticker.Stop()
 		s.runDueScheduledJobs(ctx, time.Now().UTC())
+		s.runDueMaintenance(ctx, time.Now().UTC())
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
 				s.runDueScheduledJobs(ctx, now.UTC())
+				s.runDueMaintenance(ctx, now.UTC())
 			}
 		}
 	}()
@@ -51,6 +55,168 @@ func (s *Server) runDueScheduledJobs(ctx context.Context, now time.Time) int {
 		scheduled++
 	}
 	return scheduled
+}
+
+func (s *Server) runDueMaintenance(ctx context.Context, now time.Time) int {
+	settings := s.currentSettings()
+	cfg := settings.Maintenance
+	if !cfg.Enabled {
+		return 0
+	}
+	location, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		s.logger.Warn("invalid maintenance timezone", "timezone", cfg.Timezone, "error", err)
+		location, _ = time.LoadLocation(s.cfg.Scheduler.Timezone)
+		if location == nil {
+			location = time.Local
+		}
+	}
+	scheduled := 0
+	if s.maintenanceDue("cleanup", cfg.CleanupSchedule, location, now) {
+		scheduled++
+		go func() {
+			runCtx := context.Background()
+			if _, err := s.runStorageMaintenanceAndRecord(runCtx, "retention"); err != nil {
+				s.logger.Error("scheduled retention maintenance failed", "error", err)
+				return
+			}
+			if _, err := s.runStorageMaintenanceAndRecord(runCtx, "cleanup-errors"); err != nil {
+				s.logger.Error("scheduled cleanup maintenance failed", "error", err)
+			}
+		}()
+	}
+	if cfg.CompactEnabled && s.maintenanceDue("compact", cfg.CompactSchedule, location, now) {
+		scheduled++
+		go s.runScheduledCompact(context.Background(), cfg)
+	}
+	return scheduled
+}
+
+func (s *Server) maintenanceDue(key, schedule string, location *time.Location, now time.Time) bool {
+	if !cronMatches(schedule, now.In(location)) {
+		return false
+	}
+	localNow := now.In(location)
+	minuteStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), localNow.Hour(), localNow.Minute(), 0, 0, location).UTC()
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if last, ok := s.lastMaintenance[key]; ok && last.Equal(minuteStart) {
+		return false
+	}
+	s.lastMaintenance[key] = minuteStart
+	return true
+}
+
+func nextCronTime(schedule string, location *time.Location, now time.Time) (time.Time, bool) {
+	if location == nil {
+		location = time.Local
+	}
+	next := now.In(location).Truncate(time.Minute).Add(time.Minute)
+	for i := 0; i < 366*24*60; i++ {
+		if cronMatches(schedule, next) {
+			return next.UTC(), true
+		}
+		next = next.Add(time.Minute)
+	}
+	return time.Time{}, false
+}
+
+func (s *Server) runScheduledCompact(ctx context.Context, cfg config.MaintenanceConfig) {
+	if skip, report, err := s.scheduledCompactSkipReport(ctx, cfg); err != nil {
+		s.logger.Error("evaluate scheduled compact", "error", err)
+	} else if skip {
+		s.recordScheduledMaintenanceReport(ctx, "compact", report)
+		return
+	}
+	if _, err := s.runStorageMaintenanceAndRecord(ctx, "compact"); err != nil {
+		s.logger.Error("scheduled compact failed", "error", err)
+	}
+}
+
+func (s *Server) scheduledCompactSkipReport(ctx context.Context, cfg config.MaintenanceConfig) (bool, maintenanceReport, error) {
+	activeRuns, err := s.store.CountActiveRuns(ctx)
+	if err != nil {
+		return false, maintenanceReport{}, err
+	}
+	if activeRuns > 0 {
+		return false, maintenanceReport{}, nil
+	}
+	started := time.Now().UTC()
+	report := maintenanceReport{
+		Status:  "completed",
+		Mode:    "compact",
+		Started: started,
+	}
+	settings := s.currentSettings()
+	report.Retention.Policy = state.RetentionPolicy{
+		KeepLast:   settings.Retention.KeepLast,
+		KeepDaily:  settings.Retention.KeepDaily,
+		KeepWeekly: settings.Retention.KeepWeekly,
+	}
+	activeSnapshots, err := s.store.ListActiveSnapshots(ctx)
+	if err != nil {
+		return false, maintenanceReport{}, err
+	}
+	report.Manifests.Active = len(activeSnapshots)
+	counts, err := s.store.SnapshotCounts(ctx)
+	if err != nil {
+		return false, maintenanceReport{}, err
+	}
+	report.Retention.ActiveSnapshots = counts.Active
+	report.Retention.DeletedSnapshots = counts.Deleted
+	stats, err := s.repo.Stats()
+	if err != nil {
+		return false, maintenanceReport{}, err
+	}
+	report.Segment.Count = stats.Segments
+	report.Segment.Bytes = stats.SegmentBytes
+	report.Segment.LogicalBytes = stats.LogicalBytes
+	report.Segment.CompressedBytes = stats.CompressedBytes
+	report.Segment.Utilization = utilization(stats.CompressedBytes, stats.SegmentBytes)
+	report.Chunks.Indexed = stats.Chunks
+	referenced, referencedCompressedBytes, manifestErrors := s.referencedChunkStats(activeSnapshots)
+	report.Chunks.Referenced = referenced
+	if stats.Chunks > referenced {
+		report.Chunks.EstimatedOrphans = stats.Chunks - referenced
+	}
+	report.Manifests.Errors = manifestErrors
+	if len(manifestErrors) > 0 {
+		report.Compact.SkippedReason = "active manifest errors exist"
+		report.Finished = time.Now().UTC()
+		return true, report, nil
+	}
+	minBytes, err := parseByteSize(cfg.CompactMinReclaimBytes)
+	if err != nil {
+		minBytes = 1 << 30
+	}
+	reclaimableBytes := stats.SegmentBytes - referencedCompressedBytes
+	if reclaimableBytes < 0 {
+		reclaimableBytes = 0
+	}
+	reclaimRatio := utilization(reclaimableBytes, stats.SegmentBytes)
+	if reclaimRatio < cfg.CompactMinReclaimRatio && reclaimableBytes < minBytes {
+		report.Compact.SkippedReason = "compact reclaim threshold not met"
+		report.Finished = time.Now().UTC()
+		return true, report, nil
+	}
+	return false, report, nil
+}
+
+func (s *Server) recordScheduledMaintenanceReport(ctx context.Context, mode string, report maintenanceReport) {
+	data, _ := json.Marshal(report)
+	if len(data) == 0 {
+		data = []byte("{}")
+	}
+	if _, err := s.store.RecordMaintenanceRun(ctx, state.RecordMaintenanceRunInput{
+		Mode:          mode,
+		Status:        "skipped",
+		StartedAt:     report.Started,
+		FinishedAt:    report.Finished,
+		SkippedReason: report.Compact.SkippedReason,
+		ReportJSON:    string(data),
+	}); err != nil {
+		s.logger.Error("record scheduled maintenance", "mode", mode, "error", err)
+	}
 }
 
 func (s *Server) jobDue(ctx context.Context, job state.Job, now time.Time) scheduledDecision {

@@ -73,6 +73,16 @@ const {
   settingsKeepLast,
   settingsKeepDaily,
   settingsKeepWeekly,
+  settingsMaintenanceEnabled,
+  settingsMaintenanceTimezone,
+  settingsCleanupSchedule,
+  settingsCompactEnabled,
+  settingsCompactSchedule,
+  settingsErrorGracePeriod,
+  settingsStaleRunAfter,
+  settingsKeepDeletedMetadataDays,
+  settingsCompactMinReclaimRatio,
+  settingsCompactMinReclaimBytes,
   savingSettings,
   statRows,
   hostSummaryRows,
@@ -152,7 +162,7 @@ const {
 	              <h2>{{ t('settings.runtime') }}</h2>
 	              <span>{{ bootstrap?.scheduler.timezone ?? '-' }}</span>
 	            </div>
-	            <form class="inline-form" @submit.prevent="saveSettings">
+	            <form class="settings-form" @submit.prevent="saveSettings">
 	              <label class="field">
 	                <span>{{ t('field.adminUsername') }}</span>
 	                <input v-model="settingsAdminUsername" type="text" required />
@@ -180,6 +190,46 @@ const {
 	              <label class="field">
 	                <span>{{ t('field.weekly') }}</span>
 	                <input v-model.number="settingsKeepWeekly" type="number" min="0" step="1" required />
+	              </label>
+	              <label class="field checkbox-field">
+	                <input v-model="settingsMaintenanceEnabled" type="checkbox" />
+	                <span>{{ t('field.maintenanceEnabled') }}</span>
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.maintenanceTimezone') }}</span>
+	                <input v-model="settingsMaintenanceTimezone" type="text" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.cleanupSchedule') }}</span>
+	                <input v-model="settingsCleanupSchedule" type="text" required />
+	              </label>
+	              <label class="field checkbox-field">
+	                <input v-model="settingsCompactEnabled" type="checkbox" />
+	                <span>{{ t('field.compactEnabled') }}</span>
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.compactSchedule') }}</span>
+	                <input v-model="settingsCompactSchedule" type="text" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.errorGracePeriod') }}</span>
+	                <input v-model="settingsErrorGracePeriod" type="text" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.staleRunAfter') }}</span>
+	                <input v-model="settingsStaleRunAfter" type="text" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.keepDeletedMetadataDays') }}</span>
+	                <input v-model.number="settingsKeepDeletedMetadataDays" type="number" min="0" step="1" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.compactMinReclaimRatio') }}</span>
+	                <input v-model.number="settingsCompactMinReclaimRatio" type="number" min="0" step="0.01" required />
+	              </label>
+	              <label class="field">
+	                <span>{{ t('field.compactMinReclaimBytes') }}</span>
+	                <input v-model="settingsCompactMinReclaimBytes" type="text" required />
 	              </label>
 	              <button class="text-button primary" type="submit" :disabled="savingSettings">
 	                <Save :size="16" />

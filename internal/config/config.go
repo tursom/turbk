@@ -7,17 +7,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server     ServerConfig     `json:"server" yaml:"server"`
-	Auth       AuthConfig       `json:"auth" yaml:"auth"`
-	Paths      PathsConfig      `json:"paths" yaml:"paths"`
-	Repository RepositoryConfig `json:"repository" yaml:"repository"`
-	Scheduler  SchedulerConfig  `json:"scheduler" yaml:"scheduler"`
-	Retention  RetentionConfig  `json:"retention" yaml:"retention"`
+	Server      ServerConfig      `json:"server" yaml:"server"`
+	Auth        AuthConfig        `json:"auth" yaml:"auth"`
+	Paths       PathsConfig       `json:"paths" yaml:"paths"`
+	Repository  RepositoryConfig  `json:"repository" yaml:"repository"`
+	Scheduler   SchedulerConfig   `json:"scheduler" yaml:"scheduler"`
+	Retention   RetentionConfig   `json:"retention" yaml:"retention"`
+	Maintenance MaintenanceConfig `json:"maintenance" yaml:"maintenance"`
 }
 
 type ServerConfig struct {
@@ -56,6 +58,19 @@ type RetentionConfig struct {
 	KeepWeekly int `json:"keep_weekly" yaml:"keep_weekly"`
 }
 
+type MaintenanceConfig struct {
+	Enabled                 bool    `json:"enabled" yaml:"enabled"`
+	Timezone                string  `json:"timezone" yaml:"timezone"`
+	CleanupSchedule         string  `json:"cleanup_schedule" yaml:"cleanup_schedule"`
+	CompactEnabled          bool    `json:"compact_enabled" yaml:"compact_enabled"`
+	CompactSchedule         string  `json:"compact_schedule" yaml:"compact_schedule"`
+	ErrorGracePeriod        string  `json:"error_grace_period" yaml:"error_grace_period"`
+	StaleRunAfter           string  `json:"stale_run_after" yaml:"stale_run_after"`
+	KeepDeletedMetadataDays int     `json:"keep_deleted_metadata_days" yaml:"keep_deleted_metadata_days"`
+	CompactMinReclaimRatio  float64 `json:"compact_min_reclaim_ratio" yaml:"compact_min_reclaim_ratio"`
+	CompactMinReclaimBytes  string  `json:"compact_min_reclaim_bytes" yaml:"compact_min_reclaim_bytes"`
+}
+
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
@@ -87,6 +102,18 @@ func Default() Config {
 			KeepLast:   30,
 			KeepDaily:  30,
 			KeepWeekly: 12,
+		},
+		Maintenance: MaintenanceConfig{
+			Enabled:                 true,
+			Timezone:                "Asia/Shanghai",
+			CleanupSchedule:         "0 3 * * *",
+			CompactEnabled:          true,
+			CompactSchedule:         "30 3 * * 0",
+			ErrorGracePeriod:        "24h",
+			StaleRunAfter:           "6h",
+			KeepDeletedMetadataDays: 30,
+			CompactMinReclaimRatio:  0.15,
+			CompactMinReclaimBytes:  "1GiB",
 		},
 	}
 }
@@ -149,6 +176,40 @@ func (c *Config) Normalize() error {
 	if c.Retention.KeepDaily < 0 || c.Retention.KeepWeekly < 0 {
 		return errors.New("retention keep values must be non-negative")
 	}
+	if c.Maintenance.Timezone == "" {
+		c.Maintenance.Timezone = c.Scheduler.Timezone
+	}
+	if c.Maintenance.CleanupSchedule == "" {
+		c.Maintenance.CleanupSchedule = "0 3 * * *"
+	}
+	if c.Maintenance.CompactSchedule == "" {
+		c.Maintenance.CompactSchedule = "30 3 * * 0"
+	}
+	if c.Maintenance.ErrorGracePeriod == "" {
+		c.Maintenance.ErrorGracePeriod = "24h"
+	}
+	if duration, err := time.ParseDuration(c.Maintenance.ErrorGracePeriod); err != nil {
+		return fmt.Errorf("maintenance.error_grace_period must be a duration: %w", err)
+	} else if duration < 0 {
+		return errors.New("maintenance.error_grace_period must be non-negative")
+	}
+	if c.Maintenance.StaleRunAfter == "" {
+		c.Maintenance.StaleRunAfter = "6h"
+	}
+	if duration, err := time.ParseDuration(c.Maintenance.StaleRunAfter); err != nil {
+		return fmt.Errorf("maintenance.stale_run_after must be a duration: %w", err)
+	} else if duration < 0 {
+		return errors.New("maintenance.stale_run_after must be non-negative")
+	}
+	if c.Maintenance.KeepDeletedMetadataDays < 0 {
+		return errors.New("maintenance.keep_deleted_metadata_days must be non-negative")
+	}
+	if c.Maintenance.CompactMinReclaimRatio < 0 {
+		return errors.New("maintenance.compact_min_reclaim_ratio must be non-negative")
+	}
+	if c.Maintenance.CompactMinReclaimBytes == "" {
+		c.Maintenance.CompactMinReclaimBytes = "1GiB"
+	}
 	return nil
 }
 
@@ -162,6 +223,20 @@ func applyEnv(c *Config) {
 		if v := os.Getenv(env); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
 				*dst = n
+			}
+		}
+	}
+	applyBool := func(env string, dst *bool) {
+		if v := os.Getenv(env); v != "" {
+			if parsed, err := strconv.ParseBool(v); err == nil {
+				*dst = parsed
+			}
+		}
+	}
+	applyFloat := func(env string, dst *float64) {
+		if v := os.Getenv(env); v != "" {
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				*dst = parsed
 			}
 		}
 	}
@@ -186,6 +261,16 @@ func applyEnv(c *Config) {
 	applyInt("TURBK_KEEP_LAST", &c.Retention.KeepLast)
 	applyInt("TURBK_KEEP_DAILY", &c.Retention.KeepDaily)
 	applyInt("TURBK_KEEP_WEEKLY", &c.Retention.KeepWeekly)
+	applyBool("TURBK_MAINTENANCE_ENABLED", &c.Maintenance.Enabled)
+	applyString("TURBK_MAINTENANCE_TIMEZONE", &c.Maintenance.Timezone)
+	applyString("TURBK_MAINTENANCE_CLEANUP_SCHEDULE", &c.Maintenance.CleanupSchedule)
+	applyBool("TURBK_MAINTENANCE_COMPACT_ENABLED", &c.Maintenance.CompactEnabled)
+	applyString("TURBK_MAINTENANCE_COMPACT_SCHEDULE", &c.Maintenance.CompactSchedule)
+	applyString("TURBK_MAINTENANCE_ERROR_GRACE_PERIOD", &c.Maintenance.ErrorGracePeriod)
+	applyString("TURBK_MAINTENANCE_STALE_RUN_AFTER", &c.Maintenance.StaleRunAfter)
+	applyInt("TURBK_MAINTENANCE_KEEP_DELETED_METADATA_DAYS", &c.Maintenance.KeepDeletedMetadataDays)
+	applyFloat("TURBK_MAINTENANCE_COMPACT_MIN_RECLAIM_RATIO", &c.Maintenance.CompactMinReclaimRatio)
+	applyString("TURBK_MAINTENANCE_COMPACT_MIN_RECLAIM_BYTES", &c.Maintenance.CompactMinReclaimBytes)
 }
 
 func splitList(value string) []string {

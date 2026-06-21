@@ -36,6 +36,7 @@ export interface Bootstrap {
     keep_daily: number;
     keep_weekly: number;
   };
+  maintenance: MaintenanceSettings;
 }
 
 export interface AuthSession {
@@ -54,6 +55,20 @@ export interface AppSettings {
     keep_daily: number;
     keep_weekly: number;
   };
+  maintenance: MaintenanceSettings;
+}
+
+export interface MaintenanceSettings {
+  enabled: boolean;
+  timezone: string;
+  cleanup_schedule: string;
+  compact_enabled: boolean;
+  compact_schedule: string;
+  error_grace_period: string;
+  stale_run_after: string;
+  keep_deleted_metadata_days: number;
+  compact_min_reclaim_ratio: number;
+  compact_min_reclaim_bytes: string;
 }
 
 export interface Host {
@@ -159,6 +174,11 @@ export interface Snapshot {
   total_size: number;
   created_at: string;
   deleted_at: unknown;
+  delete_reason: unknown;
+  deleted_by: unknown;
+  health: string;
+  health_message: unknown;
+  verified_at: unknown;
 }
 
 export interface SnapshotTreeEntry {
@@ -228,6 +248,15 @@ export interface StorageHealth {
   manifests: {
     count: number;
   };
+  maintenance: {
+    enabled: boolean;
+    timezone: string;
+    cleanup_schedule: string;
+    next_cleanup_at: unknown;
+    compact_enabled: boolean;
+    compact_schedule: string;
+    next_compact_at: unknown;
+  };
 }
 
 export interface StorageMaintenance {
@@ -275,6 +304,27 @@ export interface StorageMaintenance {
     removed_segment_bytes: number;
     skipped_reason?: string;
   };
+  cleanup: {
+    stale_runs_failed: number;
+    removed_manifests: number;
+    removed_manifest_bytes: number;
+    removed_chunks: number;
+    removed_logical_bytes: number;
+    removed_compressed_bytes: number;
+    skipped_reason?: string;
+    errors?: string[];
+  };
+}
+
+export interface MaintenanceRun {
+  id: number;
+  mode: string;
+  status: string;
+  started_at: string;
+  finished_at: unknown;
+  skipped_reason: unknown;
+  report_json: string;
+  error_message: unknown;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -317,6 +367,7 @@ export const api = {
       keep_daily?: number;
       keep_weekly?: number;
     };
+    maintenance?: Partial<MaintenanceSettings>;
   }) =>
     request<{ settings: AppSettings }>('/api/v1/settings', {
       method: 'PATCH',
@@ -377,6 +428,23 @@ export const api = {
   runs: () => request<{ runs: Run[] }>('/api/v1/runs'),
   runLogs: (id: number) => request<{ logs: RunLog[] }>(`/api/v1/runs/${id}/logs`),
   snapshots: () => request<{ snapshots: Snapshot[] }>('/api/v1/snapshots'),
+  deleteSnapshot: (id: number) =>
+    request<{ status: string; deleted: boolean; snapshot: Snapshot; space_reclaim: { requires_compact: boolean; message: string } }>(
+      `/api/v1/snapshots/${id}`,
+      {
+        method: 'DELETE'
+      }
+    ),
+  deleteSnapshots: (snapshotIds: number[]) =>
+    request<{
+      status: string;
+      results: Array<{ id: number; status: string; deleted: boolean; snapshot?: Snapshot; error?: string }>;
+      space_reclaim: { requires_compact: boolean; message: string };
+    }>('/api/v1/snapshots/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot_ids: snapshotIds })
+    }),
   snapshotTree: (id: number, path = '.') =>
     request<SnapshotTree>(`/api/v1/snapshots/${id}/tree?path=${encodeURIComponent(path)}`),
   snapshotDownloadURL: (id: number, path = '.') =>
@@ -389,6 +457,7 @@ export const api = {
     }),
   restoreTasks: () => request<{ tasks: RestoreTask[] }>('/api/v1/restore/tasks'),
   storageHealth: () => request<StorageHealth>('/api/v1/storage/health'),
+  maintenanceRuns: () => request<{ runs: MaintenanceRun[] }>('/api/v1/storage/maintenance/runs'),
   storageMaintenance: (mode = 'retention') =>
     request<StorageMaintenance>('/api/v1/storage/maintenance', {
       method: 'POST',

@@ -87,6 +87,8 @@ go run ./cmd/turbk-agent \
   -once
 ```
 
+Agent 默认启用 `-skip-pseudo-fs=true`，会跳过 procfs、sysfs、cgroup 等 Linux 伪文件系统，避免读取 `/proc/*/attr/*` 这类伪文件导致备份失败。需要额外排除路径时可用 `-exclude` 或 `TURBK_AGENT_EXCLUDES`，规则相对备份根目录，多个规则用逗号或换行分隔。
+
 创建并运行一个本地备份任务。本地来源也先创建 Host，具体备份路径放在 Job 的 `source_config.root`：
 
 ```bash
@@ -164,10 +166,16 @@ curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/storage/maintenan
 
 curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/storage/maintenance \
   -H 'Content-Type: application/json' \
+  --data '{"mode":"cleanup-errors"}'
+
+curl -b /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/storage/maintenance \
+  -H 'Content-Type: application/json' \
   --data '{"mode":"compact"}'
+
+curl -b /tmp/turbk.cookie -X DELETE http://localhost:8080/api/v1/snapshots/1
 ```
 
-`retention` 模式会按配置保留策略软删除过期 snapshot，并返回 segment 利用率、活跃/已删除 snapshot 数量和 orphan chunk 估算。`verify` 模式只读校验 active manifest 引用的 chunk index 和 segment record，不执行保留删除。`compact` 模式会先执行 retention，再把 active snapshot 仍引用的 chunk 顺序重写到新 segment，更新 manifest/index，并删除不再被 active manifest 引用的旧 segment；有 pending/running run 或备份写入 gate 正忙时会跳过 compact。
+`retention` 模式会按配置保留策略软删除过期 snapshot，并返回 segment 利用率、活跃/已删除 snapshot 数量和 orphan chunk 估算。`verify` 模式只读校验 active manifest 引用的 chunk index 和 segment record，不执行保留删除。`cleanup-errors` 会把服务重启前遗留且超过阈值的 stale run 标记失败，并清理不被 active snapshot 引用的旧 manifest 和 chunk index。`compact` 模式会先执行 retention 和 cleanup-errors，再把 active snapshot 仍引用的 chunk 顺序重写到新 segment，更新 manifest/index，并删除不再被 active manifest 引用的旧 segment；有 pending/running run 或备份写入 gate 正忙时会跳过 compact。`full-cleanup` 可用于手动执行完整清理流程。删除 snapshot 只写 `deleted_at`，磁盘空间由后续 compact 回收。
 
 浏览、下载和恢复 snapshot：
 
@@ -239,6 +247,9 @@ GitHub Actions 会在 push 和 tag 时构建并推送服务端镜像 `ghcr.io/tu
 - `repository.segment_size`、`repository.chunk_avg_size`、`repository.compression`、`repository.encryption`
 - `scheduler.timezone`、`scheduler.max_concurrent_runs`
 - `retention.keep_last`、`retention.keep_daily`、`retention.keep_weekly`
+- `maintenance.enabled`、`maintenance.cleanup_schedule`、`maintenance.compact_enabled`、`maintenance.compact_schedule`
+- `maintenance.error_grace_period`、`maintenance.stale_run_after`、`maintenance.keep_deleted_metadata_days`
+- `maintenance.compact_min_reclaim_ratio`、`maintenance.compact_min_reclaim_bytes`
 
 `.env` 只保留 Compose 层参数，例如镜像 tag、宿主机端口、构建参数和宿主机目录。默认绑定挂载：
 
@@ -278,6 +289,8 @@ cp .env.example .env
 docker compose pull
 docker compose run --rm turbk-agent
 ```
+
+备份 Docker 数据目录时，运行中的 `overlay2/*/merged` 可能包含容器内的 `/proc`、`/sys` 等挂载视图。agent 默认跳过 Linux 伪文件系统；如需路径级排除，可在 `deploy/agent/.env` 设置 `TURBK_AGENT_EXCLUDES=overlay2/*/merged/proc/**,overlay2/*/merged/sys/**`。
 
 也可以在被备份主机上从源码构建 agent 镜像：
 

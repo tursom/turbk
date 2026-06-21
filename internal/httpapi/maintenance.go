@@ -8,8 +8,10 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/tursom/turbk/internal/config"
 	"github.com/tursom/turbk/internal/repository"
 	"github.com/tursom/turbk/internal/state"
 )
@@ -48,6 +50,7 @@ type maintenanceReport struct {
 		Errors         []string `json:"errors,omitempty"`
 	} `json:"verify"`
 	Compact compactReport `json:"compact"`
+	Cleanup cleanupReport `json:"cleanup"`
 }
 
 func (s *Server) handleStorageMaintenance(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +61,7 @@ func (s *Server) handleStorageMaintenance(w http.ResponseWriter, r *http.Request
 	if req.Mode == "" {
 		req.Mode = "retention"
 	}
-	report, err := s.runStorageMaintenance(r.Context(), req.Mode)
+	report, err := s.runStorageMaintenanceAndRecord(r.Context(), req.Mode)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errInvalidMaintenanceMode) {
@@ -70,11 +73,20 @@ func (s *Server) handleStorageMaintenance(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, report)
 }
 
+func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.store.ListMaintenanceRuns(r.Context(), 50)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
 var errInvalidMaintenanceMode = errors.New("invalid maintenance mode")
 
 func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (maintenanceReport, error) {
 	switch mode {
-	case "retention", "compact-report", "verify", "compact":
+	case "retention", "compact-report", "verify", "cleanup-errors", "compact", "full-cleanup":
 	default:
 		return maintenanceReport{}, fmt.Errorf("%w: %s", errInvalidMaintenanceMode, mode)
 	}
@@ -85,7 +97,8 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 		Mode:    mode,
 		Started: started,
 	}
-	retention := s.currentSettings().Retention
+	settings := s.currentSettings()
+	retention := settings.Retention
 	policy := state.RetentionPolicy{
 		KeepLast:   retention.KeepLast,
 		KeepDaily:  retention.KeepDaily,
@@ -93,7 +106,7 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 	}
 	report.Retention.Policy = policy
 
-	if mode == "compact" {
+	if mode == "compact" || mode == "full-cleanup" {
 		releaseCompactGate, ok := s.tryEnterCompactMaintenance()
 		if !ok {
 			report.Compact.SkippedReason = "backup or chunk upload in progress"
@@ -108,7 +121,7 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 		return maintenanceReport{}, err
 	}
 	report.Manifests.Active = len(activeSnapshots)
-	if mode == "retention" || mode == "compact-report" || mode == "compact" {
+	if mode == "retention" || mode == "compact-report" || mode == "compact" || mode == "full-cleanup" {
 		expiredIDs := state.ExpiredSnapshotIDs(activeSnapshots, policy)
 		expired, err := s.store.ExpireSnapshots(ctx, expiredIDs, time.Now().UTC())
 		if err != nil {
@@ -123,7 +136,19 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 			report.Manifests.Active = len(activeSnapshots)
 		}
 	}
-	if mode == "compact" {
+	if mode == "cleanup-errors" || mode == "compact" || mode == "full-cleanup" {
+		cleanup, err := s.cleanupErrorBackupData(ctx, activeSnapshots, time.Now().UTC(), settings.Maintenance)
+		if err != nil {
+			return maintenanceReport{}, err
+		}
+		report.Cleanup = cleanup
+		activeSnapshots, err = s.store.ListActiveSnapshots(ctx)
+		if err != nil {
+			return maintenanceReport{}, err
+		}
+		report.Manifests.Active = len(activeSnapshots)
+	}
+	if mode == "compact" || mode == "full-cleanup" {
 		compact, err := s.compactRepository(ctx, activeSnapshots)
 		if err != nil {
 			return maintenanceReport{}, err
@@ -153,7 +178,7 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 	report.Segment.Utilization = utilization(stats.CompressedBytes, stats.SegmentBytes)
 	report.Chunks.Indexed = stats.Chunks
 
-	referenced, manifestErrors := s.countReferencedChunks(activeSnapshots)
+	referenced, _, manifestErrors := s.referencedChunkStats(activeSnapshots)
 	report.Chunks.Referenced = referenced
 	if stats.Chunks > referenced {
 		report.Chunks.EstimatedOrphans = stats.Chunks - referenced
@@ -168,6 +193,45 @@ func (s *Server) runStorageMaintenance(ctx context.Context, mode string) (mainte
 	}
 	report.Finished = time.Now().UTC()
 	return report, nil
+}
+
+func (s *Server) runStorageMaintenanceAndRecord(ctx context.Context, mode string) (maintenanceReport, error) {
+	started := time.Now().UTC()
+	report, err := s.runStorageMaintenance(ctx, mode)
+	status := "completed"
+	errorMessage := ""
+	skippedReason := ""
+	finished := time.Now().UTC()
+	reportJSON := "{}"
+	if err != nil {
+		status = "failed"
+		errorMessage = err.Error()
+	} else {
+		started = report.Started
+		finished = report.Finished
+		skippedReason = report.Compact.SkippedReason
+		if skippedReason == "" {
+			skippedReason = report.Cleanup.SkippedReason
+		}
+		if skippedReason != "" {
+			status = "skipped"
+		}
+		if data, marshalErr := json.Marshal(report); marshalErr == nil {
+			reportJSON = string(data)
+		}
+	}
+	if _, recordErr := s.store.RecordMaintenanceRun(ctx, state.RecordMaintenanceRunInput{
+		Mode:          mode,
+		Status:        status,
+		StartedAt:     started,
+		FinishedAt:    finished,
+		SkippedReason: skippedReason,
+		ReportJSON:    reportJSON,
+		ErrorMessage:  errorMessage,
+	}); recordErr != nil && err == nil {
+		return maintenanceReport{}, recordErr
+	}
+	return report, err
 }
 
 type verifyReport struct {
@@ -186,9 +250,83 @@ type compactReport struct {
 	SkippedReason       string `json:"skipped_reason,omitempty"`
 }
 
+type cleanupReport struct {
+	StaleRunsFailed        int64    `json:"stale_runs_failed"`
+	RemovedManifests       int      `json:"removed_manifests"`
+	RemovedManifestBytes   int64    `json:"removed_manifest_bytes"`
+	RemovedChunks          int64    `json:"removed_chunks"`
+	RemovedLogicalBytes    int64    `json:"removed_logical_bytes"`
+	RemovedCompressedBytes int64    `json:"removed_compressed_bytes"`
+	SkippedReason          string   `json:"skipped_reason,omitempty"`
+	Errors                 []string `json:"errors,omitempty"`
+}
+
 type compactManifest struct {
 	snapshot state.Snapshot
 	manifest *repository.SnapshotManifest
+}
+
+func (s *Server) cleanupErrorBackupData(ctx context.Context, activeSnapshots []state.Snapshot, now time.Time, cfg config.MaintenanceConfig) (cleanupReport, error) {
+	var report cleanupReport
+	errorGrace, err := time.ParseDuration(cfg.ErrorGracePeriod)
+	if err != nil {
+		errorGrace = 24 * time.Hour
+	}
+	staleAfter, err := time.ParseDuration(cfg.StaleRunAfter)
+	if err != nil {
+		staleAfter = 6 * time.Hour
+	}
+
+	staleRuns, err := s.store.MarkStaleRunsFailed(ctx, now.Add(-staleAfter), s.store.StartedAt(), now)
+	if err != nil {
+		return cleanupReport{}, err
+	}
+	report.StaleRunsFailed = staleRuns
+
+	liveManifests, liveHashes, _, manifestErrors := s.snapshotLiveSets(activeSnapshots)
+	if len(manifestErrors) > 0 {
+		report.Errors = manifestErrors
+		report.SkippedReason = "active manifest errors exist"
+		return report, nil
+	}
+
+	keepManifests := make(map[string]struct{}, len(liveManifests))
+	for id := range liveManifests {
+		keepManifests[id] = struct{}{}
+	}
+	deletedSnapshots, err := s.store.ListDeletedSnapshots(ctx)
+	if err != nil {
+		return cleanupReport{}, err
+	}
+	var deletedMetadataCutoff time.Time
+	if cfg.KeepDeletedMetadataDays > 0 {
+		deletedMetadataCutoff = now.AddDate(0, 0, -cfg.KeepDeletedMetadataDays)
+	}
+	for _, snapshot := range deletedSnapshots {
+		if snapshot.ManifestRef == "" {
+			continue
+		}
+		if cfg.KeepDeletedMetadataDays == 0 || !snapshot.DeletedAt.Valid || snapshot.DeletedAt.Time.After(deletedMetadataCutoff) {
+			keepManifests[snapshot.ManifestRef] = struct{}{}
+		}
+	}
+
+	cutoff := now.Add(-errorGrace)
+	removedManifests, removedManifestBytes, err := s.repo.DeleteManifestsExceptOlderThan(ctx, keepManifests, cutoff)
+	if err != nil {
+		return cleanupReport{}, err
+	}
+	report.RemovedManifests = removedManifests
+	report.RemovedManifestBytes = removedManifestBytes
+
+	chunkCleanup, err := s.repo.DeleteUnreferencedChunksOlderThan(ctx, liveHashes, cutoff)
+	if err != nil {
+		return cleanupReport{}, err
+	}
+	report.RemovedChunks = chunkCleanup.Count
+	report.RemovedLogicalBytes = chunkCleanup.LogicalBytes
+	report.RemovedCompressedBytes = chunkCleanup.CompressedBytes
+	return report, nil
 }
 
 func (s *Server) compactRepository(ctx context.Context, snapshots []state.Snapshot) (compactReport, error) {
@@ -299,6 +437,7 @@ func (s *Server) verifyReferencedChunks(ctx context.Context, snapshots []state.S
 	const maxVerifyErrors = 200
 	report := verifyReport{}
 	seen := make(map[string]struct{})
+	hashErrors := make(map[string]string)
 	addError := func(format string, args ...any) {
 		if len(report.Errors) < maxVerifyErrors {
 			report.Errors = append(report.Errors, fmt.Sprintf(format, args...))
@@ -310,9 +449,18 @@ func (s *Server) verifyReferencedChunks(ctx context.Context, snapshots []state.S
 			addError("verification canceled: %v", err)
 			return report
 		}
+		var snapshotErrors []string
+		addSnapshotError := func(format string, args ...any) {
+			message := fmt.Sprintf(format, args...)
+			if len(snapshotErrors) < 5 {
+				snapshotErrors = append(snapshotErrors, message)
+			}
+			addError("%s", message)
+		}
 		manifest, err := s.repo.ReadManifest(snapshot.ManifestRef)
 		if err != nil {
-			addError("snapshot %d manifest %q: %v", snapshot.ID, snapshot.ManifestRef, err)
+			addSnapshotError("snapshot %d manifest %q: %v", snapshot.ID, snapshot.ManifestRef, err)
+			_ = s.store.UpdateSnapshotHealth(ctx, snapshot.ID, "corrupt", strings.Join(snapshotErrors, "; "), time.Now().UTC())
 			continue
 		}
 		for _, entry := range manifest.Entries {
@@ -323,42 +471,63 @@ func (s *Server) verifyReferencedChunks(ctx context.Context, snapshots []state.S
 			for _, manifestRef := range entry.Chunks {
 				if manifestRef.Hash == "" {
 					report.CorruptChunks++
-					addError("snapshot %d file %q references an empty chunk hash", snapshot.ID, entry.Path)
+					addSnapshotError("snapshot %d file %q references an empty chunk hash", snapshot.ID, entry.Path)
 					continue
 				}
 				chunkBytes += manifestRef.OriginalSize
 				if _, ok := seen[manifestRef.Hash]; ok {
+					if message := hashErrors[manifestRef.Hash]; message != "" {
+						addSnapshotError("snapshot %d file %q references corrupt chunk %s: %s", snapshot.ID, entry.Path, manifestRef.Hash, message)
+					}
 					continue
 				}
 				seen[manifestRef.Hash] = struct{}{}
 				indexRef, exists, err := s.repo.GetChunkRef(ctx, manifestRef.Hash)
 				if err != nil {
 					report.CorruptChunks++
-					addError("chunk %s index read failed: %v", manifestRef.Hash, err)
+					message := fmt.Sprintf("chunk %s index read failed: %v", manifestRef.Hash, err)
+					hashErrors[manifestRef.Hash] = message
+					addSnapshotError("%s", message)
 					continue
 				}
 				if !exists {
 					report.MissingIndex++
-					addError("chunk %s missing from index", manifestRef.Hash)
+					message := fmt.Sprintf("chunk %s missing from index", manifestRef.Hash)
+					hashErrors[manifestRef.Hash] = message
+					addSnapshotError("%s", message)
 					continue
 				}
 				if !sameChunkRefLocation(manifestRef, indexRef) {
 					report.CorruptChunks++
-					addError("chunk %s manifest ref does not match index ref", manifestRef.Hash)
+					message := fmt.Sprintf("chunk %s manifest ref does not match index ref", manifestRef.Hash)
+					hashErrors[manifestRef.Hash] = message
+					addSnapshotError("%s", message)
 					continue
 				}
 				if _, err := s.repo.ReadChunkRef(ctx, indexRef); err != nil {
 					report.CorruptChunks++
-					addError("chunk %s read failed: %v", manifestRef.Hash, err)
+					message := fmt.Sprintf("chunk %s read failed: %v", manifestRef.Hash, err)
+					hashErrors[manifestRef.Hash] = message
+					addSnapshotError("%s", message)
 					continue
 				}
 				report.VerifiedChunks++
 			}
 			if chunkBytes != entry.Size {
 				report.CorruptChunks++
-				addError("snapshot %d file %q size %d does not match chunk bytes %d", snapshot.ID, entry.Path, entry.Size, chunkBytes)
+				addSnapshotError("snapshot %d file %q size %d does not match chunk bytes %d", snapshot.ID, entry.Path, entry.Size, chunkBytes)
 			}
 		}
+		health := "healthy"
+		message := ""
+		if len(snapshotErrors) > 0 {
+			health = "corrupt"
+			message = strings.Join(snapshotErrors, "; ")
+		}
+		if len(message) > 1000 {
+			message = message[:1000]
+		}
+		_ = s.store.UpdateSnapshotHealth(ctx, snapshot.ID, health, message, time.Now().UTC())
 	}
 	return report
 }
@@ -372,8 +541,15 @@ func sameChunkRefLocation(a, b repository.ChunkRef) bool {
 		a.CompressedSize == b.CompressedSize
 }
 
-func (s *Server) countReferencedChunks(snapshots []state.Snapshot) (int64, []string) {
-	seen := make(map[string]bool)
+func (s *Server) referencedChunkStats(snapshots []state.Snapshot) (int64, int64, []string) {
+	_, _, stats, errors := s.snapshotLiveSets(snapshots)
+	return stats.Count, stats.CompressedBytes, errors
+}
+
+func (s *Server) snapshotLiveSets(snapshots []state.Snapshot) (map[string]struct{}, map[string]struct{}, repository.CleanupStats, []string) {
+	manifestIDs := make(map[string]struct{})
+	hashes := make(map[string]struct{})
+	refs := make(map[string]repository.ChunkRef)
 	var manifestErrors []string
 	for _, snapshot := range snapshots {
 		manifest, err := s.repo.ReadManifest(snapshot.ManifestRef)
@@ -381,15 +557,25 @@ func (s *Server) countReferencedChunks(snapshots []state.Snapshot) (int64, []str
 			manifestErrors = append(manifestErrors, err.Error())
 			continue
 		}
+		manifestIDs[snapshot.ManifestRef] = struct{}{}
 		for _, entry := range manifest.Entries {
 			for _, chunk := range entry.Chunks {
 				if chunk.Hash != "" {
-					seen[chunk.Hash] = true
+					hashes[chunk.Hash] = struct{}{}
+					if _, ok := refs[chunk.Hash]; !ok {
+						refs[chunk.Hash] = chunk
+					}
 				}
 			}
 		}
 	}
-	return int64(len(seen)), manifestErrors
+	var stats repository.CleanupStats
+	for _, ref := range refs {
+		stats.Count++
+		stats.LogicalBytes += ref.OriginalSize
+		stats.CompressedBytes += ref.CompressedSize
+	}
+	return manifestIDs, hashes, stats, manifestErrors
 }
 
 func utilization(used, total int64) float64 {

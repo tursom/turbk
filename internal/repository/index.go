@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -58,18 +59,27 @@ func (i *chunkIndex) Put(ref ChunkRef) error {
 }
 
 func (i *chunkIndex) DeleteUnreferenced(keep map[string]struct{}) (int64, error) {
+	stats, err := i.deleteUnreferenced(keep, time.Time{})
+	return stats.Count, err
+}
+
+func (i *chunkIndex) DeleteUnreferencedOlderThan(keep map[string]struct{}, cutoff time.Time) (CleanupStats, error) {
+	return i.deleteUnreferenced(keep, cutoff.UTC())
+}
+
+func (i *chunkIndex) deleteUnreferenced(keep map[string]struct{}, cutoff time.Time) (CleanupStats, error) {
 	iter, err := i.db.NewIter(&pebble.IterOptions{
 		LowerBound: []byte("chunk:"),
 		UpperBound: []byte("chunk;"),
 	})
 	if err != nil {
-		return 0, fmt.Errorf("create chunk index iterator: %w", err)
+		return CleanupStats{}, fmt.Errorf("create chunk index iterator: %w", err)
 	}
 	defer iter.Close()
 
 	batch := i.db.NewBatch()
 	defer batch.Close()
-	var deleted int64
+	var stats CleanupStats
 	for valid := iter.First(); valid; valid = iter.Next() {
 		if !bytes.HasPrefix(iter.Key(), []byte("chunk:")) {
 			continue
@@ -78,19 +88,28 @@ func (i *chunkIndex) DeleteUnreferenced(keep map[string]struct{}) (int64, error)
 		if _, ok := keep[hash]; ok {
 			continue
 		}
+		var ref ChunkRef
+		if err := json.Unmarshal(iter.Value(), &ref); err != nil {
+			return CleanupStats{}, fmt.Errorf("decode chunk index value: %w", err)
+		}
+		if !cutoff.IsZero() && !ref.CreatedAt.IsZero() && ref.CreatedAt.After(cutoff) {
+			continue
+		}
 		key := append([]byte(nil), iter.Key()...)
 		if err := batch.Delete(key, nil); err != nil {
-			return 0, fmt.Errorf("delete unreferenced chunk index %q: %w", hash, err)
+			return CleanupStats{}, fmt.Errorf("delete unreferenced chunk index %q: %w", hash, err)
 		}
-		deleted++
+		stats.Count++
+		stats.LogicalBytes += ref.OriginalSize
+		stats.CompressedBytes += ref.CompressedSize
 	}
 	if err := iter.Error(); err != nil {
-		return 0, fmt.Errorf("iterate chunk index: %w", err)
+		return CleanupStats{}, fmt.Errorf("iterate chunk index: %w", err)
 	}
 	if err := batch.Commit(pebble.Sync); err != nil {
-		return 0, fmt.Errorf("commit unreferenced chunk index deletes: %w", err)
+		return CleanupStats{}, fmt.Errorf("commit unreferenced chunk index deletes: %w", err)
 	}
-	return deleted, nil
+	return stats, nil
 }
 
 func (i *chunkIndex) Stats() (chunks int64, logicalBytes int64, compressedBytes int64, err error) {

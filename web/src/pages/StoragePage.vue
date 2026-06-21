@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Database, Shield, Wrench } from '@lucide/vue';
+import TablePanel from '../components/TablePanel';
 import { useAppContext } from '../appContext';
 
 const {
@@ -15,6 +16,7 @@ const {
   runs,
   snapshots,
   restoreTasks,
+  maintenanceRuns,
   selectedSnapshot,
   snapshotTreePath,
   snapshotTreeEntries,
@@ -188,9 +190,17 @@ const {
 	                <Shield :size="16" />
 	                <span>{{ t('common.verify') }}</span>
 	              </button>
+	              <button class="text-button" type="button" :disabled="maintenanceRunning" @click="runMaintenance('cleanup-errors')">
+	                <Wrench :size="16" />
+	                <span>{{ t('common.cleanup') }}</span>
+	              </button>
 	              <button class="text-button" type="button" :disabled="maintenanceRunning" @click="runMaintenance('compact')">
 	                <Database :size="16" />
 	                <span>{{ t('common.compact') }}</span>
+	              </button>
+	              <button class="text-button primary" type="button" :disabled="maintenanceRunning" @click="runMaintenance('full-cleanup')">
+	                <Database :size="16" />
+	                <span>{{ t('common.fullCleanup') }}</span>
 	              </button>
 	            </div>
 	          </div>
@@ -198,6 +208,14 @@ const {
 	            <div>
 	              <dt>{{ t('field.mode') }}</dt>
 	              <dd>{{ maintenanceModeText(maintenanceReport?.mode) }}</dd>
+	            </div>
+	            <div>
+	              <dt>{{ t('field.nextCleanup') }}</dt>
+	              <dd>{{ nullText(storageHealth?.maintenance.next_cleanup_at) }}</dd>
+	            </div>
+	            <div>
+	              <dt>{{ t('field.nextCompact') }}</dt>
+	              <dd>{{ nullText(storageHealth?.maintenance.next_compact_at) }}</dd>
 	            </div>
 	            <div>
 	              <dt>{{ t('field.retention') }}</dt>
@@ -218,6 +236,18 @@ const {
 	              <dd>{{ maintenanceReport?.chunks.estimated_orphans ?? '-' }}</dd>
 	            </div>
 	            <div>
+	              <dt>{{ t('field.cleanedChunks') }}</dt>
+	              <dd>{{ maintenanceReport?.cleanup.removed_chunks ?? '-' }}</dd>
+	            </div>
+	            <div>
+	              <dt>{{ t('field.cleanedManifests') }}</dt>
+	              <dd>{{ maintenanceReport?.cleanup.removed_manifests ?? '-' }}</dd>
+	            </div>
+	            <div>
+	              <dt>{{ t('field.staleRuns') }}</dt>
+	              <dd>{{ maintenanceReport?.cleanup.stale_runs_failed ?? '-' }}</dd>
+	            </div>
+	            <div>
 	              <dt>{{ t('field.verified') }}</dt>
 	              <dd>{{ maintenanceReport?.verify.verified_chunks ?? '-' }}</dd>
 	            </div>
@@ -235,5 +265,27 @@ const {
 	            </div>
 	          </dl>
 	        </section>
+	        <TablePanel :title="t('storage.maintenanceHistory')" :empty="maintenanceRuns.length === 0">
+	          <thead>
+	            <tr>
+	              <th>{{ t('field.id') }}</th>
+	              <th>{{ t('field.mode') }}</th>
+	              <th>{{ t('field.status') }}</th>
+	              <th>{{ t('field.started') }}</th>
+	              <th>{{ t('field.finished') }}</th>
+	              <th>{{ t('field.compactSkipped') }}</th>
+	            </tr>
+	          </thead>
+	          <tbody>
+	            <tr v-for="run in maintenanceRuns" :key="run.id">
+	              <td>#{{ run.id }}</td>
+	              <td>{{ maintenanceModeText(run.mode) }}</td>
+	              <td><span class="tag">{{ statusText(run.status) }}</span></td>
+	              <td>{{ formatTime(run.started_at) }}</td>
+	              <td>{{ nullText(run.finished_at) }}</td>
+	              <td>{{ compactSkippedText(nullText(run.skipped_reason)) }}</td>
+	            </tr>
+	          </tbody>
+	        </TablePanel>
 	      </section>
 </template>

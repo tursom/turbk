@@ -47,6 +47,10 @@ func TestExampleConfigsLoad(t *testing.T) {
 			if cfg.Retention.KeepLast <= 0 || cfg.Retention.KeepDaily < 0 || cfg.Retention.KeepWeekly < 0 {
 				t.Fatal("expected retention config")
 			}
+			if cfg.Maintenance.Timezone == "" || cfg.Maintenance.CleanupSchedule == "" || cfg.Maintenance.CompactSchedule == "" ||
+				cfg.Maintenance.ErrorGracePeriod == "" || cfg.Maintenance.StaleRunAfter == "" || cfg.Maintenance.CompactMinReclaimBytes == "" {
+				t.Fatal("expected maintenance config")
+			}
 		})
 	}
 }

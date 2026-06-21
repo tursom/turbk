@@ -16,6 +16,8 @@ cp .env.example .env
 - `TURBK_AGENT_ID`：服务端生成的 Client ID。
 - `TURBK_AGENT_SECRET`：服务端生成的 Client Secret。
 - `TURBK_AGENT_SOURCE_DIR`：宿主机上要备份的目录。
+- `TURBK_AGENT_EXCLUDES`：可选，逗号或换行分隔的排除规则，规则相对被备份目录，例如 `overlay2/*/merged/proc/**`。
+- `TURBK_AGENT_SKIP_PSEUDO_FS`：可选，默认 `true`，自动跳过 procfs、sysfs、cgroup 等 Linux 伪文件系统。
 
 ## 运行
 
@@ -34,6 +36,12 @@ docker compose run --rm turbk-agent
 ```
 
 compose 会把 `TURBK_AGENT_SOURCE_DIR` 只读挂载到容器内固定路径 `/backup/source`，并执行一次备份。需要定时备份时，可以在被备份主机上用 cron 或 systemd timer 定时运行同一条 `docker compose run --rm turbk-agent` 命令。
+
+如果备份 Docker 数据目录，运行中的 overlay `merged` 目录可能包含容器内的 `/proc`、`/sys`、`/dev` 等挂载视图。agent 默认会按文件系统类型跳过 procfs、sysfs、cgroup 等伪文件系统；仍需要额外排除路径时，可以在 `.env` 中配置：
+
+```env
+TURBK_AGENT_EXCLUDES=overlay2/*/merged/proc/**,overlay2/*/merged/sys/**
+```
 
 ## Web UI 接入方式
 

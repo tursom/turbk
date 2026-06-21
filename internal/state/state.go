@@ -75,6 +75,9 @@ func (s *Store) init(ctx context.Context) error {
 	if err := s.ensureJobRuntimeColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureSnapshotCleanupColumns(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -96,6 +99,32 @@ func (s *Store) ensureJobRuntimeColumns(ctx context.Context) error {
 		}
 		if _, err := s.db.ExecContext(ctx, column.stmt); err != nil {
 			return fmt.Errorf("add jobs.%s column: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureSnapshotCleanupColumns(ctx context.Context) error {
+	columns := []struct {
+		name string
+		stmt string
+	}{
+		{"delete_reason", `ALTER TABLE snapshots ADD COLUMN delete_reason TEXT`},
+		{"deleted_by", `ALTER TABLE snapshots ADD COLUMN deleted_by TEXT`},
+		{"health", `ALTER TABLE snapshots ADD COLUMN health TEXT NOT NULL DEFAULT 'unknown'`},
+		{"health_message", `ALTER TABLE snapshots ADD COLUMN health_message TEXT`},
+		{"verified_at", `ALTER TABLE snapshots ADD COLUMN verified_at DATETIME`},
+	}
+	for _, column := range columns {
+		exists, err := s.columnExists(ctx, "snapshots", column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, column.stmt); err != nil {
+			return fmt.Errorf("add snapshots.%s column: %w", column.name, err)
 		}
 	}
 	return nil
@@ -436,7 +465,7 @@ func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 
 func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at
+		SELECT id, job_id, host_id, run_id, created_at, source_type, manifest_ref, file_count, total_size, deleted_at, delete_reason, deleted_by, health, health_message, verified_at
 		FROM snapshots
 		WHERE deleted_at IS NULL
 		ORDER BY created_at DESC, id DESC
@@ -448,8 +477,8 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 
 	snapshots := make([]Snapshot, 0)
 	for rows.Next() {
-		var snapshot Snapshot
-		if err := rows.Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt); err != nil {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
 			return nil, err
 		}
 		snapshots = append(snapshots, snapshot)
@@ -588,16 +617,21 @@ type RunProgress struct {
 }
 
 type Snapshot struct {
-	ID          int64         `json:"id"`
-	JobID       sql.NullInt64 `json:"job_id"`
-	HostID      sql.NullInt64 `json:"host_id"`
-	RunID       sql.NullInt64 `json:"run_id"`
-	CreatedAt   time.Time     `json:"created_at"`
-	SourceType  string        `json:"source_type"`
-	ManifestRef string        `json:"manifest_ref"`
-	FileCount   int64         `json:"file_count"`
-	TotalSize   int64         `json:"total_size"`
-	DeletedAt   sql.NullTime  `json:"deleted_at"`
+	ID            int64          `json:"id"`
+	JobID         sql.NullInt64  `json:"job_id"`
+	HostID        sql.NullInt64  `json:"host_id"`
+	RunID         sql.NullInt64  `json:"run_id"`
+	CreatedAt     time.Time      `json:"created_at"`
+	SourceType    string         `json:"source_type"`
+	ManifestRef   string         `json:"manifest_ref"`
+	FileCount     int64          `json:"file_count"`
+	TotalSize     int64          `json:"total_size"`
+	DeletedAt     sql.NullTime   `json:"deleted_at"`
+	DeleteReason  sql.NullString `json:"delete_reason"`
+	DeletedBy     sql.NullString `json:"deleted_by"`
+	Health        string         `json:"health"`
+	HealthMessage sql.NullString `json:"health_message"`
+	VerifiedAt    sql.NullTime   `json:"verified_at"`
 }
 
 type RunLog struct {
@@ -710,7 +744,12 @@ var schema = []string{
 		manifest_ref TEXT NOT NULL DEFAULT '',
 		file_count INTEGER NOT NULL DEFAULT 0,
 		total_size INTEGER NOT NULL DEFAULT 0,
-		deleted_at DATETIME
+		deleted_at DATETIME,
+		delete_reason TEXT,
+		deleted_by TEXT,
+		health TEXT NOT NULL DEFAULT 'unknown',
+		health_message TEXT,
+		verified_at DATETIME
 	)`,
 	`CREATE TABLE IF NOT EXISTS restore_tasks (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,4 +777,14 @@ var schema = []string{
 			value TEXT NOT NULL,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+	`CREATE TABLE IF NOT EXISTS maintenance_runs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		mode TEXT NOT NULL,
+		status TEXT NOT NULL,
+		started_at DATETIME NOT NULL,
+		finished_at DATETIME,
+		skipped_reason TEXT,
+		report_json TEXT NOT NULL DEFAULT '{}',
+		error_message TEXT
+	)`,
 }

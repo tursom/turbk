@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/repository"
 	"github.com/tursom/turbk/internal/version"
 	"github.com/zeebo/blake3"
@@ -68,10 +69,14 @@ func main() {
 	var clientSecret string
 	var root string
 	var once bool
+	var excludeValue string
+	var skipPseudoFS bool
 	flag.StringVar(&serverURL, "server", os.Getenv("TURBK_SERVER_URL"), "Turbk server URL")
 	flag.StringVar(&clientID, "client-id", os.Getenv("TURBK_AGENT_ID"), "Agent client ID")
 	flag.StringVar(&clientSecret, "client-secret", os.Getenv("TURBK_AGENT_SECRET"), "Agent client secret")
 	flag.StringVar(&root, "root", os.Getenv("TURBK_AGENT_ROOT"), "Root directory to back up")
+	flag.StringVar(&excludeValue, "exclude", os.Getenv("TURBK_AGENT_EXCLUDES"), "Comma or newline separated path patterns to skip, relative to root")
+	flag.BoolVar(&skipPseudoFS, "skip-pseudo-fs", envBool("TURBK_AGENT_SKIP_PSEUDO_FS", true), "Skip Linux pseudo filesystems such as procfs and sysfs")
 	flag.BoolVar(&once, "once", false, "Send one heartbeat or run one backup and exit")
 	flag.Parse()
 
@@ -90,7 +95,11 @@ func main() {
 			logger.Error("agent heartbeat failed", "error", err)
 			os.Exit(1)
 		}
-		if err := runBackup(client, root, logger); err != nil {
+		scanOptions := fsfilter.Options{
+			ExcludePatterns:       fsfilter.SplitPatterns(excludeValue),
+			SkipPseudoFilesystems: skipPseudoFS,
+		}
+		if err := runBackup(client, root, logger, scanOptions); err != nil {
 			logger.Error("agent backup failed", "error", err)
 			os.Exit(1)
 		}
@@ -136,7 +145,22 @@ func (c *agentClient) sendHeartbeat() error {
 	return err
 }
 
-func runBackup(client *agentClient, root string, logger *slog.Logger) error {
+func envBool(name string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func runBackup(client *agentClient, root string, logger *slog.Logger, scanOptions fsfilter.Options) error {
 	root = filepath.Clean(root)
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -144,6 +168,11 @@ func runBackup(client *agentClient, root string, logger *slog.Logger) error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("root %q is not a directory", root)
+	}
+	if scanOptions.SkipPseudoFilesystems {
+		if fsName, ok, err := fsfilter.PseudoFilesystemName(root); err == nil && ok {
+			return fmt.Errorf("root %q is on unsupported pseudo filesystem %s", root, fsName)
+		}
 	}
 	hostname, _ := os.Hostname()
 	var created createRunResponse
@@ -158,7 +187,7 @@ func runBackup(client *agentClient, root string, logger *slog.Logger) error {
 	}
 	logger.Info("agent run started", "run", created.Run.ID, "root", root)
 
-	manifest, err := client.scanAndUpload(created.Run.ID, root, logger)
+	manifest, err := client.scanAndUpload(created.Run.ID, root, logger, scanOptions)
 	if err != nil {
 		return err
 	}
@@ -176,7 +205,22 @@ func runBackup(client *agentClient, root string, logger *slog.Logger) error {
 	return nil
 }
 
-func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logger) (*repository.SnapshotManifest, error) {
+type agentSkipReporter struct {
+	logger *slog.Logger
+	total  int64
+	logged int64
+}
+
+func (r *agentSkipReporter) record(event fsfilter.SkipEvent) {
+	r.total++
+	if r.logger == nil || r.logged >= 20 {
+		return
+	}
+	r.logged++
+	r.logger.Warn("agent skipped path", "path", event.Path, "rel", event.Rel, "reason", event.Reason)
+}
+
+func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logger, scanOptions fsfilter.Options) (*repository.SnapshotManifest, error) {
 	manifest := &repository.SnapshotManifest{
 		CreatedAt:  time.Now().UTC(),
 		SourceType: "agent",
@@ -195,6 +239,7 @@ func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logge
 		lastProgress = time.Now()
 		return c.sendProgress(runID, progress)
 	}
+	skipReporter := &agentSkipReporter{logger: logger}
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -203,6 +248,17 @@ func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logge
 		info, err := os.Lstat(path)
 		if err != nil {
 			return fmt.Errorf("stat %q: %w", path, err)
+		}
+		if event, skip := fsfilter.ShouldSkip(root, path, info, scanOptions); skip {
+			skipReporter.record(event)
+			progress.Message = "skipped " + event.Rel
+			if err := sendProgress(false); err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
@@ -273,7 +329,7 @@ func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logge
 	if err := sendProgress(true); err != nil {
 		return nil, err
 	}
-	logger.Info("agent scan complete", "files", progress.ProcessedFiles, "uploaded_chunks", progress.UploadedChunks, "reused_chunks", progress.ReusedChunks)
+	logger.Info("agent scan complete", "files", progress.ProcessedFiles, "uploaded_chunks", progress.UploadedChunks, "reused_chunks", progress.ReusedChunks, "skipped_paths", skipReporter.total)
 	return manifest, nil
 }
 

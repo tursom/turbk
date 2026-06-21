@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowUp, Download, FolderOpen, RotateCcw } from '@lucide/vue';
+import { ArrowUp, Download, FolderOpen, RotateCcw, Trash2 } from '@lucide/vue';
 import TablePanel from '../components/TablePanel';
 import { useAppContext } from '../appContext';
 
@@ -17,6 +17,10 @@ const {
   snapshots,
   restoreTasks,
   selectedSnapshot,
+  selectedSnapshotIds,
+  snapshotDeleteTarget,
+  snapshotDeleteMany,
+  deletingSnapshots,
   snapshotTreePath,
   snapshotTreeEntries,
   hostName,
@@ -112,6 +116,12 @@ const {
   snapshotDownloadURL,
   browseSnapshot,
   selectRestore,
+  toggleSnapshotSelection,
+  toggleAllSnapshots,
+  requestDeleteSnapshot,
+  requestDeleteSelectedSnapshots,
+  cancelSnapshotDelete,
+  confirmSnapshotDelete,
   createCredential,
   createHost,
   createJob,
@@ -128,26 +138,49 @@ const {
 <template>
   <section class="view">
   <TablePanel :title="t('nav.snapshots')" :empty="snapshots.length === 0">
+    <template #actions>
+      <button class="text-button" type="button" :disabled="selectedSnapshotIds.length === 0" @click="requestDeleteSelectedSnapshots">
+        <Trash2 :size="16" />
+        <span>{{ t('common.delete') }} {{ selectedSnapshotIds.length }}</span>
+      </button>
+    </template>
     <thead>
       <tr>
+        <th>
+          <input
+            type="checkbox"
+            :checked="snapshots.length > 0 && selectedSnapshotIds.length === snapshots.length"
+            :indeterminate.prop="selectedSnapshotIds.length > 0 && selectedSnapshotIds.length < snapshots.length"
+            @change="toggleAllSnapshots(($event.target as HTMLInputElement).checked)"
+          />
+        </th>
         <th>{{ t('field.id') }}</th>
         <th>{{ t('field.job') }}</th>
         <th>{{ t('field.manifest') }}</th>
         <th>{{ t('field.source') }}</th>
         <th>{{ t('field.files') }}</th>
         <th>{{ t('field.size') }}</th>
+        <th>{{ t('field.health') }}</th>
         <th>{{ t('field.created') }}</th>
         <th>{{ t('field.action') }}</th>
       </tr>
     </thead>
     <tbody>
       <tr v-for="snapshot in snapshots" :key="snapshot.id">
+        <td>
+          <input
+            type="checkbox"
+            :checked="selectedSnapshotIds.includes(snapshot.id)"
+            @change="toggleSnapshotSelection(snapshot, ($event.target as HTMLInputElement).checked)"
+          />
+        </td>
         <td>#{{ snapshot.id }}</td>
         <td>{{ nullText(snapshot.job_id) }}</td>
         <td>{{ snapshot.manifest_ref }}</td>
         <td>{{ sourceTypeLabel(snapshot.source_type) }}</td>
         <td>{{ snapshot.file_count }}</td>
         <td>{{ formatBytes(snapshot.total_size) }}</td>
+        <td><span class="tag">{{ statusText(snapshot.health || 'unknown') }}</span></td>
         <td>{{ formatTime(snapshot.created_at) }}</td>
         <td>
           <div class="button-row">
@@ -162,6 +195,10 @@ const {
             <button class="text-button" type="button" @click="selectRestore(snapshot, '.')">
               <RotateCcw :size="16" />
               <span>{{ t('common.restore') }}</span>
+            </button>
+            <button class="text-button danger" type="button" @click="requestDeleteSnapshot(snapshot)">
+              <Trash2 :size="16" />
+              <span>{{ t('common.delete') }}</span>
             </button>
           </div>
         </td>
@@ -228,5 +265,30 @@ const {
       </table>
     </div>
   </section>
+  <div v-if="snapshotDeleteTarget || snapshotDeleteMany" class="drawer-backdrop" @click.self="cancelSnapshotDelete">
+    <aside class="drawer-panel compact-dialog" aria-modal="true" role="dialog">
+      <div class="panel-title">
+        <h2>{{ t('snapshots.deleteTitle') }}</h2>
+        <button class="icon-button" type="button" @click="cancelSnapshotDelete">×</button>
+      </div>
+      <p class="panel-description">
+        {{
+          snapshotDeleteMany
+            ? t('snapshots.deleteManyConfirm', { count: selectedSnapshotIds.length })
+            : t('snapshots.deleteOneConfirm', { id: snapshotDeleteTarget?.id ?? '-' })
+        }}
+      </p>
+      <p class="panel-description">{{ t('snapshots.deleteSpaceHint') }}</p>
+      <div class="button-row dialog-actions">
+        <button class="text-button" type="button" @click="cancelSnapshotDelete">
+          <span>{{ t('common.cancel') }}</span>
+        </button>
+        <button class="text-button danger" type="button" :disabled="deletingSnapshots" @click="confirmSnapshotDelete">
+          <Trash2 :size="16" />
+          <span>{{ deletingSnapshots ? t('common.running') : t('common.delete') }}</span>
+        </button>
+      </div>
+    </aside>
+  </div>
 </section>
 </template>
