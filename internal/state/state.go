@@ -169,32 +169,43 @@ func (s *Store) Counts(ctx context.Context) (Counts, error) {
 
 func (s *Store) ListHosts(ctx context.Context) ([]Host, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, source_type, address, status, last_seen_at, created_at, updated_at
-		FROM hosts
-		ORDER BY created_at DESC, id DESC
+		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.created_at, h.updated_at,
+			c.id, c.name, c.type
+		FROM hosts h
+		LEFT JOIN credentials c ON c.id = h.credential_id
+		ORDER BY h.created_at DESC, h.id DESC
 		LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var hosts []Host
+	hosts := make([]Host, 0)
 	for rows.Next() {
-		var host Host
-		if err := rows.Scan(&host.ID, &host.Name, &host.SourceType, &host.Address, &host.Status, &host.LastSeenAt, &host.CreatedAt, &host.UpdatedAt); err != nil {
+		host, err := scanHost(rows)
+		if err != nil {
 			return nil, err
 		}
 		hosts = append(hosts, host)
 	}
-	return hosts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range hosts {
+		if err := s.hydrateHostAgent(ctx, &hosts[i]); err != nil {
+			return nil, err
+		}
+	}
+	return hosts, nil
 }
 
 type CreateHostInput struct {
-	Name       string
-	SourceType string
-	Address    sql.NullString
-	Status     string
-	LastSeenAt sql.NullTime
+	Name         string
+	SourceType   string
+	Address      sql.NullString
+	CredentialID sql.NullInt64
+	Status       string
+	LastSeenAt   sql.NullTime
 }
 
 func (s *Store) CreateHost(ctx context.Context, input CreateHostInput) (Host, error) {
@@ -211,9 +222,9 @@ func (s *Store) CreateHost(ctx context.Context, input CreateHostInput) (Host, er
 		input.Status = "unknown"
 	}
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO hosts (name, source_type, address, status, last_seen_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		input.Name, input.SourceType, input.Address, input.Status, input.LastSeenAt)
+		INSERT INTO hosts (name, source_type, address, credential_id, status, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		input.Name, input.SourceType, input.Address, input.CredentialID, input.Status, input.LastSeenAt)
 	if err != nil {
 		return Host{}, fmt.Errorf("create host: %w", err)
 	}
@@ -225,19 +236,93 @@ func (s *Store) CreateHost(ctx context.Context, input CreateHostInput) (Host, er
 }
 
 func (s *Store) GetHost(ctx context.Context, id int64) (Host, error) {
-	var host Host
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, name, source_type, address, status, last_seen_at, created_at, updated_at
-		FROM hosts
-		WHERE id = ?`, id).
-		Scan(&host.ID, &host.Name, &host.SourceType, &host.Address, &host.Status, &host.LastSeenAt, &host.CreatedAt, &host.UpdatedAt)
+	host, err := s.getHost(ctx, id)
 	if err == sql.ErrNoRows {
 		return Host{}, fmt.Errorf("host %d not found", id)
 	}
 	if err != nil {
 		return Host{}, fmt.Errorf("get host %d: %w", id, err)
 	}
+	if err := s.hydrateHostAgent(ctx, &host); err != nil {
+		return Host{}, err
+	}
 	return host, nil
+}
+
+func (s *Store) getHost(ctx context.Context, id int64) (Host, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.created_at, h.updated_at,
+			c.id, c.name, c.type
+		FROM hosts h
+		LEFT JOIN credentials c ON c.id = h.credential_id
+		WHERE h.id = ?`, id)
+	return scanHost(row)
+}
+
+type UpdateHostInput struct {
+	ID           int64
+	Name         string
+	Address      sql.NullString
+	CredentialID sql.NullInt64
+	Status       string
+}
+
+func (s *Store) UpdateHost(ctx context.Context, input UpdateHostInput) (Host, error) {
+	input.Name = strings.TrimSpace(input.Name)
+	input.Status = strings.TrimSpace(input.Status)
+	if input.ID <= 0 {
+		return Host{}, errors.New("host id is required")
+	}
+	if input.Name == "" {
+		return Host{}, errors.New("host name is required")
+	}
+	if input.Status == "" {
+		input.Status = "unknown"
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE hosts
+		SET name = ?, address = ?, credential_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`,
+		input.Name, input.Address, input.CredentialID, input.Status, input.ID)
+	if err != nil {
+		return Host{}, fmt.Errorf("update host: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Host{}, fmt.Errorf("get updated host rows affected: %w", err)
+	}
+	if changed == 0 {
+		return Host{}, fmt.Errorf("host %d not found", input.ID)
+	}
+	return s.GetHost(ctx, input.ID)
+}
+
+func (s *Store) UpdateHostStatus(ctx context.Context, id int64, address, status string, lastSeenAt time.Time) (Host, error) {
+	address = strings.TrimSpace(address)
+	status = strings.TrimSpace(status)
+	if id <= 0 {
+		return Host{}, errors.New("host id is required")
+	}
+	if status == "" {
+		status = "unknown"
+	}
+	addressValue := sql.NullString{String: address, Valid: address != ""}
+	lastSeenValue := sql.NullTime{Time: lastSeenAt.UTC(), Valid: !lastSeenAt.IsZero()}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE hosts
+		SET address = ?, status = ?, last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, addressValue, status, lastSeenValue, id)
+	if err != nil {
+		return Host{}, fmt.Errorf("update host status: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return Host{}, fmt.Errorf("get updated host status rows affected: %w", err)
+	}
+	if changed == 0 {
+		return Host{}, fmt.Errorf("host %d not found", id)
+	}
+	return s.GetHost(ctx, id)
 }
 
 func (s *Store) UpsertHostStatus(ctx context.Context, name, sourceType, address, status string, lastSeenAt time.Time) (Host, error) {
@@ -313,7 +398,7 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	}
 	defer rows.Close()
 
-	var jobs []Job
+	jobs := make([]Job, 0)
 	for rows.Next() {
 		var job Job
 		if err := rows.Scan(&job.ID, &job.HostID, &job.CredentialID, &job.Name, &job.SourceType, &job.SourceConfig, &job.Enabled, &job.Schedule, &job.Timezone, &job.MaxRuntimeSeconds, &job.RetryAttempts, &job.CreatedAt, &job.UpdatedAt); err != nil {
@@ -335,7 +420,7 @@ func (s *Store) ListRuns(ctx context.Context) ([]Run, error) {
 	}
 	defer rows.Close()
 
-	var runs []Run
+	runs := make([]Run, 0)
 	for rows.Next() {
 		var run Run
 		if err := rows.Scan(&run.ID, &run.JobID, &run.HostID, &run.Status, &run.StartedAt, &run.FinishedAt, &run.ErrorMessage, &run.CreatedAt); err != nil {
@@ -361,7 +446,7 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 	}
 	defer rows.Close()
 
-	var snapshots []Snapshot
+	snapshots := make([]Snapshot, 0)
 	for rows.Next() {
 		var snapshot Snapshot
 		if err := rows.Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt); err != nil {
@@ -372,7 +457,7 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 	return snapshots, rows.Err()
 }
 
-func (s *Store) UpsertAgentHeartbeat(ctx context.Context, subject, hostname, version string, now time.Time) error {
+func (s *Store) UpsertAgentHeartbeat(ctx context.Context, hostID int64, subject, hostname, version string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO agent_heartbeats (token_subject, hostname, agent_version, last_seen_at)
 		VALUES (?, ?, ?, ?)
@@ -384,8 +469,57 @@ func (s *Store) UpsertAgentHeartbeat(ctx context.Context, subject, hostname, ver
 	if err != nil {
 		return fmt.Errorf("upsert agent heartbeat: %w", err)
 	}
-	if _, err := s.UpsertHostStatus(ctx, subject, "agent", hostname, "online", now); err != nil {
-		return fmt.Errorf("upsert agent host: %w", err)
+	if _, err := s.UpdateHostStatus(ctx, hostID, hostname, "online", now); err != nil {
+		return fmt.Errorf("update agent host: %w", err)
+	}
+	return nil
+}
+
+type hostScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanHost(scanner hostScanner) (Host, error) {
+	var host Host
+	var credentialID sql.NullInt64
+	var credentialName sql.NullString
+	var credentialType sql.NullString
+	if err := scanner.Scan(
+		&host.ID,
+		&host.Name,
+		&host.SourceType,
+		&host.Address,
+		&host.CredentialID,
+		&host.Status,
+		&host.LastSeenAt,
+		&host.CreatedAt,
+		&host.UpdatedAt,
+		&credentialID,
+		&credentialName,
+		&credentialType,
+	); err != nil {
+		return Host{}, err
+	}
+	if credentialID.Valid {
+		host.Credential = &CredentialSummary{
+			ID:   credentialID.Int64,
+			Name: credentialName.String,
+			Type: credentialType.String,
+		}
+	}
+	return host, nil
+}
+
+func (s *Store) hydrateHostAgent(ctx context.Context, host *Host) error {
+	if host == nil || host.SourceType != "agent" {
+		return nil
+	}
+	agent, ok, err := s.GetAgentCredentialForHost(ctx, host.ID)
+	if err != nil {
+		return err
+	}
+	if ok {
+		host.Agent = &agent
 	}
 	return nil
 }
@@ -399,14 +533,17 @@ type Counts struct {
 }
 
 type Host struct {
-	ID         int64          `json:"id"`
-	Name       string         `json:"name"`
-	SourceType string         `json:"source_type"`
-	Address    sql.NullString `json:"address"`
-	Status     string         `json:"status"`
-	LastSeenAt sql.NullTime   `json:"last_seen_at"`
-	CreatedAt  time.Time      `json:"created_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
+	ID           int64              `json:"id"`
+	Name         string             `json:"name"`
+	SourceType   string             `json:"source_type"`
+	Address      sql.NullString     `json:"address"`
+	CredentialID sql.NullInt64      `json:"credential_id"`
+	Credential   *CredentialSummary `json:"credential,omitempty"`
+	Agent        *AgentCredential   `json:"agent,omitempty"`
+	Status       string             `json:"status"`
+	LastSeenAt   sql.NullTime       `json:"last_seen_at"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
 }
 
 type Job struct {
@@ -490,6 +627,7 @@ var schema = []string{
 		name TEXT NOT NULL,
 		source_type TEXT NOT NULL CHECK (source_type IN ('agent', 'sftp', 'ftp', 'ftps', 'webdav', 'local')),
 		address TEXT,
+		credential_id INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
 		status TEXT NOT NULL DEFAULT 'unknown',
 		last_seen_at DATETIME,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -518,6 +656,20 @@ var schema = []string{
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+	`CREATE TABLE IF NOT EXISTS agent_credentials (
+		credential_id INTEGER PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
+		host_id INTEGER NOT NULL UNIQUE REFERENCES hosts(id) ON DELETE CASCADE,
+		client_id TEXT NOT NULL UNIQUE,
+		secret_hash TEXT NOT NULL,
+		subject TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		last_used_at DATETIME,
+		revoked_at DATETIME
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_agent_credentials_client_id ON agent_credentials(client_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_jobs_host_id ON jobs(host_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_hosts_credential_id ON hosts(credential_id)`,
 	`CREATE TABLE IF NOT EXISTS runs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,

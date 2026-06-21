@@ -61,10 +61,31 @@ export interface Host {
   name: string;
   source_type: string;
   address: unknown;
+  credential_id: unknown;
+  credential?: CredentialSummary;
+  agent?: AgentCredential;
   status: string;
   last_seen_at: unknown;
   created_at: string;
   updated_at: string;
+}
+
+export interface CredentialSummary {
+  id: number;
+  name: string;
+  type: string;
+}
+
+export interface AgentCredential {
+  credential_id: number;
+  host_id: number;
+  client_id: string;
+  client_secret?: string;
+  subject?: string;
+  created_at: string;
+  updated_at: string;
+  last_used_at: unknown;
+  revoked_at: unknown;
 }
 
 export interface Credential {
@@ -73,6 +94,7 @@ export interface Credential {
   type: string;
   client_id?: string;
   client_secret?: string;
+  subject?: string;
   created_at: string;
   updated_at: string;
 }
@@ -302,8 +324,8 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   hosts: () => request<{ hosts: Host[] }>('/api/v1/hosts'),
-  createHost: (payload: { name: string; source_type: string; address?: string; status?: string }) =>
-    request<{ host: Host }>('/api/v1/hosts', {
+  createHost: (payload: { name: string; source_type: string; address?: string; credential_id?: number; status?: string }) =>
+    request<{ host: Host; credential?: Credential; agent?: { client_id: string; client_secret: string } }>('/api/v1/hosts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -318,9 +340,8 @@ export const api = {
   jobs: () => request<{ jobs: Job[] }>('/api/v1/jobs'),
   createJob: (payload: {
     name: string;
-    source_type: string;
+    host_id: number;
     source_config: Record<string, unknown>;
-    credential_id?: number;
     enabled: boolean;
     schedule?: string;
     timezone?: string;
@@ -337,7 +358,6 @@ export const api = {
     payload: {
       name?: string;
       source_config?: Record<string, unknown>;
-      credential_id?: number;
       enabled?: boolean;
       schedule?: string;
       timezone?: string;

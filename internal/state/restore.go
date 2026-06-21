@@ -79,7 +79,7 @@ func (s *Store) ListRestoreTasks(ctx context.Context) ([]RestoreTask, error) {
 	}
 	defer rows.Close()
 
-	var tasks []RestoreTask
+	tasks := make([]RestoreTask, 0)
 	for rows.Next() {
 		var task RestoreTask
 		if err := rows.Scan(&task.ID, &task.SnapshotID, &task.TargetPath, &task.Status, &task.CreatedAt, &task.UpdatedAt); err != nil {

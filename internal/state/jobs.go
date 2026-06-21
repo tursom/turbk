@@ -13,9 +13,8 @@ var ErrActiveRunExists = errors.New("active run already exists for job")
 
 type CreateJobInput struct {
 	Name              string          `json:"name"`
-	SourceType        string          `json:"source_type"`
+	HostID            int64           `json:"host_id"`
 	SourceConfig      json.RawMessage `json:"source_config"`
-	CredentialID      sql.NullInt64   `json:"credential_id"`
 	Enabled           bool            `json:"enabled"`
 	Schedule          sql.NullString  `json:"schedule"`
 	Timezone          string          `json:"timezone"`
@@ -27,7 +26,6 @@ type UpdateJobInput struct {
 	ID                int64           `json:"id"`
 	Name              string          `json:"name"`
 	SourceConfig      json.RawMessage `json:"source_config"`
-	CredentialID      sql.NullInt64   `json:"credential_id"`
 	Enabled           bool            `json:"enabled"`
 	Schedule          sql.NullString  `json:"schedule"`
 	Timezone          string          `json:"timezone"`
@@ -46,6 +44,7 @@ type CreateSnapshotInput struct {
 }
 
 type AgentJobInput struct {
+	HostID       int64
 	CredentialID int64
 	Name         string
 	SourceConfig json.RawMessage
@@ -92,8 +91,12 @@ func (s *Store) CreateJob(ctx context.Context, input CreateJobInput) (Job, error
 	if input.Name == "" {
 		return Job{}, errors.New("job name is required")
 	}
-	if input.SourceType == "" {
-		return Job{}, errors.New("job source_type is required")
+	if input.HostID <= 0 {
+		return Job{}, errors.New("job host_id is required")
+	}
+	host, err := s.GetHost(ctx, input.HostID)
+	if err != nil {
+		return Job{}, err
 	}
 	if len(input.SourceConfig) == 0 {
 		input.SourceConfig = json.RawMessage(`{}`)
@@ -112,9 +115,9 @@ func (s *Store) CreateJob(ctx context.Context, input CreateJobInput) (Job, error
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-			INSERT INTO jobs (name, source_type, source_config, credential_id, enabled, schedule, timezone, max_runtime_seconds, retry_attempts)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		input.Name, input.SourceType, string(input.SourceConfig), input.CredentialID, input.Enabled, input.Schedule, input.Timezone, input.MaxRuntimeSeconds, input.RetryAttempts)
+			INSERT INTO jobs (host_id, credential_id, name, source_type, source_config, enabled, schedule, timezone, max_runtime_seconds, retry_attempts)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		host.ID, host.CredentialID, input.Name, host.SourceType, string(input.SourceConfig), input.Enabled, input.Schedule, input.Timezone, input.MaxRuntimeSeconds, input.RetryAttempts)
 	if err != nil {
 		return Job{}, fmt.Errorf("create job: %w", err)
 	}
@@ -150,9 +153,9 @@ func (s *Store) UpdateJob(ctx context.Context, input UpdateJobInput) (Job, error
 
 	result, err := s.db.ExecContext(ctx, `
 			UPDATE jobs
-			SET name = ?, source_config = ?, credential_id = ?, enabled = ?, schedule = ?, timezone = ?, max_runtime_seconds = ?, retry_attempts = ?, updated_at = CURRENT_TIMESTAMP
+			SET name = ?, source_config = ?, enabled = ?, schedule = ?, timezone = ?, max_runtime_seconds = ?, retry_attempts = ?, updated_at = CURRENT_TIMESTAMP
 			WHERE id = ?`,
-		input.Name, string(input.SourceConfig), input.CredentialID, input.Enabled, input.Schedule, input.Timezone, input.MaxRuntimeSeconds, input.RetryAttempts, input.ID)
+		input.Name, string(input.SourceConfig), input.Enabled, input.Schedule, input.Timezone, input.MaxRuntimeSeconds, input.RetryAttempts, input.ID)
 	if err != nil {
 		return Job{}, fmt.Errorf("update job: %w", err)
 	}
@@ -167,6 +170,9 @@ func (s *Store) UpdateJob(ctx context.Context, input UpdateJobInput) (Job, error
 }
 
 func (s *Store) FindOrCreateAgentJob(ctx context.Context, input AgentJobInput) (Job, bool, error) {
+	if input.HostID <= 0 {
+		return Job{}, false, errors.New("agent host_id is required")
+	}
 	if input.CredentialID <= 0 {
 		return Job{}, false, errors.New("agent credential_id is required")
 	}
@@ -193,9 +199,9 @@ func (s *Store) FindOrCreateAgentJob(ctx context.Context, input AgentJobInput) (
 	err = tx.QueryRowContext(ctx, `
 		SELECT id
 		FROM jobs
-		WHERE source_type = 'agent' AND credential_id = ? AND name = ?
+		WHERE source_type = 'agent' AND host_id = ? AND name = ?
 		ORDER BY id DESC
-		LIMIT 1`, input.CredentialID, input.Name).Scan(&id)
+		LIMIT 1`, input.HostID, input.Name).Scan(&id)
 	if err == nil {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE jobs
@@ -214,9 +220,9 @@ func (s *Store) FindOrCreateAgentJob(ctx context.Context, input AgentJobInput) (
 	}
 
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO jobs (name, source_type, source_config, credential_id, enabled, timezone)
-		VALUES (?, 'agent', ?, ?, 1, ?)`,
-		input.Name, string(input.SourceConfig), input.CredentialID, input.Timezone)
+		INSERT INTO jobs (host_id, credential_id, name, source_type, source_config, enabled, timezone)
+		VALUES (?, ?, ?, 'agent', ?, 1, ?)`,
+		input.HostID, input.CredentialID, input.Name, string(input.SourceConfig), input.Timezone)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("create agent job: %w", err)
 	}
@@ -261,7 +267,7 @@ func (s *Store) ListScheduledJobs(ctx context.Context) ([]Job, error) {
 	}
 	defer rows.Close()
 
-	var jobs []Job
+	jobs := make([]Job, 0)
 	for rows.Next() {
 		var job Job
 		if err := rows.Scan(&job.ID, &job.HostID, &job.CredentialID, &job.Name, &job.SourceType, &job.SourceConfig, &job.Enabled, &job.Schedule, &job.Timezone, &job.MaxRuntimeSeconds, &job.RetryAttempts, &job.CreatedAt, &job.UpdatedAt); err != nil {
@@ -546,7 +552,7 @@ func (s *Store) ListRunLogs(ctx context.Context, runID int64) ([]RunLog, error) 
 	}
 	defer rows.Close()
 
-	var logs []RunLog
+	logs := make([]RunLog, 0)
 	for rows.Next() {
 		var log RunLog
 		if err := rows.Scan(&log.ID, &log.RunID, &log.Level, &log.Message, &log.CreatedAt); err != nil {
@@ -635,7 +641,7 @@ func (s *Store) ListActiveSnapshots(ctx context.Context) ([]Snapshot, error) {
 	}
 	defer rows.Close()
 
-	var snapshots []Snapshot
+	snapshots := make([]Snapshot, 0)
 	for rows.Next() {
 		var snapshot Snapshot
 		if err := rows.Scan(&snapshot.ID, &snapshot.JobID, &snapshot.HostID, &snapshot.RunID, &snapshot.CreatedAt, &snapshot.SourceType, &snapshot.ManifestRef, &snapshot.FileCount, &snapshot.TotalSize, &snapshot.DeletedAt); err != nil {

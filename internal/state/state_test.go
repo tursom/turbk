@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,9 +51,16 @@ func TestJobRunSnapshotStateFlow(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
+	host, err := store.CreateHost(ctx, CreateHostInput{
+		Name:       "local server",
+		SourceType: "local",
+	})
+	if err != nil {
+		t.Fatalf("CreateHost() error = %v", err)
+	}
 	job, err := store.CreateJob(ctx, CreateJobInput{
 		Name:              "local source",
-		SourceType:        "local",
+		HostID:            host.ID,
 		SourceConfig:      []byte(`{"root":"/tmp/source"}`),
 		Enabled:           true,
 		MaxRuntimeSeconds: 3600,
@@ -185,6 +193,76 @@ func TestCredentialsAreEncryptedAtRest(t *testing.T) {
 	}
 	if loaded.ID != credential.ID || !bytes.Equal(decrypted, payload) {
 		t.Fatalf("unexpected decrypted payload: credential=%+v payload=%s", loaded, string(decrypted))
+	}
+}
+
+func TestAgentCredentialIndexedLookup(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+
+	store, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	clientID := "agt_state_lookup"
+	clientSecret := "ags_state_lookup"
+	payload := []byte(`{"client_id":"agt_state_lookup","client_secret":"ags_state_lookup","secret_hash":"` + HashAgentSecret(clientID, clientSecret) + `","subject":"agent-host"}`)
+	host, credential, err := store.CreateAgentHost(ctx, CreateAgentHostInput{
+		Name:         "agent-host",
+		Payload:      payload,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		SecretHash:   HashAgentSecret(clientID, clientSecret),
+		Subject:      "agent-host",
+	})
+	if err != nil {
+		t.Fatalf("CreateAgentHost() error = %v", err)
+	}
+	if !host.CredentialID.Valid || host.CredentialID.Int64 != credential.ID || host.Agent == nil || host.Agent.ClientSecret != clientSecret {
+		t.Fatalf("agent host did not expose bound credential: host=%+v credential=%+v", host, credential)
+	}
+
+	rows, err := store.db.QueryContext(ctx, `PRAGMA index_list(agent_credentials)`)
+	if err != nil {
+		t.Fatalf("inspect agent credential indexes: %v", err)
+	}
+	defer rows.Close()
+	seenClientIDIndex := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan agent credential index: %v", err)
+		}
+		if name == "idx_agent_credentials_client_id" {
+			seenClientIDIndex = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate agent credential indexes: %v", err)
+	}
+	if !seenClientIDIndex {
+		t.Fatal("agent_credentials.client_id index is missing")
+	}
+
+	auth, err := store.FindAgentCredentialByClientSecret(ctx, clientID, clientSecret)
+	if err != nil {
+		t.Fatalf("FindAgentCredentialByClientSecret() error = %v", err)
+	}
+	if auth.HostID != host.ID || auth.Credential.ID != credential.ID || auth.Subject != "agent-host" {
+		t.Fatalf("unexpected agent auth context: %+v", auth)
+	}
+	if _, err := store.FindAgentCredentialByClientSecret(ctx, clientID, "wrong"); !errors.Is(err, ErrAgentCredentialNotFound) {
+		t.Fatalf("wrong secret error = %v, want ErrAgentCredentialNotFound", err)
 	}
 }
 
