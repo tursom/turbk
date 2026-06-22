@@ -312,7 +312,7 @@ docker compose build
 docker compose up -d
 ```
 
-agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 compose 默认以 daemon 模式常驻运行，并把本地 catalog 持久化到 `./agent-state`。daemon 默认每 10 分钟轮询服务端 command，本地定期备份间隔默认 `24h`。
+agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 compose 默认以 daemon 模式常驻运行，并把本地 catalog 持久化到 `./agent-state`。daemon 默认每 10 分钟轮询服务端 command，本地定期备份 cron 默认 `0 0 * * *`。
 
 Web UI 的主机详情页会为 Agent 主机生成多种接入方式：Docker Compose、Docker run、Linux 二进制和 systemd service。推荐优先从页面复制对应配置，避免手工拼写 Client ID、Secret 和服务端地址。
 

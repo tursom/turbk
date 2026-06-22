@@ -42,11 +42,12 @@ type runRef struct {
 }
 
 type agentCommand struct {
-	ID        int64     `json:"id"`
-	Type      string    `json:"type"`
-	JobID     int64     `json:"job_id"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID        int64           `json:"id"`
+	Type      string          `json:"type"`
+	JobID     int64           `json:"job_id"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"created_at"`
+	ExpiresAt time.Time       `json:"expires_at"`
 }
 
 type heartbeatRequest struct {
@@ -467,7 +468,15 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				}
 				continue
 			}
-			if len(opts.Roots) == 0 {
+			commandRoots, err := backupRootsForCommand(command, opts.Roots)
+			if err != nil {
+				lastError = err.Error()
+				if err := client.ackCommand(command.ID, "failed", err.Error()); err != nil {
+					logger.Warn("agent invalid command ack failed", "command", command.ID, "error", err)
+				}
+				continue
+			}
+			if len(commandRoots) == 0 {
 				if err := client.ackCommand(command.ID, "dropped", "root_not_configured"); err != nil {
 					logger.Warn("agent root-not-configured command drop failed", "command", command.ID, "error", err)
 				}
@@ -476,7 +485,7 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 			running = true
 			backupCommandHandled = true
 			lastBackupStarted = time.Now().UTC()
-			err := runBackupWithOptions(client, opts.Roots, logger, opts.ScanOptions, backupRunOptions{
+			err = runBackupWithOptions(client, commandRoots, logger, opts.ScanOptions, backupRunOptions{
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
 				ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
@@ -538,6 +547,42 @@ func dueByCron(schedule string, lastChecked, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+func backupRootsForCommand(command agentCommand, fallback []string) ([]string, error) {
+	if roots, ok, err := rootsFromCommandPayload(command.Payload); err != nil {
+		return nil, err
+	} else if ok {
+		return roots, nil
+	}
+	if len(fallback) == 0 {
+		return nil, nil
+	}
+	return rootset.Normalize(fallback)
+}
+
+func rootsFromCommandPayload(payload json.RawMessage) ([]string, bool, error) {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || bytes.Equal(payload, []byte("null")) {
+		return nil, false, nil
+	}
+	var req struct {
+		Root  string   `json:"root"`
+		Roots []string `json:"roots"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil, false, fmt.Errorf("parse command payload roots: %w", err)
+	}
+	if len(req.Roots) > 0 {
+		roots, err := rootset.Normalize(req.Roots)
+		return roots, true, err
+	}
+	req.Root = strings.TrimSpace(req.Root)
+	if req.Root == "" {
+		return nil, false, nil
+	}
+	roots, err := rootset.Normalize([]string{req.Root})
+	return roots, true, err
 }
 
 func commandCreatedDuringLastRun(command agentCommand, started, finished time.Time) bool {

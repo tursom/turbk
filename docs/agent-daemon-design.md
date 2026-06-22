@@ -477,9 +477,9 @@ expired
 ### 10.2 领取流程
 
 1. Web 用户点击 Agent job 的手动运行。
-2. Server 创建 `agent_commands` 记录，状态 `pending`，递增 `command_generation`。
+2. Server 创建 `agent_commands` 记录，状态 `pending`，payload 带上当前保存的 roots，递增 `command_generation`。
 3. Agent heartbeat/poll 获取命令。
-4. 如果 Agent 空闲，调用 create run 时携带 `command_id`，Server 原子地把命令标记为 `claimed/running`。
+4. 如果 Agent 空闲，优先使用 command payload 的 roots 调用 create run 并携带 `command_id`，Server 原子地把命令标记为 `claimed/running`。
 5. 如果 Agent 忙碌，Agent 调用 ack 接口把命令标记为 `dropped`，原因 `agent_busy`。
 6. run 完成后，Agent 或 Server 把命令状态更新为 `completed/failed`。
 
@@ -500,6 +500,10 @@ POST /agent/v1/heartbeat
       "id": 42,
       "type": "run-backup",
       "job_id": 7,
+      "payload": {
+        "job_id": 7,
+        "roots": ["/backup/source"]
+      },
       "created_at": "2026-06-21T10:00:00Z",
       "expires_at": "2026-06-21T10:30:00Z"
     }
@@ -528,7 +532,7 @@ Content-Type: application/json
 {
   "command_id": 42,
   "trigger": "manual",
-  "root": "/backup/source",
+  "roots": ["/backup/source"],
   "repository_id": "repo-a",
   "base_chunk_generation": 13
 }

@@ -2118,6 +2118,164 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	}
 }
 
+func TestAgentSetupCreatesTriggerableJobAndCommandRootsDriveRun(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "daemon-trigger-host",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Host  state.Host `json:"host"`
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := []string{"/var/lib/docker", "/etc"}
+	status, body = requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/hosts/"+strconv.FormatInt(createdAgent.Host.ID, 10), cookie, map[string]any{
+		"agent_setup": map[string]any{
+			"roots":           roots,
+			"backup_schedule": "0 2 * * *",
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("patch agent setup status = %d body=%s", status, string(body))
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agentJob state.Job
+	for _, job := range jobs {
+		if job.SourceType == "agent" && job.HostID.Valid && job.HostID.Int64 == createdAgent.Host.ID {
+			agentJob = job
+			break
+		}
+	}
+	if agentJob.ID == 0 {
+		t.Fatalf("agent setup did not create a triggerable job: %+v", jobs)
+	}
+	var sourceConfig struct {
+		Root  string   `json:"root"`
+		Roots []string `json:"roots"`
+	}
+	if err := json.Unmarshal([]byte(agentJob.SourceConfig), &sourceConfig); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sourceConfig.Roots, roots) {
+		t.Fatalf("agent job roots = %#v, want %#v", sourceConfig.Roots, roots)
+	}
+
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs/"+strconv.FormatInt(agentJob.ID, 10)+"/run", cookie, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("queue agent job status = %d body=%s", status, string(body))
+	}
+	type commandPayload struct {
+		ID      int64           `json:"id"`
+		JobID   int64           `json:"job_id"`
+		Status  string          `json:"status"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	var queued struct {
+		Command commandPayload `json:"command"`
+	}
+	if err := json.Unmarshal(body, &queued); err != nil {
+		t.Fatal(err)
+	}
+	var queuedPayload struct {
+		JobID int64    `json:"job_id"`
+		Roots []string `json:"roots"`
+	}
+	if err := json.Unmarshal(queued.Command.Payload, &queuedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if queuedPayload.JobID != agentJob.ID || !reflect.DeepEqual(queuedPayload.Roots, roots) {
+		t.Fatalf("queued command payload = %+v, want job=%d roots=%#v", queuedPayload, agentJob.ID, roots)
+	}
+
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/heartbeat", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname":       "daemon-trigger-hostname",
+		"version":        "test",
+		"mode":           "daemon",
+		"state_dir":      "/var/lib/turbk-agent",
+		"catalog_status": "ok",
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("agent heartbeat status = %d body=%s", status, string(body))
+	}
+	var heartbeat struct {
+		Commands []commandPayload `json:"commands"`
+	}
+	if err := json.Unmarshal(body, &heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if len(heartbeat.Commands) != 1 || heartbeat.Commands[0].ID != queued.Command.ID {
+		t.Fatalf("heartbeat commands = %+v, want command %d", heartbeat.Commands, queued.Command.ID)
+	}
+	var heartbeatPayload struct {
+		Roots []string `json:"roots"`
+	}
+	if err := json.Unmarshal(heartbeat.Commands[0].Payload, &heartbeatPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(heartbeatPayload.Roots, roots) {
+		t.Fatalf("heartbeat command roots = %#v, want %#v", heartbeatPayload.Roots, roots)
+	}
+
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname":   "daemon-trigger-hostname",
+		"command_id": queued.Command.ID,
+		"roots":      heartbeatPayload.Roots,
+		"trigger":    "manual",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("agent command create run status = %d body=%s", status, string(body))
+	}
+	var createdRun struct {
+		Run state.Run `json:"run"`
+		Job state.Job `json:"job"`
+	}
+	if err := json.Unmarshal(body, &createdRun); err != nil {
+		t.Fatal(err)
+	}
+	if createdRun.Run.ID == 0 || !createdRun.Run.JobID.Valid || createdRun.Run.JobID.Int64 != agentJob.ID || createdRun.Job.ID != agentJob.ID {
+		t.Fatalf("created run/job = %+v / %+v, want job %d", createdRun.Run, createdRun.Job, agentJob.ID)
+	}
+	command, err := store.GetAgentCommand(context.Background(), queued.Command.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Status != "running" || !command.RunID.Valid || command.RunID.Int64 != createdRun.Run.ID {
+		t.Fatalf("command after create run = %+v, want running run %d", command, createdRun.Run.ID)
+	}
+}
+
 func TestAgentManifestMissingChunksIsRetryable(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()

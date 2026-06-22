@@ -40,7 +40,7 @@ docker compose up -d
 
 compose 会把 `TURBK_AGENT_SOURCE_DIR` 只读挂载到容器内相同的绝对路径，并把 `TURBK_AGENT_STATE_HOST_DIR` 持久挂载到 `/var/lib/turbk-agent`。agent 默认以 daemon 模式常驻运行，本地 SQLite catalog 会记录文件元数据、文件 chunk 列表和服务端已确认 chunk 状态。删除 state 目录不会损坏服务端数据，但下次启动会退化为重新扫描和重新向服务端确认 chunk。
 
-daemon 默认每 10 分钟轮询一次服务端，领取 Web 手动运行产生的 command；本地定期备份由 `TURBK_AGENT_BACKUP_SCHEDULE` 控制，默认 `0 0 * * *`。同一时间只执行一个备份，忙碌时收到的多余手动 command 会被标记为 dropped。
+daemon 默认每 10 分钟轮询一次服务端，领取 Web 手动运行产生的 command；手动 command 优先使用服务端保存的备份目录，旧 command 未携带目录时回退到本地 `TURBK_AGENT_ROOTS`。本地定期备份由 `TURBK_AGENT_BACKUP_SCHEDULE` 控制，默认 `0 0 * * *`。同一时间只执行一个备份，忙碌时收到的多余手动 command 会被标记为 dropped。
 
 ## 多目录
 

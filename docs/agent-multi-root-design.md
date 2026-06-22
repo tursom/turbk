@@ -185,16 +185,12 @@ turbk-agent \
 行为：
 
 - heartbeat 继续上报 daemon 状态。
-- 服务端手动运行只下发 `run-backup` 命令。
-- Agent 收到命令后使用本地配置的 roots 发起 run。
+- 服务端手动运行下发 `run-backup` 命令，并在 payload 中携带服务端保存的 roots。
+- Agent 收到命令后优先使用 command payload 的 roots 发起 run；旧命令或无 roots payload 时回退到本地配置的 roots。
 - 本地 `backup_schedule` 命中时也使用同一组 roots 发起 run。
 - 多余命令仍按现有策略 `dropped: agent_busy`。
 
-本次不要求服务端在 command payload 中下发 host 真实路径。原因是：
-
-- Docker 模式下服务端无法验证宿主机路径。
-- Host 不应该保存目录。
-- Agent 本地配置才是该主机可访问路径的事实来源。
+服务端保存的 roots 用于生成接入配置和手动触发命令。Docker 模式下服务端仍无法验证宿主机路径，用户必须确保 compose/docker/systemd 配置把这些路径挂载或暴露给 Agent。
 
 ## 9. 服务端 API 合约
 

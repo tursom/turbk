@@ -164,6 +164,29 @@ func TestRootFlagCommandLineOverridesEnvironment(t *testing.T) {
 	}
 }
 
+func TestBackupRootsForCommandUsesPayloadRoots(t *testing.T) {
+	roots, err := backupRootsForCommand(agentCommand{
+		Payload: json.RawMessage(`{"roots":["/server/root","/server/logs"]}`),
+	}, []string{"/local/root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/server/root", "/server/logs"}
+	if len(roots) != len(want) || roots[0] != want[0] || roots[1] != want[1] {
+		t.Fatalf("roots = %#v, want %#v", roots, want)
+	}
+}
+
+func TestBackupRootsForCommandFallsBackToLocalRoots(t *testing.T) {
+	roots, err := backupRootsForCommand(agentCommand{Payload: json.RawMessage(`{"job_id":7}`)}, []string{"/local/root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0] != "/local/root" {
+		t.Fatalf("roots = %#v, want local fallback", roots)
+	}
+}
+
 func TestParseBackupScheduleOrDefault(t *testing.T) {
 	if got := parseBackupScheduleOrDefault("*/15 * * * *", defaultAgentBackupSchedule); got != "*/15 * * * *" {
 		t.Fatalf("valid schedule = %q", got)

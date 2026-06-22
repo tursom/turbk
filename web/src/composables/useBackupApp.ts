@@ -848,6 +848,8 @@ export function useBackupApp() {
       const response = await api.updateHost(host.id, { agent_setup: agentSetupPayload() });
       const index = hosts.value.findIndex((item) => item.id === response.host.id);
       if (index >= 0) hosts.value[index] = response.host;
+      const jobResponse = await api.jobs();
+      jobs.value = jobResponse.jobs;
       lastSavedAgentSetupKey = saveKey;
       agentSetupSaveMessage.value = t('message.agentSetupSaved');
     } catch (err) {

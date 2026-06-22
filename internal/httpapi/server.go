@@ -389,6 +389,12 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if updated.SourceType == "agent" && updated.AgentSetup != nil && len(updated.AgentSetup.Roots) > 0 {
+		if _, _, err := s.ensureAgentJobForHostSetup(r.Context(), updated); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"host": updated})
 }
 
@@ -653,6 +659,11 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("agent job host_id is required"))
 			return
 		}
+		host, err := s.store.GetHost(r.Context(), job.HostID.Int64)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		ttl, err := time.ParseDuration(s.cfg.Agent.CommandTTL)
 		if err != nil || ttl <= 0 {
 			ttl = 30 * time.Minute
@@ -661,7 +672,7 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 			HostID:    job.HostID.Int64,
 			JobID:     sql.NullInt64{Int64: job.ID, Valid: true},
 			Type:      "run-backup",
-			Payload:   mustJSON(map[string]any{"job_id": job.ID}),
+			Payload:   agentRunCommandPayload(job, host),
 			CreatedBy: "web",
 			ExpiresAt: time.Now().UTC().Add(ttl),
 		})
@@ -956,15 +967,42 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseRunGate()
-	job, created, err := s.store.FindOrCreateAgentJob(r.Context(), state.AgentJobInput{
-		HostID:       agent.HostID,
-		CredentialID: agent.Credential.ID,
-		Name:         agentJobName(agentHost),
-		SourceConfig: sourceConfig,
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	var job state.Job
+	created := false
+	if req.CommandID > 0 {
+		command, err := s.store.GetAgentCommand(r.Context(), req.CommandID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if command.HostID != agent.HostID {
+			writeError(w, http.StatusForbidden, errors.New("agent command does not belong to this host"))
+			return
+		}
+		if command.JobID.Valid {
+			job, err = s.store.GetJob(r.Context(), command.JobID.Int64)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			if job.SourceType != "agent" || !job.HostID.Valid || job.HostID.Int64 != agent.HostID {
+				writeError(w, http.StatusForbidden, errors.New("agent command job does not belong to this host"))
+				return
+			}
+		}
+	}
+	if job.ID == 0 {
+		var err error
+		job, created, err = s.store.FindOrCreateAgentJob(r.Context(), state.AgentJobInput{
+			HostID:       agent.HostID,
+			CredentialID: agent.Credential.ID,
+			Name:         agentJobName(agentHost),
+			SourceConfig: sourceConfig,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	run, err := s.store.CreateRun(r.Context(), job)
 	if err != nil {
@@ -1517,6 +1555,66 @@ func agentJobName(host state.Host) string {
 		name = fmt.Sprintf("host-%d", host.ID)
 	}
 	return fmt.Sprintf("Agent backup - %s", name)
+}
+
+func (s *Server) ensureAgentJobForHostSetup(ctx context.Context, host state.Host) (state.Job, bool, error) {
+	if host.SourceType != "agent" || host.AgentSetup == nil || len(host.AgentSetup.Roots) == 0 {
+		return state.Job{}, false, nil
+	}
+	if !host.CredentialID.Valid {
+		return state.Job{}, false, errors.New("agent host credential_id is required")
+	}
+	sourceConfig, err := agentSourceConfigFromRoots(host.AgentSetup.Roots)
+	if err != nil {
+		return state.Job{}, false, err
+	}
+	return s.store.FindOrCreateAgentJob(ctx, state.AgentJobInput{
+		HostID:       host.ID,
+		CredentialID: host.CredentialID.Int64,
+		Name:         agentJobName(host),
+		SourceConfig: sourceConfig,
+		Timezone:     s.cfg.Scheduler.Timezone,
+	})
+}
+
+func agentSourceConfigFromRoots(roots []string) (json.RawMessage, error) {
+	normalized, err := rootset.Normalize(roots)
+	if err != nil {
+		return nil, err
+	}
+	if len(normalized) == 0 {
+		return nil, errors.New("agent roots are required")
+	}
+	payload := map[string]any{}
+	if len(normalized) == 1 {
+		payload["root"] = normalized[0]
+	} else {
+		payload["roots"] = normalized
+	}
+	return json.Marshal(payload)
+}
+
+func agentRunCommandPayload(job state.Job, host state.Host) json.RawMessage {
+	payload := map[string]any{"job_id": job.ID}
+	if roots, ok := agentCommandRoots(job, host); ok {
+		payload["roots"] = roots
+	}
+	return mustJSON(payload)
+}
+
+func agentCommandRoots(job state.Job, host state.Host) ([]string, bool) {
+	var cfg jobSourceConfig
+	if strings.TrimSpace(job.SourceConfig) != "" && json.Unmarshal([]byte(job.SourceConfig), &cfg) == nil {
+		if roots, err := rootsFromSourceConfig(cfg); err == nil && len(roots) > 0 {
+			return roots, true
+		}
+	}
+	if host.AgentSetup != nil && len(host.AgentSetup.Roots) > 0 {
+		if roots, err := rootset.Normalize(host.AgentSetup.Roots); err == nil && len(roots) > 0 {
+			return roots, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Server) authorizeAgentRun(w http.ResponseWriter, r *http.Request, agent agentAuthContext, runID int64) (state.Job, state.Run, bool) {
