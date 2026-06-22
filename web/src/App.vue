@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { provide } from 'vue';
-import { Activity, CheckCircle2, LogOut, RefreshCw, Shield, User } from '@lucide/vue';
+import { Activity, CheckCircle2, LogOut, RefreshCw, User } from '@lucide/vue';
 import { appContextKey } from './appContext';
 import { useBackupApp } from './composables/useBackupApp';
 import CredentialsPage from './pages/CredentialsPage.vue';
@@ -47,7 +47,7 @@ const {
     <section class="login-panel">
       <div class="login-topline">
         <div class="brand-mark">
-          <Shield :size="22" />
+          <img class="brand-logo" src="/logo.svg" alt="Turbk" />
         </div>
         <div class="language-switch" role="group" :aria-label="t('language')">
           <button type="button" :class="{ active: locale === 'zh' }" @click="setLocale('zh')">{{ t('language.zh') }}</button>
@@ -66,7 +66,7 @@ const {
     <form class="login-panel" @submit.prevent="login">
       <div class="login-topline">
         <div class="brand-mark">
-          <Shield :size="22" />
+          <img class="brand-logo" src="/logo.svg" alt="Turbk" />
         </div>
         <div class="language-switch" role="group" :aria-label="t('language')">
           <button type="button" :class="{ active: locale === 'zh' }" @click="setLocale('zh')">{{ t('language.zh') }}</button>
@@ -96,7 +96,7 @@ const {
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">
-          <Shield :size="22" />
+          <img class="brand-logo" src="/logo.svg" alt="Turbk" />
         </div>
         <div>
           <strong>Turbk</strong>

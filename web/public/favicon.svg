@@ -1,0 +1,22 @@
+<svg width="64" height="64" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Turbk favicon</title>
+  <desc id="desc">A rounded blue backup-server mark with segmented storage lanes forming a T.</desc>
+  <defs>
+    <linearGradient id="bg" x1="36" y1="28" x2="220" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14B8A6"/>
+      <stop offset="0.5" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#1E3A8A"/>
+    </linearGradient>
+    <linearGradient id="lane" x1="64" y1="76" x2="192" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D7F3FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="28" y="28" width="200" height="200" rx="44" fill="url(#bg)"/>
+  <path d="M78 78C78 70.268 84.268 64 92 64H164C171.732 64 178 70.268 178 78V90H78V78Z" fill="url(#lane)"/>
+  <path d="M78 104H178V128H78V104Z" fill="#EAFBFF" fill-opacity="0.92"/>
+  <path d="M78 142H112V178C112 185.732 118.268 192 126 192H130C137.732 192 144 185.732 144 178V142H178V166C178 188.091 160.091 206 138 206H118C95.9086 206 78 188.091 78 166V142Z" fill="#EAFBFF" fill-opacity="0.92"/>
+  <path d="M128 82V176" stroke="#0F172A" stroke-opacity="0.82" stroke-width="20" stroke-linecap="round"/>
+  <path d="M94 82H162" stroke="#0F172A" stroke-opacity="0.82" stroke-width="20" stroke-linecap="round"/>
+  <path d="M151 174L166 189L196 153" stroke="#5EEAD4" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
