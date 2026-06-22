@@ -1285,6 +1285,33 @@ func TestHostAPIAndAgentHeartbeatPublishesHostStatus(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("patch agent host address status = %d body=%s", status, string(body))
 	}
+	status, body = requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/hosts/"+strconv.FormatInt(createdAgentHost.Host.ID, 10), cookie, map[string]any{
+		"agent_setup": map[string]any{
+			"roots":           []string{"/var/lib/docker", "/etc"},
+			"backup_schedule": "6h",
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("patch invalid agent setup schedule status = %d body=%s", status, string(body))
+	}
+	status, body = requestJSONAuthed(t, http.MethodPatch, server.URL+"/api/v1/hosts/"+strconv.FormatInt(createdAgentHost.Host.ID, 10), cookie, map[string]any{
+		"agent_setup": map[string]any{
+			"roots":           []string{"/var/lib/docker", "/etc"},
+			"backup_schedule": "0 */6 * * *",
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("patch agent setup status = %d body=%s", status, string(body))
+	}
+	var patchedAgentHost struct {
+		Host state.Host `json:"host"`
+	}
+	if err := json.Unmarshal(body, &patchedAgentHost); err != nil {
+		t.Fatal(err)
+	}
+	if patchedAgentHost.Host.AgentSetup == nil || !reflect.DeepEqual(patchedAgentHost.Host.AgentSetup.Roots, []string{"/var/lib/docker", "/etc"}) || patchedAgentHost.Host.AgentSetup.BackupSchedule != "0 */6 * * *" {
+		t.Fatalf("agent setup not saved: %+v", patchedAgentHost.Host.AgentSetup)
+	}
 	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/heartbeat", createdAgentHost.Agent.ClientID, createdAgentHost.Agent.ClientSecret, map[string]any{
 		"hostname": "agent-hostname",
 		"version":  "test",
@@ -1305,16 +1332,18 @@ func TestHostAPIAndAgentHeartbeatPublishesHostStatus(t *testing.T) {
 	}
 	seenManual := false
 	seenAgent := false
+	seenAgentSetup := false
 	for _, host := range listed.Hosts {
 		if host.Name == "sftp host" && host.SourceType == "sftp" && nullStringValue(host.Address) == "10.0.0.10:22" {
 			seenManual = true
 		}
 		if host.Name == "agent-subject" && host.SourceType == "agent" && host.Status == "online" && nullStringValue(host.Address) == "agent-hostname" && host.LastSeenAt.Valid {
 			seenAgent = true
+			seenAgentSetup = host.AgentSetup != nil && reflect.DeepEqual(host.AgentSetup.Roots, []string{"/var/lib/docker", "/etc"}) && host.AgentSetup.BackupSchedule == "0 */6 * * *"
 		}
 	}
-	if !seenManual || !seenAgent {
-		t.Fatalf("hosts did not include manual=%v agent=%v: %+v", seenManual, seenAgent, listed.Hosts)
+	if !seenManual || !seenAgent || !seenAgentSetup {
+		t.Fatalf("hosts did not include manual=%v agent=%v agentSetup=%v: %+v", seenManual, seenAgent, seenAgentSetup, listed.Hosts)
 	}
 }
 

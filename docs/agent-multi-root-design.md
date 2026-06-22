@@ -187,7 +187,7 @@ turbk-agent \
 - heartbeat 继续上报 daemon 状态。
 - 服务端手动运行只下发 `run-backup` 命令。
 - Agent 收到命令后使用本地配置的 roots 发起 run。
-- 本地 `backup_interval` 到期时也使用同一组 roots 发起 run。
+- 本地 `backup_schedule` 命中时也使用同一组 roots 发起 run。
 - 多余命令仍按现有策略 `dropped: agent_busy`。
 
 本次不要求服务端在 command payload 中下发 host 真实路径。原因是：

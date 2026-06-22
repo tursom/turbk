@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tursom/turbk/internal/cronexpr"
 	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/repository"
 	"github.com/tursom/turbk/internal/rootset"
@@ -27,6 +28,7 @@ import (
 )
 
 const agentChunkAvgSize = 1024 * 1024
+const defaultAgentBackupSchedule = "0 0 * * *"
 
 type agentClient struct {
 	serverURL    string
@@ -185,7 +187,7 @@ func main() {
 	var stateDir string
 	var pollIntervalValue string
 	var pollJitterValue string
-	var backupIntervalValue string
+	var backupScheduleValue string
 	var maxManifestRepairAttempts int
 	var excludeValue string
 	var skipPseudoFS bool
@@ -196,7 +198,7 @@ func main() {
 	flag.StringVar(&stateDir, "state-dir", envString("TURBK_AGENT_STATE_DIR", "/var/lib/turbk-agent"), "Persistent agent state directory")
 	flag.StringVar(&pollIntervalValue, "poll-interval", os.Getenv("TURBK_AGENT_POLL_INTERVAL"), "Daemon poll interval override")
 	flag.StringVar(&pollJitterValue, "poll-jitter", envString("TURBK_AGENT_POLL_JITTER", "1m"), "Daemon poll jitter")
-	flag.StringVar(&backupIntervalValue, "backup-interval", envString("TURBK_AGENT_BACKUP_INTERVAL", "24h"), "Daemon local backup interval")
+	flag.StringVar(&backupScheduleValue, "backup-schedule", envString("TURBK_AGENT_BACKUP_SCHEDULE", defaultAgentBackupSchedule), "Daemon local backup cron schedule")
 	flag.IntVar(&maxManifestRepairAttempts, "max-manifest-repair-attempts", envInt("TURBK_AGENT_MAX_MANIFEST_REPAIR_ATTEMPTS", 3), "Maximum manifest missing chunk repair attempts")
 	flag.StringVar(&excludeValue, "exclude", os.Getenv("TURBK_AGENT_EXCLUDES"), "Comma or newline separated path patterns to skip, relative to root")
 	flag.BoolVar(&skipPseudoFS, "skip-pseudo-fs", envBool("TURBK_AGENT_SKIP_PSEUDO_FS", true), "Skip Linux pseudo filesystems such as procfs and sysfs")
@@ -229,7 +231,7 @@ func main() {
 			StateDir:                  stateDir,
 			PollInterval:              parseDurationOrDefault(pollIntervalValue, 0),
 			PollJitter:                parseDurationOrDefault(pollJitterValue, time.Minute),
-			BackupInterval:            parseDurationOrDefault(backupIntervalValue, 24*time.Hour),
+			BackupSchedule:            parseBackupScheduleOrDefault(backupScheduleValue, defaultAgentBackupSchedule),
 			MaxManifestRepairAttempts: maxManifestRepairAttempts,
 			ScanOptions:               scanOptions,
 		}
@@ -384,12 +386,23 @@ func parseDurationOrDefault(value string, fallback time.Duration) time.Duration 
 	return duration
 }
 
+func parseBackupScheduleOrDefault(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	if !cronexpr.Valid(value) {
+		return fallback
+	}
+	return value
+}
+
 type daemonOptions struct {
 	Roots                     []string
 	StateDir                  string
 	PollInterval              time.Duration
 	PollJitter                time.Duration
-	BackupInterval            time.Duration
+	BackupSchedule            string
 	MaxManifestRepairAttempts int
 	ScanOptions               fsfilter.Options
 }
@@ -403,13 +416,14 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 	if opts.MaxManifestRepairAttempts <= 0 {
 		opts.MaxManifestRepairAttempts = 3
 	}
-	if opts.BackupInterval <= 0 {
-		opts.BackupInterval = 24 * time.Hour
+	if strings.TrimSpace(opts.BackupSchedule) == "" || !cronexpr.Valid(opts.BackupSchedule) {
+		opts.BackupSchedule = defaultAgentBackupSchedule
 	}
 
 	var running bool
 	var lastBackupStarted time.Time
 	var lastBackupFinished time.Time
+	var lastScheduleChecked time.Time
 	var runningRunID int64
 	var lastError string
 	for {
@@ -482,9 +496,10 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 			}
 		}
 
-		if !running && !backupCommandHandled && len(opts.Roots) != 0 && dueByInterval(lastBackupStarted, opts.BackupInterval) {
+		scheduleCheckTime := time.Now().UTC()
+		if !running && !backupCommandHandled && len(opts.Roots) != 0 && dueByCron(opts.BackupSchedule, lastScheduleChecked, scheduleCheckTime) {
 			running = true
-			lastBackupStarted = time.Now().UTC()
+			lastBackupStarted = scheduleCheckTime
 			err := runBackupWithOptions(client, opts.Roots, logger, opts.ScanOptions, backupRunOptions{
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
@@ -499,17 +514,30 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				lastError = err.Error()
 				logger.Error("agent scheduled backup failed", "error", err)
 			}
+			lastScheduleChecked = time.Now().UTC()
+		} else {
+			lastScheduleChecked = scheduleCheckTime
 		}
 
 		time.Sleep(nextPollDelay(opts.PollInterval, opts.PollJitter, heartbeat))
 	}
 }
 
-func dueByInterval(lastStarted time.Time, interval time.Duration) bool {
-	if lastStarted.IsZero() {
-		return true
+func dueByCron(schedule string, lastChecked, now time.Time) bool {
+	if strings.TrimSpace(schedule) == "" {
+		return false
 	}
-	return time.Since(lastStarted) >= interval
+	end := now.Truncate(time.Minute)
+	start := end
+	if !lastChecked.IsZero() {
+		start = lastChecked.Add(time.Minute).Truncate(time.Minute)
+	}
+	for cursor := start; !cursor.After(end); cursor = cursor.Add(time.Minute) {
+		if cronexpr.Matches(schedule, cursor.Local()) {
+			return true
+		}
+	}
+	return false
 }
 
 func commandCreatedDuringLastRun(command agentCommand, started, finished time.Time) bool {

@@ -19,6 +19,12 @@ const {
   hostSearch,
   hostSourceFilter,
   agentSetupSourceDirs,
+  agentSetupBackupSchedule,
+  agentSetupScheduleMode,
+  agentSetupScheduleMinute,
+  agentSetupScheduleHour,
+  agentSetupScheduleWeekday,
+  agentSetupSaveMessage,
   agentSetupRunMode,
   copyActionMessage,
   agentCredentialClientId,
@@ -34,6 +40,11 @@ const {
   agentContainerStateDir,
   agentSetupRoots,
   agentSetupRootErrors,
+  agentSetupScheduleErrors,
+  agentSetupScheduleModeOptions,
+  agentScheduleMinuteOptions,
+  agentScheduleHourOptions,
+  agentSetupScheduleWeekdayOptions,
   agentSetupReady,
   agentSetupStateMount,
   agentSetupSourceMounts,
@@ -368,6 +379,51 @@ const {
                     </button>
                   </div>
                 </div>
+                <div v-if="agentSetupRunMode === 'daemon'" class="field wide agent-backup-schedule-field">
+                  <span>{{ t('hosts.agentBackupSchedule') }}</span>
+                  <div class="cron-editor">
+                    <div class="cron-mode-selector" role="tablist" :aria-label="t('hosts.agentBackupSchedule')">
+                      <button
+                        v-for="mode in agentSetupScheduleModeOptions"
+                        :key="mode.value"
+                        class="cron-mode-option"
+                        :class="{ active: agentSetupScheduleMode === mode.value }"
+                        type="button"
+                        role="tab"
+                        :aria-selected="agentSetupScheduleMode === mode.value"
+                        @click="agentSetupScheduleMode = mode.value"
+                      >
+                        {{ mode.label }}
+                      </button>
+                    </div>
+                    <div v-if="agentSetupScheduleMode !== 'custom'" class="cron-editor-controls">
+                      <label v-if="agentSetupScheduleMode === 'weekly'" class="cron-select-field">
+                        <span>{{ t('hosts.agentScheduleWeekday') }}</span>
+                        <select v-model="agentSetupScheduleWeekday">
+                          <option v-for="option in agentSetupScheduleWeekdayOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                        </select>
+                      </label>
+                      <label v-if="agentSetupScheduleMode === 'daily' || agentSetupScheduleMode === 'weekly'" class="cron-select-field">
+                        <span>{{ t('hosts.agentScheduleHour') }}</span>
+                        <select v-model="agentSetupScheduleHour">
+                          <option v-for="option in agentScheduleHourOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                        </select>
+                      </label>
+                      <label class="cron-select-field">
+                        <span>{{ t('hosts.agentScheduleMinute') }}</span>
+                        <select v-model="agentSetupScheduleMinute">
+                          <option v-for="option in agentScheduleMinuteOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label v-else class="cron-custom-field">
+                      <span>{{ t('hosts.agentCronExpression') }}</span>
+                      <input v-model="agentSetupBackupSchedule" type="text" :placeholder="t('hosts.agentBackupSchedulePlaceholder')" />
+                    </label>
+                    <code class="cron-schedule-preview" aria-live="polite">{{ agentSetupBackupSchedule }}</code>
+                  </div>
+                  <small v-for="message in agentSetupScheduleErrors" :key="message" class="field-error">{{ message }}</small>
+                </div>
                 <div class="field wide agent-root-list">
                   <span>{{ t('hosts.sourceDirs') }}</span>
                   <div v-for="(_, index) in agentSetupSourceDirs" :key="index" class="agent-root-row">
@@ -381,6 +437,7 @@ const {
                     <span>{{ t('hosts.addSourceDir') }}</span>
                   </button>
                   <small v-for="message in agentSetupRootErrors" :key="message" class="field-error">{{ message }}</small>
+                  <small v-if="agentSetupSaveMessage" class="field-help">{{ agentSetupSaveMessage }}</small>
                 </div>
               </div>
               <p class="muted agent-access-note">{{ t('hosts.agentMountHint') }}</p>

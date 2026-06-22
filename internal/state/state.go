@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -78,6 +79,9 @@ func (s *Store) init(ctx context.Context) error {
 	if err := s.ensureSnapshotCleanupColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureHostAgentSetupColumn(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureAgentHeartbeatColumns(ctx); err != nil {
 		return err
 	}
@@ -135,6 +139,20 @@ func (s *Store) ensureSnapshotCleanupColumns(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, column.stmt); err != nil {
 			return fmt.Errorf("add snapshots.%s column: %w", column.name, err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) ensureHostAgentSetupColumn(ctx context.Context) error {
+	exists, err := s.columnExists(ctx, "hosts", "agent_setup")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN agent_setup TEXT`); err != nil {
+		return fmt.Errorf("add hosts.agent_setup column: %w", err)
 	}
 	return nil
 }
@@ -207,7 +225,7 @@ func (s *Store) Counts(ctx context.Context) (Counts, error) {
 
 func (s *Store) ListHosts(ctx context.Context) ([]Host, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.created_at, h.updated_at,
+		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.agent_setup, h.created_at, h.updated_at,
 			c.id, c.name, c.type
 		FROM hosts h
 		LEFT JOIN credentials c ON c.id = h.credential_id
@@ -292,7 +310,7 @@ func (s *Store) GetHost(ctx context.Context, id int64) (Host, error) {
 
 func (s *Store) getHost(ctx context.Context, id int64) (Host, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.created_at, h.updated_at,
+		SELECT h.id, h.name, h.source_type, h.address, h.credential_id, h.status, h.last_seen_at, h.agent_setup, h.created_at, h.updated_at,
 			c.id, c.name, c.type
 		FROM hosts h
 		LEFT JOIN credentials c ON c.id = h.credential_id
@@ -306,6 +324,7 @@ type UpdateHostInput struct {
 	Address      sql.NullString
 	CredentialID sql.NullInt64
 	Status       string
+	AgentSetup   *AgentSetupConfig
 }
 
 func (s *Store) UpdateHost(ctx context.Context, input UpdateHostInput) (Host, error) {
@@ -320,11 +339,15 @@ func (s *Store) UpdateHost(ctx context.Context, input UpdateHostInput) (Host, er
 	if input.Status == "" {
 		input.Status = "unknown"
 	}
+	agentSetupValue, err := marshalAgentSetup(input.AgentSetup)
+	if err != nil {
+		return Host{}, err
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE hosts
-		SET name = ?, address = ?, credential_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+		SET name = ?, address = ?, credential_id = ?, status = ?, agent_setup = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`,
-		input.Name, input.Address, input.CredentialID, input.Status, input.ID)
+		input.Name, input.Address, input.CredentialID, input.Status, agentSetupValue, input.ID)
 	if err != nil {
 		return Host{}, fmt.Errorf("update host: %w", err)
 	}
@@ -569,6 +592,7 @@ func scanHost(scanner hostScanner) (Host, error) {
 	var credentialID sql.NullInt64
 	var credentialName sql.NullString
 	var credentialType sql.NullString
+	var agentSetup sql.NullString
 	if err := scanner.Scan(
 		&host.ID,
 		&host.Name,
@@ -577,6 +601,7 @@ func scanHost(scanner hostScanner) (Host, error) {
 		&host.CredentialID,
 		&host.Status,
 		&host.LastSeenAt,
+		&agentSetup,
 		&host.CreatedAt,
 		&host.UpdatedAt,
 		&credentialID,
@@ -592,7 +617,25 @@ func scanHost(scanner hostScanner) (Host, error) {
 			Type: credentialType.String,
 		}
 	}
+	if agentSetup.Valid && strings.TrimSpace(agentSetup.String) != "" {
+		var setup AgentSetupConfig
+		if err := json.Unmarshal([]byte(agentSetup.String), &setup); err != nil {
+			return Host{}, fmt.Errorf("parse host agent_setup: %w", err)
+		}
+		host.AgentSetup = &setup
+	}
 	return host, nil
+}
+
+func marshalAgentSetup(setup *AgentSetupConfig) (any, error) {
+	if setup == nil {
+		return nil, nil
+	}
+	payload, err := json.Marshal(setup)
+	if err != nil {
+		return nil, fmt.Errorf("marshal host agent_setup: %w", err)
+	}
+	return string(payload), nil
 }
 
 func (s *Store) hydrateHostAgent(ctx context.Context, host *Host) error {
@@ -633,10 +676,16 @@ type Host struct {
 	Credential   *CredentialSummary `json:"credential,omitempty"`
 	Agent        *AgentCredential   `json:"agent,omitempty"`
 	AgentStatus  *AgentHeartbeat    `json:"agent_status,omitempty"`
+	AgentSetup   *AgentSetupConfig  `json:"agent_setup,omitempty"`
 	Status       string             `json:"status"`
 	LastSeenAt   sql.NullTime       `json:"last_seen_at"`
 	CreatedAt    time.Time          `json:"created_at"`
 	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+type AgentSetupConfig struct {
+	Roots          []string `json:"roots,omitempty"`
+	BackupSchedule string   `json:"backup_schedule,omitempty"`
 }
 
 type Job struct {
@@ -728,6 +777,7 @@ var schema = []string{
 		credential_id INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
 		status TEXT NOT NULL DEFAULT 'unknown',
 		last_seen_at DATETIME,
+		agent_setup TEXT,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`,

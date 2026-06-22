@@ -23,10 +23,15 @@ import { en, locale, setLocale, t, type MessageKey } from '../i18n';
 import { pages, type PageKey } from '../navigation';
 
 const agentContainerStateDir = '/var/lib/turbk-agent';
+const defaultAgentBackupSchedule = '0 0 * * *';
 type AgentSetupMethod = 'compose' | 'docker' | 'binary' | 'systemd';
 type AgentRunMode = 'daemon' | 'once';
+type AgentScheduleMode = 'hourly' | 'daily' | 'weekly' | 'custom';
 const hostTabs = ['overview', 'access', 'jobs'] as const;
 type HostTab = (typeof hostTabs)[number];
+
+const agentScheduleMinuteOptions = Array.from({ length: 60 }, (_, value) => ({ value: String(value), label: String(value).padStart(2, '0') }));
+const agentScheduleHourOptions = Array.from({ length: 24 }, (_, value) => ({ value: String(value), label: String(value).padStart(2, '0') }));
 
 function shellQuote(value: string) {
   if (value === '') return "''";
@@ -63,6 +68,105 @@ function agentRootNested(parent: string, child: string) {
   if (parent === child) return false;
   if (parent === '/') return child !== '/';
   return child.startsWith(`${parent.replace(/\/+$/, '')}/`);
+}
+
+function cronFieldValid(field: string, minValue: number, maxValue: number) {
+  return field.split(',').every((part) => cronPartValid(part.trim(), minValue, maxValue));
+}
+
+function cronPartValid(part: string, minValue: number, maxValue: number) {
+  if (part === '') return false;
+  const [rangePart, stepPart, ...rest] = part.split('/');
+  if (rest.length > 0) return false;
+  if (stepPart !== undefined) {
+    if (!/^\d+$/.test(stepPart)) return false;
+    const step = Number(stepPart);
+    if (!Number.isInteger(step) || step <= 0) return false;
+  }
+  let start = minValue;
+  let end = maxValue;
+  if (rangePart === '*') {
+    return true;
+  }
+  if (rangePart.includes('-')) {
+    const pieces = rangePart.split('-');
+    if (pieces.length !== 2) return false;
+    if (!/^\d+$/.test(pieces[0]) || !/^\d+$/.test(pieces[1])) return false;
+    start = Number(pieces[0]);
+    end = Number(pieces[1]);
+  } else {
+    if (!/^\d+$/.test(rangePart)) return false;
+    start = Number(rangePart);
+    end = start;
+  }
+  return Number.isInteger(start) && Number.isInteger(end) && start >= minValue && end <= maxValue && start <= end;
+}
+
+function isCronExpression(value: string) {
+  const trimmed = value.trim();
+  if (trimmed === '') return false;
+  if (['@hourly', '@daily', '@midnight', '@weekly'].includes(trimmed)) return true;
+  const fields = trimmed.split(/\s+/);
+  if (fields.length !== 5) return false;
+  const ranges = [
+    [0, 59],
+    [0, 23],
+    [1, 31],
+    [1, 12],
+    [0, 7]
+  ] as const;
+  for (let i = 0; i < fields.length; i += 1) {
+    if (!cronFieldValid(fields[i], ranges[i][0], ranges[i][1])) return false;
+  }
+  return true;
+}
+
+function parseCronNumber(value: string, minValue: number, maxValue: number) {
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minValue || parsed > maxValue) return null;
+  return String(parsed);
+}
+
+function parseAgentBackupSchedule(value: string) {
+  const trimmed = value.trim();
+  switch (trimmed) {
+    case '@hourly':
+      return { mode: 'hourly' as const, minute: '0', hour: '0', weekday: '0' };
+    case '@daily':
+    case '@midnight':
+      return { mode: 'daily' as const, minute: '0', hour: '0', weekday: '0' };
+    case '@weekly':
+      return { mode: 'weekly' as const, minute: '0', hour: '0', weekday: '0' };
+  }
+  const fields = trimmed.split(/\s+/);
+  if (fields.length !== 5) return { mode: 'custom' as const };
+  const minute = parseCronNumber(fields[0], 0, 59);
+  const hour = parseCronNumber(fields[1], 0, 23);
+  if (minute !== null && fields[1] === '*' && fields[2] === '*' && fields[3] === '*' && fields[4] === '*') {
+    return { mode: 'hourly' as const, minute, hour: '0', weekday: '0' };
+  }
+  if (minute !== null && hour !== null && fields[2] === '*' && fields[3] === '*' && fields[4] === '*') {
+    return { mode: 'daily' as const, minute, hour, weekday: '0' };
+  }
+  const weekday = parseCronNumber(fields[4], 0, 7);
+  if (minute !== null && hour !== null && fields[2] === '*' && fields[3] === '*' && weekday !== null) {
+    return { mode: 'weekly' as const, minute, hour, weekday: weekday === '7' ? '0' : weekday };
+  }
+  return { mode: 'custom' as const };
+}
+
+function agentBackupScheduleFromParts(mode: AgentScheduleMode, minute: string, hour: string, weekday: string) {
+  switch (mode) {
+    case 'hourly':
+      return `${minute} * * * *`;
+    case 'daily':
+      return `${minute} ${hour} * * *`;
+    case 'weekly':
+      return `${minute} ${hour} * * ${weekday}`;
+    case 'custom':
+      return null;
+  }
 }
 
 function isHostTab(value: string | null): value is HostTab {
@@ -129,6 +233,12 @@ export function useBackupApp() {
   const hostSourceFilter = ref('all');
   const agentSetupHostName = ref('');
   const agentSetupSourceDirs = ref(['/srv/data']);
+  const agentSetupBackupSchedule = ref(defaultAgentBackupSchedule);
+  const agentSetupScheduleMode = ref<AgentScheduleMode>('daily');
+  const agentSetupScheduleMinute = ref('0');
+  const agentSetupScheduleHour = ref('0');
+  const agentSetupScheduleWeekday = ref('0');
+  const agentSetupSaveMessage = ref('');
   const agentSetupSourceDir = computed({
     get: () => agentSetupSourceDirs.value[0] ?? '',
     set: (value: string) => {
@@ -205,6 +315,11 @@ export function useBackupApp() {
   const settingsCompactMinReclaimRatio = ref(0.15);
   const settingsCompactMinReclaimBytes = ref('1GiB');
   const savingSettings = ref(false);
+  const savingAgentSetup = ref(false);
+  let suppressAgentSetupSave = false;
+  let syncingAgentSetupScheduleEditor = false;
+  let agentSetupSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSavedAgentSetupKey = '';
 
   const activeMeta = computed(() => pages.find((page) => page.key === activePage.value) ?? pages[0]);
   const activeTitle = computed(() => t(activeMeta.value.labelKey));
@@ -465,10 +580,30 @@ export function useBackupApp() {
     return errors;
   });
 
-  const agentSetupReady = computed(() => agentSetupRootErrors.value.length === 0);
+  const agentSetupBackupScheduleValue = computed(() => agentSetupBackupSchedule.value.trim() || defaultAgentBackupSchedule);
+  const agentSetupScheduleErrors = computed(() => {
+    if (agentSetupRunMode.value !== 'daemon') return [];
+    return isCronExpression(agentSetupBackupScheduleValue.value) ? [] : [t('hosts.agentBackupScheduleError')];
+  });
+  const agentSetupReady = computed(() => agentSetupRootErrors.value.length === 0 && agentSetupScheduleErrors.value.length === 0);
   const agentRootEnvValue = computed(() => agentSetupRoots.value.join(','));
   const agentRootFlags = computed(() => agentSetupRoots.value.map((root) => `-root ${shellQuote(root)}`).join(' '));
   const agentSystemdRootFlags = computed(() => agentSetupRoots.value.map((root) => `-root ${systemdQuote(root)}`).join(' '));
+  const agentSetupScheduleModeOptions = computed(() => [
+    { value: 'hourly' as const, label: t('hosts.agentScheduleHourly') },
+    { value: 'daily' as const, label: t('hosts.agentScheduleDaily') },
+    { value: 'weekly' as const, label: t('hosts.agentScheduleWeekly') },
+    { value: 'custom' as const, label: t('hosts.agentScheduleCustom') }
+  ]);
+  const agentSetupScheduleWeekdayOptions = computed(() => [
+    { value: '0', label: t('weekday.sunday') },
+    { value: '1', label: t('weekday.monday') },
+    { value: '2', label: t('weekday.tuesday') },
+    { value: '3', label: t('weekday.wednesday') },
+    { value: '4', label: t('weekday.thursday') },
+    { value: '5', label: t('weekday.friday') },
+    { value: '6', label: t('weekday.saturday') }
+  ]);
   const agentRunModeOptions = computed(() => [
     { value: 'daemon' as const, label: t('hosts.agentRunDaemon'), description: t('hosts.agentRunDaemonDesc') },
     { value: 'once' as const, label: t('hosts.agentRunOnce'), description: t('hosts.agentRunOnceDesc') }
@@ -492,6 +627,7 @@ export function useBackupApp() {
       `TURBK_AGENT_ID=${agentSetupClientId.value}`,
       `TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`,
       ...(agentSetupRunMode.value === 'daemon' ? [`TURBK_AGENT_DAEMON=true`] : []),
+      ...(agentSetupRunMode.value === 'daemon' ? [`TURBK_AGENT_BACKUP_SCHEDULE=${agentSetupBackupScheduleValue.value}`] : []),
       `TURBK_AGENT_STATE_DIR=${agentContainerStateDir}`,
       `TURBK_AGENT_ROOTS=${agentRootEnvValue.value}`
     ].join('\n')
@@ -506,6 +642,7 @@ export function useBackupApp() {
       `      TURBK_AGENT_ID: ${yamlQuote(agentSetupClientId.value)}`,
       `      TURBK_AGENT_SECRET: ${yamlQuote(agentSetupClientSecret.value)}`,
       ...(agentSetupRunMode.value === 'daemon' ? ['      TURBK_AGENT_DAEMON: "true"'] : []),
+      ...(agentSetupRunMode.value === 'daemon' ? [`      TURBK_AGENT_BACKUP_SCHEDULE: ${yamlQuote(agentSetupBackupScheduleValue.value)}`] : []),
       `      TURBK_AGENT_STATE_DIR: ${yamlQuote(agentContainerStateDir)}`,
       `      TURBK_AGENT_ROOTS: ${yamlQuote(agentRootEnvValue.value)}`
     ];
@@ -514,8 +651,6 @@ export function useBackupApp() {
       ...agentSetupRoots.value.map((root) => `      - ${yamlQuote(`${root}:${root}:ro`)}`)
     ];
     return [
-      'mkdir -p turbk-agent && cd turbk-agent',
-      "cat > compose.yaml <<'YAML'",
       'services:',
       '  turbk-agent:',
       '    image: ghcr.io/tursom/turbk-agent:latest',
@@ -524,9 +659,7 @@ export function useBackupApp() {
       ...environment,
       '    volumes:',
       ...volumes,
-      ...(agentSetupRunMode.value === 'daemon' ? ['    restart: unless-stopped'] : []),
-      'YAML',
-      agentSetupRunMode.value === 'daemon' ? 'docker compose up -d' : 'docker compose run --rm turbk-agent -once'
+      ...(agentSetupRunMode.value === 'daemon' ? ['    restart: unless-stopped'] : [])
     ].join('\n');
   });
 
@@ -538,6 +671,7 @@ export function useBackupApp() {
       `  -e TURBK_AGENT_ID=${JSON.stringify(agentSetupClientId.value)} \\`,
       `  -e TURBK_AGENT_SECRET=${JSON.stringify(agentSetupClientSecret.value)} \\`,
       ...(daemon ? ['  -e TURBK_AGENT_DAEMON=true \\'] : []),
+      ...(daemon ? [`  -e TURBK_AGENT_BACKUP_SCHEDULE=${JSON.stringify(agentSetupBackupScheduleValue.value)} \\`] : []),
       `  -e TURBK_AGENT_STATE_DIR=${JSON.stringify(agentContainerStateDir)} \\`,
       `  -e TURBK_AGENT_ROOTS=${JSON.stringify(agentRootEnvValue.value)} \\`,
       `  -v ${JSON.stringify(`turbk-agent-state:${agentContainerStateDir}`)} \\`,
@@ -553,6 +687,7 @@ export function useBackupApp() {
       `export TURBK_AGENT_ID=${shellQuote(agentSetupClientId.value)}`,
       `export TURBK_AGENT_SECRET=${shellQuote(agentSetupClientSecret.value)}`,
       `export TURBK_AGENT_STATE_DIR=${shellQuote('/var/lib/turbk-agent')}`,
+      ...(agentSetupRunMode.value === 'daemon' ? [`export TURBK_AGENT_BACKUP_SCHEDULE=${shellQuote(agentSetupBackupScheduleValue.value)}`] : []),
       `./turbk-agent ${agentRootFlags.value} ${agentSetupRunMode.value === 'daemon' ? '-daemon' : '-once'}`
     ].join('\n')
   );
@@ -574,6 +709,7 @@ export function useBackupApp() {
       `Environment=${systemdQuote(`TURBK_AGENT_ID=${agentSetupClientId.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_STATE_DIR=/var/lib/turbk-agent`)}`,
+      ...(daemon ? [`Environment=${systemdQuote(`TURBK_AGENT_BACKUP_SCHEDULE=${agentSetupBackupScheduleValue.value}`)}`] : []),
       `ExecStart=/usr/local/bin/turbk-agent ${agentSystemdRootFlags.value} ${daemon ? '-daemon' : '-once'}`,
       ...(daemon ? ['Restart=always', 'RestartSec=30'] : []),
       'UNIT',
@@ -632,6 +768,103 @@ export function useBackupApp() {
   }));
 
   const selectedAgentSetupSnippet = computed(() => agentSetupSnippets.value[agentSetupMethod.value]);
+
+  function syncAgentSetupScheduleEditor(value: string) {
+    const parsed = parseAgentBackupSchedule(value);
+    syncingAgentSetupScheduleEditor = true;
+    try {
+      agentSetupScheduleMode.value = parsed.mode;
+      if (parsed.mode !== 'custom') {
+        agentSetupScheduleMinute.value = parsed.minute;
+        agentSetupScheduleHour.value = parsed.hour;
+        agentSetupScheduleWeekday.value = parsed.weekday;
+      }
+    } finally {
+      syncingAgentSetupScheduleEditor = false;
+    }
+  }
+
+  function applyAgentSetupScheduleEditor() {
+    if (syncingAgentSetupScheduleEditor) return;
+    const next = agentBackupScheduleFromParts(
+      agentSetupScheduleMode.value,
+      agentSetupScheduleMinute.value,
+      agentSetupScheduleHour.value,
+      agentSetupScheduleWeekday.value
+    );
+    if (next !== null && next !== agentSetupBackupSchedule.value) {
+      agentSetupBackupSchedule.value = next;
+    }
+  }
+
+  function hydrateAgentSetupFromHost(host: Host | null) {
+    suppressAgentSetupSave = true;
+    if (host?.source_type === 'agent') {
+      const roots = Array.isArray(host.agent_setup?.roots) && host.agent_setup.roots.length > 0 ? host.agent_setup.roots : ['/srv/data'];
+      agentSetupSourceDirs.value = roots.slice();
+      agentSetupBackupSchedule.value = host.agent_setup?.backup_schedule || defaultAgentBackupSchedule;
+      lastSavedAgentSetupKey = agentSetupSaveKey(host.id);
+    } else {
+      agentSetupSourceDirs.value = ['/srv/data'];
+      agentSetupBackupSchedule.value = defaultAgentBackupSchedule;
+      lastSavedAgentSetupKey = '';
+    }
+    agentSetupSaveMessage.value = '';
+    suppressAgentSetupSave = false;
+  }
+
+  function agentSetupPayload() {
+    return {
+      roots: agentSetupRoots.value,
+      backup_schedule: agentSetupBackupScheduleValue.value
+    };
+  }
+
+  function agentSetupSaveKey(hostID = selectedHost.value?.id ?? 0) {
+    return `${hostID}:${JSON.stringify(agentSetupPayload())}`;
+  }
+
+  function scheduleAgentSetupSave() {
+    if (suppressAgentSetupSave) return;
+    const host = selectedHost.value;
+    if (!host || host.source_type !== 'agent') return;
+    if (agentSetupRootErrors.value.length > 0 || agentSetupScheduleErrors.value.length > 0) return;
+    if (agentSetupSaveTimer) clearTimeout(agentSetupSaveTimer);
+    agentSetupSaveTimer = setTimeout(() => {
+      agentSetupSaveTimer = null;
+      void saveAgentSetup();
+    }, 500);
+  }
+
+  async function saveAgentSetup() {
+    const host = selectedHost.value;
+    if (!host || host.source_type !== 'agent') return;
+    if (agentSetupRootErrors.value.length > 0 || agentSetupScheduleErrors.value.length > 0) return;
+    const saveKey = agentSetupSaveKey(host.id);
+    if (saveKey === lastSavedAgentSetupKey) return;
+    savingAgentSetup.value = true;
+    agentSetupSaveMessage.value = t('common.saving');
+    try {
+      const response = await api.updateHost(host.id, { agent_setup: agentSetupPayload() });
+      const index = hosts.value.findIndex((item) => item.id === response.host.id);
+      if (index >= 0) hosts.value[index] = response.host;
+      lastSavedAgentSetupKey = saveKey;
+      agentSetupSaveMessage.value = t('message.agentSetupSaved');
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : String(err);
+      agentSetupSaveMessage.value = error.value;
+    } finally {
+      savingAgentSetup.value = false;
+    }
+  }
+
+  watch(agentSetupBackupSchedule, (value) => syncAgentSetupScheduleEditor(value), { immediate: true, flush: 'sync' });
+
+  watch([agentSetupScheduleMode, agentSetupScheduleMinute, agentSetupScheduleHour, agentSetupScheduleWeekday], applyAgentSetupScheduleEditor, { flush: 'sync' });
+
+  watch(selectedHost, (host) => hydrateAgentSetupFromHost(host), { immediate: true, flush: 'sync' });
+
+  watch([agentSetupSourceDirs, agentSetupBackupSchedule], scheduleAgentSetupSave, { deep: true, flush: 'sync' });
 
   watch(hosts, (nextHosts) => {
     if (nextHosts.length === 0) {
@@ -1461,6 +1694,10 @@ export function useBackupApp() {
     if (typeof window !== 'undefined') {
       window.removeEventListener('popstate', syncPageFromLocation);
     }
+    if (agentSetupSaveTimer) {
+      clearTimeout(agentSetupSaveTimer);
+      agentSetupSaveTimer = null;
+    }
   });
 
   return {
@@ -1513,6 +1750,13 @@ export function useBackupApp() {
     agentSetupHostName,
     agentSetupSourceDir,
     agentSetupSourceDirs,
+    agentSetupBackupSchedule,
+    agentSetupScheduleMode,
+    agentSetupScheduleMinute,
+    agentSetupScheduleHour,
+    agentSetupScheduleWeekday,
+    agentSetupSaveMessage,
+    savingAgentSetup,
     agentSetupRunMode,
     agentSetupMethod,
     copyActionMessage,
@@ -1599,6 +1843,11 @@ export function useBackupApp() {
     agentContainerStateDir,
     agentSetupRoots,
     agentSetupRootErrors,
+    agentSetupScheduleErrors,
+    agentSetupScheduleModeOptions,
+    agentScheduleMinuteOptions,
+    agentScheduleHourOptions,
+    agentSetupScheduleWeekdayOptions,
     agentSetupReady,
     agentRunModeOptions,
     agentSetupStateMount,

@@ -294,10 +294,11 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name         *string `json:"name"`
-		Address      *string `json:"address"`
-		CredentialID *int64  `json:"credential_id"`
-		Status       *string `json:"status"`
+		Name         *string          `json:"name"`
+		Address      *string          `json:"address"`
+		CredentialID *int64           `json:"credential_id"`
+		Status       *string          `json:"status"`
+		AgentSetup   *json.RawMessage `json:"agent_setup"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -317,6 +318,7 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 		address = sql.NullString{String: value, Valid: value != ""}
 	}
 	credentialID := host.CredentialID
+	agentSetup := host.AgentSetup
 	switch host.SourceType {
 	case "agent":
 		if req.Address != nil {
@@ -327,7 +329,19 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("agent credential binding cannot be changed"))
 			return
 		}
+		if req.AgentSetup != nil {
+			value, err := validateAgentSetupConfig(*req.AgentSetup)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			agentSetup = value
+		}
 	case "local":
+		if req.AgentSetup != nil {
+			writeError(w, http.StatusBadRequest, errors.New("agent_setup is only supported for agent hosts"))
+			return
+		}
 		if req.Address != nil {
 			writeError(w, http.StatusBadRequest, errors.New("local hosts do not use address"))
 			return
@@ -338,6 +352,10 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 		}
 		credentialID = sql.NullInt64{}
 	default:
+		if req.AgentSetup != nil {
+			writeError(w, http.StatusBadRequest, errors.New("agent_setup is only supported for agent hosts"))
+			return
+		}
 		if req.CredentialID != nil {
 			if *req.CredentialID <= 0 {
 				writeError(w, http.StatusBadRequest, errors.New("credential_id is required for pull hosts"))
@@ -365,12 +383,41 @@ func (s *Server) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
 		Address:      address,
 		CredentialID: credentialID,
 		Status:       status,
+		AgentSetup:   agentSetup,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"host": updated})
+}
+
+func validateAgentSetupConfig(raw json.RawMessage) (*state.AgentSetupConfig, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var req struct {
+		Roots          []string `json:"roots"`
+		BackupSchedule string   `json:"backup_schedule"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	roots, err := rootset.Normalize(req.Roots)
+	if err != nil {
+		return nil, err
+	}
+	if len(roots) == 0 {
+		return nil, errors.New("agent_setup.roots is required")
+	}
+	backupSchedule := strings.TrimSpace(req.BackupSchedule)
+	if backupSchedule != "" && !validCronExpression(backupSchedule) {
+		return nil, fmt.Errorf("invalid agent_setup.backup_schedule %q", backupSchedule)
+	}
+	return &state.AgentSetupConfig{
+		Roots:          roots,
+		BackupSchedule: backupSchedule,
+	}, nil
 }
 
 func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {

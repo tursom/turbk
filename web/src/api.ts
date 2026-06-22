@@ -87,10 +87,16 @@ export interface Host {
   credential?: CredentialSummary;
   agent?: AgentCredential;
   agent_status?: AgentStatus;
+  agent_setup?: AgentSetupConfig;
   status: string;
   last_seen_at: unknown;
   created_at: string;
   updated_at: string;
+}
+
+export interface AgentSetupConfig {
+  roots?: string[];
+  backup_schedule?: string;
 }
 
 export interface AgentStatus {
@@ -422,6 +428,21 @@ export const api = {
   createHost: (payload: { name: string; source_type: string; address?: string; credential_id?: number; status?: string }) =>
     request<{ host: Host; credential?: Credential; agent?: { client_id: string; client_secret: string } }>('/api/v1/hosts', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }),
+  updateHost: (
+    id: number,
+    payload: {
+      name?: string;
+      address?: string;
+      credential_id?: number;
+      status?: string;
+      agent_setup?: AgentSetupConfig;
+    }
+  ) =>
+    request<{ host: Host }>(`/api/v1/hosts/${id}`, {
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     }),

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/repository"
@@ -160,5 +161,30 @@ func TestRootFlagCommandLineOverridesEnvironment(t *testing.T) {
 	want := []string{"/cli/one", "/cli/two"}
 	if len(roots) != len(want) || roots[0] != want[0] || roots[1] != want[1] {
 		t.Fatalf("roots = %#v, want %#v", roots, want)
+	}
+}
+
+func TestParseBackupScheduleOrDefault(t *testing.T) {
+	if got := parseBackupScheduleOrDefault("*/15 * * * *", defaultAgentBackupSchedule); got != "*/15 * * * *" {
+		t.Fatalf("valid schedule = %q", got)
+	}
+	if got := parseBackupScheduleOrDefault("24h", defaultAgentBackupSchedule); got != defaultAgentBackupSchedule {
+		t.Fatalf("invalid duration schedule = %q, want default", got)
+	}
+}
+
+func TestDueByCronChecksWindowWithoutDuplicateMinute(t *testing.T) {
+	now := time.Date(2026, 6, 22, 10, 0, 30, 0, time.UTC)
+	if !dueByCron("@hourly", time.Time{}, now) {
+		t.Fatal("expected first check inside matching minute to be due")
+	}
+	if dueByCron("@hourly", time.Time{}, now.Add(time.Minute)) {
+		t.Fatal("did not expect first check outside matching minute to be due")
+	}
+	if !dueByCron("@hourly", now.Add(-10*time.Minute), now.Add(5*time.Minute)) {
+		t.Fatal("expected missed matching minute inside check window to be due")
+	}
+	if dueByCron("@hourly", now, now.Add(20*time.Second)) {
+		t.Fatal("did not expect same matching minute to trigger twice")
 	}
 }

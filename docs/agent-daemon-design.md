@@ -83,7 +83,7 @@ Daemon 主循环：
 
 默认轮询间隔建议为 10 分钟，并加入随机抖动，避免大量 Agent 同时请求服务端。备份不需要强实时性，手动运行命令接受分钟级延迟；如果某个部署需要更快响应，可以在服务端按 Agent 下发更短的 `poll_interval`。
 
-首版 daemon 除了服务端 command，也提供本地 `backup_interval` 作为兜底定期触发，默认 24 小时。后续如果服务端下发更完整的 schedule policy，Agent 仍保留最终是否执行的决定权，并继续遵守单任务互斥和丢弃策略。
+首版 daemon 除了服务端 command，也提供本地 `backup_schedule` 作为兜底定期触发，默认 `0 0 * * *`。后续如果服务端下发更完整的 schedule policy，Agent 仍保留最终是否执行的决定权，并继续遵守单任务互斥和丢弃策略。
 
 ## 6. 单任务互斥与丢弃策略
 
@@ -695,7 +695,7 @@ agent:
   state_dir: "/var/lib/turbk-agent"
   poll_interval: "10m"
   poll_jitter: "1m"
-  backup_interval: "24h"
+  backup_schedule: "0 0 * * *"
   max_concurrent_runs: 1
   busy_command_policy: "drop"
   repair_missing_chunks: true
