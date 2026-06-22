@@ -629,6 +629,7 @@ export function useBackupApp() {
       ...(agentSetupRunMode.value === 'daemon' ? [`TURBK_AGENT_DAEMON=true`] : []),
       ...(agentSetupRunMode.value === 'daemon' ? [`TURBK_AGENT_BACKUP_SCHEDULE=${agentSetupBackupScheduleValue.value}`] : []),
       `TURBK_AGENT_STATE_DIR=${agentContainerStateDir}`,
+      'TURBK_AGENT_CATALOG_BACKEND=hybrid',
       `TURBK_AGENT_ROOTS=${agentRootEnvValue.value}`
     ].join('\n')
   );
@@ -644,6 +645,7 @@ export function useBackupApp() {
       ...(agentSetupRunMode.value === 'daemon' ? ['      TURBK_AGENT_DAEMON: "true"'] : []),
       ...(agentSetupRunMode.value === 'daemon' ? [`      TURBK_AGENT_BACKUP_SCHEDULE: ${yamlQuote(agentSetupBackupScheduleValue.value)}`] : []),
       `      TURBK_AGENT_STATE_DIR: ${yamlQuote(agentContainerStateDir)}`,
+      '      TURBK_AGENT_CATALOG_BACKEND: "hybrid"',
       `      TURBK_AGENT_ROOTS: ${yamlQuote(agentRootEnvValue.value)}`
     ];
     const volumes = [
@@ -673,6 +675,7 @@ export function useBackupApp() {
       ...(daemon ? ['  -e TURBK_AGENT_DAEMON=true \\'] : []),
       ...(daemon ? [`  -e TURBK_AGENT_BACKUP_SCHEDULE=${JSON.stringify(agentSetupBackupScheduleValue.value)} \\`] : []),
       `  -e TURBK_AGENT_STATE_DIR=${JSON.stringify(agentContainerStateDir)} \\`,
+      '  -e TURBK_AGENT_CATALOG_BACKEND=hybrid \\',
       `  -e TURBK_AGENT_ROOTS=${JSON.stringify(agentRootEnvValue.value)} \\`,
       `  -v ${JSON.stringify(`turbk-agent-state:${agentContainerStateDir}`)} \\`,
       ...agentSetupRoots.value.map((root) => `  -v ${JSON.stringify(`${root}:${root}:ro`)} \\`),
@@ -687,6 +690,7 @@ export function useBackupApp() {
       `export TURBK_AGENT_ID=${shellQuote(agentSetupClientId.value)}`,
       `export TURBK_AGENT_SECRET=${shellQuote(agentSetupClientSecret.value)}`,
       `export TURBK_AGENT_STATE_DIR=${shellQuote('/var/lib/turbk-agent')}`,
+      'export TURBK_AGENT_CATALOG_BACKEND=hybrid',
       ...(agentSetupRunMode.value === 'daemon' ? [`export TURBK_AGENT_BACKUP_SCHEDULE=${shellQuote(agentSetupBackupScheduleValue.value)}`] : []),
       `./turbk-agent ${agentRootFlags.value} ${agentSetupRunMode.value === 'daemon' ? '-daemon' : '-once'}`
     ].join('\n')
@@ -709,6 +713,7 @@ export function useBackupApp() {
       `Environment=${systemdQuote(`TURBK_AGENT_ID=${agentSetupClientId.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_STATE_DIR=/var/lib/turbk-agent`)}`,
+      `Environment=${systemdQuote('TURBK_AGENT_CATALOG_BACKEND=hybrid')}`,
       ...(daemon ? [`Environment=${systemdQuote(`TURBK_AGENT_BACKUP_SCHEDULE=${agentSetupBackupScheduleValue.value}`)}`] : []),
       `ExecStart=/usr/local/bin/turbk-agent ${agentSystemdRootFlags.value} ${daemon ? '-daemon' : '-once'}`,
       ...(daemon ? ['Restart=always', 'RestartSec=30'] : []),

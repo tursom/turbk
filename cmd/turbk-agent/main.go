@@ -31,6 +31,8 @@ import (
 const agentChunkAvgSize = 1024 * 1024
 const defaultAgentBackupSchedule = "0 0 * * *"
 const defaultAgentChunkUploadBatchBytes = int64(64 * 1024 * 1024)
+const defaultAgentFileCatalogBatchFiles = 1000
+const defaultAgentFileCatalogBatchBytes = int64(16 * 1024 * 1024)
 const agentChunkBatchContentType = "application/vnd.turbk.chunk-batch.v1"
 
 var agentChunkBatchMagic = []byte("TBKCHB1\n")
@@ -714,12 +716,31 @@ func runBackupWithOptions(client *agentClient, roots []string, logger *slog.Logg
 	runStatus := "failed"
 	runMessage := ""
 	if opts.Catalog != nil {
+		catalogStatsStart := opts.Catalog.statsSnapshot()
 		if err := opts.Catalog.recordRunStart(localRunID, created.Run.ID, opts.CommandID, opts.Trigger, time.Now().UTC()); err != nil {
 			logger.Warn("agent catalog run start record failed", "run", created.Run.ID, "error", err)
 		}
 		defer func() {
 			if err := opts.Catalog.recordRunFinish(localRunID, runStatus, runMessage, time.Now().UTC()); err != nil {
 				logger.Warn("agent catalog run finish record failed", "run", created.Run.ID, "error", err)
+			}
+		}()
+		defer func() {
+			stats := opts.Catalog.statsSnapshot().delta(catalogStatsStart)
+			if stats.any() {
+				logger.Info("agent catalog writes",
+					"run", created.Run.ID,
+					"chunk_status_updates", stats.ChunkStatusUpdates,
+					"chunk_invalidations", stats.ChunkInvalidations,
+					"chunk_resets", stats.ChunkResets,
+					"file_records", stats.FileRecords,
+					"file_chunk_refs", stats.FileChunkRefs,
+				)
+			}
+		}()
+		defer func() {
+			if err := opts.Catalog.flush(); err != nil {
+				logger.Warn("agent catalog flush failed", "run", created.Run.ID, "error", err)
 			}
 		}()
 	}
@@ -755,8 +776,12 @@ func runBackupWithOptions(client *agentClient, roots []string, logger *slog.Logg
 		}
 		logger.Warn("agent manifest references missing chunks; retrying after repair", "run", created.Run.ID, "missing_chunks", len(submitted.MissingChunks), "repair_attempt", attempt+1)
 		if opts.Catalog != nil {
+			updates := make([]agentChunkStatusUpdate, 0, len(submitted.MissingChunks))
 			for _, missing := range submitted.MissingChunks {
-				_ = opts.Catalog.markChunk(missing.Hash, 0, "missing", 0, false)
+				updates = append(updates, agentChunkStatusUpdate{Hash: missing.Hash, Status: "missing"})
+			}
+			if err := opts.Catalog.markChunks(updates); err != nil {
+				logger.Warn("agent catalog missing chunk update failed", "run", created.Run.ID, "error", err)
 			}
 		}
 	}
@@ -788,6 +813,13 @@ func (r *agentSkipReporter) record(event fsfilter.SkipEvent) {
 type chunkBatchStats struct {
 	Uploaded int64
 	Reused   int64
+}
+
+type agentFileCatalogBatcher struct {
+	catalog      *agentCatalog
+	logger       *slog.Logger
+	pending      []agentFileCatalogUpdate
+	pendingBytes int64
 }
 
 type chunkBatchWaiter struct {
@@ -830,6 +862,41 @@ func newAgentChunkBatcher(client *agentClient, opts backupRunOptions) *agentChun
 		pendingByHash:   make(map[string]*pendingBatchChunk),
 		pendingByEntry:  make(map[*repository.FileEntry]int),
 	}
+}
+
+func newAgentFileCatalogBatcher(catalog *agentCatalog, logger *slog.Logger) *agentFileCatalogBatcher {
+	return &agentFileCatalogBatcher{catalog: catalog, logger: logger}
+}
+
+func (b *agentFileCatalogBatcher) Add(record catalogFileRecord, chunks []catalogChunkRecord) {
+	if b == nil || b.catalog == nil {
+		return
+	}
+	update := agentFileCatalogUpdate{Record: record}
+	if len(chunks) > 0 {
+		update.Chunks = append([]catalogChunkRecord(nil), chunks...)
+	}
+	b.pending = append(b.pending, update)
+	b.pendingBytes += estimateFileCatalogUpdateBytes(record, chunks)
+	if len(b.pending) >= defaultAgentFileCatalogBatchFiles || b.pendingBytes >= defaultAgentFileCatalogBatchBytes {
+		b.Flush()
+	}
+}
+
+func (b *agentFileCatalogBatcher) Flush() {
+	if b == nil || b.catalog == nil || len(b.pending) == 0 {
+		return
+	}
+	updates := b.pending
+	b.pending = nil
+	b.pendingBytes = 0
+	if err := b.catalog.replaceFiles(updates); err != nil && b.logger != nil {
+		b.logger.Warn("agent catalog file batch update failed", "files", len(updates), "error", err)
+	}
+}
+
+func estimateFileCatalogUpdateBytes(record catalogFileRecord, chunks []catalogChunkRecord) int64 {
+	return int64(128 + len(record.RootID) + len(record.Path) + len(record.LinkTarget) + len(record.Fingerprint) + len(chunks)*40)
 }
 
 func (b *agentChunkBatcher) Add(chunk []byte, entry *repository.FileEntry) (chunkBatchStats, error) {
@@ -931,6 +998,7 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 		return chunkBatchStats{}, err
 	}
 	stats := chunkBatchStats{}
+	catalogUpdates := make([]agentChunkStatusUpdate, 0, len(pending))
 	seen := make(map[string]struct{}, len(pending))
 	for _, hash := range checked.Exists {
 		chunk, ok := byHash[hash]
@@ -942,9 +1010,12 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 		b.fillPendingChunk(chunk, ref)
 		stats.Reused += int64(len(chunk.waiters))
 		if b.opts.Catalog != nil {
-			if err := b.opts.Catalog.markChunk(hash, chunk.originalSize, "confirmed", checked.ChunkGeneration, false); err != nil {
-				return chunkBatchStats{}, err
-			}
+			catalogUpdates = append(catalogUpdates, agentChunkStatusUpdate{
+				Hash:         hash,
+				OriginalSize: chunk.originalSize,
+				Status:       "confirmed",
+				Generation:   checked.ChunkGeneration,
+			})
 		}
 	}
 	missingChunks := make([]*pendingBatchChunk, 0, len(checked.Missing))
@@ -995,10 +1066,19 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 				stats.Reused += int64(len(pendingChunk.waiters))
 			}
 			if b.opts.Catalog != nil {
-				if err := b.opts.Catalog.markChunk(pendingChunk.hash, resp.Ref.OriginalSize, "confirmed", generation, resp.Uploaded); err != nil {
-					return chunkBatchStats{}, err
-				}
+				catalogUpdates = append(catalogUpdates, agentChunkStatusUpdate{
+					Hash:         pendingChunk.hash,
+					OriginalSize: resp.Ref.OriginalSize,
+					Status:       "confirmed",
+					Generation:   generation,
+					Uploaded:     resp.Uploaded,
+				})
 			}
+		}
+	}
+	if b.opts.Catalog != nil {
+		if err := b.opts.Catalog.markChunks(catalogUpdates); err != nil {
+			return chunkBatchStats{}, err
 		}
 	}
 	for _, chunk := range pending {
@@ -1045,6 +1125,7 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 	}
 	skipReporter := &agentSkipReporter{logger: logger}
 	chunkBatcher := newAgentChunkBatcher(c, opts)
+	fileCatalogBatcher := newAgentFileCatalogBatcher(opts.Catalog, logger)
 	type pendingManifestFile struct {
 		entry  *repository.FileEntry
 		record catalogFileRecord
@@ -1054,11 +1135,7 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 	multiRoot := len(roots) > 1
 	entryPaths := make(map[string]struct{})
 	finalizeFileEntry := func(pending pendingManifestFile) error {
-		if opts.Catalog != nil {
-			if err := opts.Catalog.replaceFile(pending.record, catalogChunksFromEntry(pending.entry)); err != nil {
-				logger.Warn("agent catalog file update failed", "path", pending.entry.Path, "error", err)
-			}
-		}
+		fileCatalogBatcher.Add(pending.record, catalogChunksFromEntry(pending.entry))
 		return appendManifestEntry(manifest, entryPaths, *pending.entry)
 	}
 	flushPendingFiles := func() error {
@@ -1127,9 +1204,7 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 			case mode.IsDir():
 				entry.Type = repository.EntryTypeDir
 				record.Type = string(repository.EntryTypeDir)
-				if opts.Catalog != nil {
-					_ = opts.Catalog.replaceFile(record, nil)
-				}
+				fileCatalogBatcher.Add(record, nil)
 			case mode&os.ModeSymlink != 0:
 				entry.Type = repository.EntryTypeSymlink
 				target, err := os.Readlink(path)
@@ -1139,9 +1214,7 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 				entry.LinkTarget = target
 				record.Type = string(repository.EntryTypeSymlink)
 				record.LinkTarget = target
-				if opts.Catalog != nil {
-					_ = opts.Catalog.replaceFile(record, nil)
-				}
+				fileCatalogBatcher.Add(record, nil)
 			case mode.IsRegular():
 				entry.Type = repository.EntryTypeFile
 				record.Type = string(repository.EntryTypeFile)
@@ -1212,6 +1285,7 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 	if err := flushPendingFiles(); err != nil {
 		return nil, err
 	}
+	fileCatalogBatcher.Flush()
 	progress.Phase = "manifest"
 	progress.Message = "manifest ready"
 	if err := sendProgress(true); err != nil {
@@ -1315,16 +1389,12 @@ func (c *agentClient) ensureChunk(chunk []byte, opts backupRunOptions) (reposito
 }
 
 func (c *agentClient) tryReuseCatalogFile(catalog *agentCatalog, record catalogFileRecord, entry *repository.FileEntry, opts backupRunOptions) (bool, error) {
-	existing, ok, err := catalog.fileRecord(record.RootID, record.Path)
+	existing, chunks, ok, err := catalog.fileRecordWithChunks(record.RootID, record.Path)
 	if err != nil || !ok {
 		return false, err
 	}
 	if !catalogFileMatches(existing, record) {
 		return false, nil
-	}
-	chunks, err := catalog.fileChunks(record.RootID, record.Path)
-	if err != nil {
-		return false, err
 	}
 	if len(chunks) == 0 {
 		return entry.Size == 0, nil
@@ -1364,16 +1434,25 @@ func (c *agentClient) ensureCatalogChunksConfirmed(catalog *agentCatalog, chunks
 		return false, err
 	}
 	missing := make(map[string]struct{}, len(checked.Missing))
+	updates := make([]agentChunkStatusUpdate, 0, len(checked.Exists)+len(checked.Missing))
 	for _, hash := range checked.Exists {
-		if err := catalog.markChunk(hash, originalSizes[hash], "confirmed", checked.ChunkGeneration, false); err != nil {
-			return false, err
-		}
+		updates = append(updates, agentChunkStatusUpdate{
+			Hash:         hash,
+			OriginalSize: originalSizes[hash],
+			Status:       "confirmed",
+			Generation:   checked.ChunkGeneration,
+		})
 	}
 	for _, hash := range checked.Missing {
 		missing[hash] = struct{}{}
-		if err := catalog.markChunk(hash, originalSizes[hash], "missing", 0, false); err != nil {
-			return false, err
-		}
+		updates = append(updates, agentChunkStatusUpdate{
+			Hash:         hash,
+			OriginalSize: originalSizes[hash],
+			Status:       "missing",
+		})
+	}
+	if err := catalog.markChunks(updates); err != nil {
+		return false, err
 	}
 	return len(missing) == 0, nil
 }

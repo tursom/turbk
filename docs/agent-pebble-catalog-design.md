@@ -2,7 +2,7 @@
 
 日期：2026-06-22
 
-状态：设计草案。
+状态：阶段一和阶段二已落地。
 
 本文定义 Turbk Agent 使用 Pebble 优化本地 catalog 写入的方案。该设计基于当前 daemon catalog、服务端 command 触发、多目录备份、chunk generation 同步和 manifest canonicalize 机制。
 
@@ -333,10 +333,10 @@ TURBK_AGENT_CATALOG_BACKEND=hybrid
 - `hybrid`：SQLite 小表 + Pebble 写热点，推荐默认。
 - `pebble`：后续全量 Pebble，首版不启用。
 
-首版建议：
+首版实现：
 
-1. 先实现 `hybrid`，但默认仍可临时保持 `sqlite`。
-2. 通过 deploy 示例和 Web UI 生成配置逐步切到 `hybrid`。
+1. 默认使用 `hybrid`。
+2. deploy 示例和 Web UI 生成配置显式写入 `TURBK_AGENT_CATALOG_BACKEND=hybrid`。
 3. 若线上发现 Pebble catalog 问题，改回 `sqlite` 并删除 `catalog.pebble/` 即可回滚。
 
 ## 11. 迁移策略
@@ -350,11 +350,15 @@ TURBK_AGENT_CATALOG_BACKEND=hybrid
 - 新确认的 chunk 写 Pebble。
 - 旧 SQLite chunk 状态可以保留一段时间，后续版本再清理。
 
+当前实现采用上述策略：`hybrid` backend 下 `server_chunks` 读写进入 `catalog.pebble/`，SQLite 仍保留表结构用于 `sqlite` 回滚模式和旧数据兼容。
+
 阶段二上线后：
 
 - 已存在的 SQLite `files/file_chunks` 不主动搬迁。
 - 第一次扫描某个文件时，Pebble miss 会读取文件并写入 Pebble。
 - 如果需要降低首次重新扫描成本，可以增加可选后台迁移命令，但不作为首版要求。
+
+当前实现采用上述策略：`hybrid` backend 下 `files/file_chunks` 合并写入 `catalog.pebble/` 的 `0x02` record；SQLite 仍保留表结构用于 `sqlite` 回滚模式和旧数据兼容。
 
 ## 12. 测试计划
 
@@ -443,10 +447,12 @@ TURBK_AGENT_CATALOG_BACKEND=hybrid
 - 一次性全量迁移旧 SQLite cache 可能导致升级时长不可控，首版不做自动迁移。
 - 如果网络层仍逐 chunk GET/PUT，Pebble 只能降低本地写入，不能解决公网 RTT 放大。因此公网场景应同时落地批量 chunk API。
 
-## 16. 推荐结论
+## 16. 当前结论
 
-在 Pebble catalog 范围内，优先实现阶段一：只迁 `server_chunks` 到 Pebble，并使用 batch + `NoSync` 写入。这个改动范围最小，能直接降低 chunk 级别热点写入。
+当前实现已完成两个阶段：
 
-如果和 chunk 批量接口一起排期，全局顺序建议先落地批量 check/upload，减少公网 RTT；随后把批量 check/upload 的本地结果写入 Pebble，避免网络请求批量化后又退化为本地逐条 SQLite 写入。
+- `server_chunks` 使用 Pebble `0x01` 二进制 key，并通过 batch + `NoSync` 写入。
+- `files/file_chunks` 合并为 Pebble `0x02` 二进制 record，未变化文件复用路径一次读取 metadata 和 chunk 列表。
+- `TURBK_AGENT_CATALOG_BACKEND=hybrid` 为默认 backend；`sqlite` 保留为回滚模式。
 
-阶段一稳定后，再迁 `files/file_chunks`。第二阶段收益更大，但会影响文件复用核心路径，需要更完整的兼容和回归测试。
+chunk 批量 check/upload 和 Pebble catalog 已一起落地：公网 RTT 由批量 API 摊薄，本地写入热点由 Pebble catalog 承接，避免网络请求批量化后又退化为本地逐 chunk/逐 chunk-row SQLite 写入。
