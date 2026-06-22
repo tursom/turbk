@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,12 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/repository"
 	"github.com/tursom/turbk/internal/rootset"
+	"github.com/zeebo/blake3"
 )
 
 func TestAgentClientUsesHTTPProxyFromEnvironment(t *testing.T) {
@@ -114,6 +119,104 @@ func TestScanAndUploadMultiRootManifestPaths(t *testing.T) {
 	}
 }
 
+func TestScanAndUploadBatchesChunkCheckAndUpload(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("first batch file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("second batch file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var checkCalls int
+	var uploadCalls int
+	var checkedHashes []string
+	var uploadedHashes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/runs/1/progress":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/check":
+			checkCalls++
+			var req struct {
+				Hashes []string `json:"hashes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode check request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			checkedHashes = append(checkedHashes, req.Hashes...)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"exists":           []string{},
+				"missing":          req.Hashes,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/upload":
+			uploadCalls++
+			chunks := decodeAgentChunkBatchRequest(t, r.Body)
+			respChunks := make([]map[string]any, 0, len(chunks))
+			for _, chunk := range chunks {
+				uploadedHashes = append(uploadedHashes, chunk.hash)
+				respChunks = append(respChunks, map[string]any{
+					"hash":     chunk.hash,
+					"exists":   true,
+					"uploaded": true,
+					"ref": repository.ChunkRef{
+						Hash:         chunk.hash,
+						OriginalSize: int64(len(chunk.data)),
+					},
+				})
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "accepted",
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"chunks":           respChunks,
+			})
+		case strings.HasPrefix(r.URL.Path, "/agent/v1/chunks/"):
+			t.Errorf("scan used legacy chunk endpoint: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "legacy chunk endpoint not allowed", http.StatusTeapot)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{
+		RepositoryID:             "repo-test",
+		ChunkGeneration:          7,
+		MaxChunkCheckBatch:       10000,
+		MaxChunkUploadBatchBytes: defaultAgentChunkUploadBatchBytes,
+		ChunkBatchUpload:         true,
+	})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if checkCalls != 1 || uploadCalls != 1 {
+		t.Fatalf("batch calls check=%d upload=%d, want 1/1", checkCalls, uploadCalls)
+	}
+	if len(checkedHashes) != 2 || len(uploadedHashes) != 2 {
+		t.Fatalf("batched hashes check=%v upload=%v, want two chunks", checkedHashes, uploadedHashes)
+	}
+	if len(manifest.Entries) != 3 {
+		t.Fatalf("manifest entries = %d, want root dir plus two files: %+v", len(manifest.Entries), manifest.Entries)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		entry, ok := manifest.Find(name)
+		if !ok || len(entry.Chunks) != 1 || entry.Chunks[0].Hash == "" {
+			t.Fatalf("manifest file %s missing uploaded chunk: %+v ok=%v", name, entry, ok)
+		}
+	}
+}
+
 func TestRootFlagReadsRootEnvironment(t *testing.T) {
 	t.Setenv("TURBK_AGENT_ROOT", "/legacy/root")
 	t.Setenv("TURBK_AGENT_ROOTS", "/data/app,/var/log/myapp")
@@ -210,4 +313,53 @@ func TestDueByCronChecksWindowWithoutDuplicateMinute(t *testing.T) {
 	if dueByCron("@hourly", now, now.Add(20*time.Second)) {
 		t.Fatal("did not expect same matching minute to trigger twice")
 	}
+}
+
+type decodedAgentChunkBatch struct {
+	hash string
+	data []byte
+}
+
+func decodeAgentChunkBatchRequest(t *testing.T, body io.Reader) []decodedAgentChunkBatch {
+	t.Helper()
+	data, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, agentChunkBatchMagic) {
+		t.Fatalf("chunk batch magic mismatch: %q", data[:min(len(data), len(agentChunkBatchMagic))])
+	}
+	offset := len(agentChunkBatchMagic)
+	if len(data) < offset+4 {
+		t.Fatalf("chunk batch missing count")
+	}
+	count := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	chunks := make([]decodedAgentChunkBatch, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if len(data) < offset+32+8 {
+			t.Fatalf("chunk %d missing header", i)
+		}
+		hashBytes := data[offset : offset+32]
+		offset += 32
+		length := binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+		if length > uint64(len(data)-offset) {
+			t.Fatalf("chunk %d length %d exceeds remaining body %d", i, length, len(data)-offset)
+		}
+		chunk := data[offset : offset+int(length)]
+		offset += int(length)
+		sum := blake3.Sum256(chunk)
+		if !bytes.Equal(sum[:], hashBytes) {
+			t.Fatalf("chunk %d hash mismatch", i)
+		}
+		chunks = append(chunks, decodedAgentChunkBatch{
+			hash: hex.EncodeToString(hashBytes),
+			data: append([]byte(nil), chunk...),
+		})
+	}
+	if offset != len(data) {
+		t.Fatalf("chunk batch has %d trailing bytes", len(data)-offset)
+	}
+	return chunks
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -29,6 +30,10 @@ import (
 
 const agentChunkAvgSize = 1024 * 1024
 const defaultAgentBackupSchedule = "0 0 * * *"
+const defaultAgentChunkUploadBatchBytes = int64(64 * 1024 * 1024)
+const agentChunkBatchContentType = "application/vnd.turbk.chunk-batch.v1"
+
+var agentChunkBatchMagic = []byte("TBKCHB1\n")
 
 type agentClient struct {
 	serverURL    string
@@ -86,6 +91,8 @@ type agentInfo struct {
 	PollIntervalSeconds       int64  `json:"poll_interval_seconds"`
 	DefaultPollInterval       string `json:"default_poll_interval"`
 	MaxChunkCheckBatch        int    `json:"max_chunk_check_batch"`
+	MaxChunkUploadBatchBytes  int64  `json:"max_chunk_upload_batch_bytes"`
+	ChunkBatchUpload          bool   `json:"chunk_batch_upload"`
 	MaxManifestRepairAttempts int    `json:"max_manifest_repair_attempts"`
 }
 
@@ -119,6 +126,20 @@ type checkChunksResponse struct {
 	ChunkGeneration int64    `json:"chunk_generation"`
 	Exists          []string `json:"exists"`
 	Missing         []string `json:"missing"`
+}
+
+type uploadChunksResponse struct {
+	Status          string                `json:"status"`
+	RepositoryID    string                `json:"repository_id"`
+	ChunkGeneration int64                 `json:"chunk_generation"`
+	Chunks          []uploadChunkResponse `json:"chunks"`
+}
+
+type uploadChunkResponse struct {
+	Hash     string              `json:"hash"`
+	Exists   bool                `json:"exists"`
+	Uploaded bool                `json:"uploaded"`
+	Ref      repository.ChunkRef `json:"ref"`
 }
 
 type invalidationsResponse struct {
@@ -264,6 +285,9 @@ func main() {
 			Catalog:                   catalog,
 			RepositoryID:              heartbeat.Repository.ID,
 			ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
+			MaxChunkCheckBatch:        heartbeat.Agent.MaxChunkCheckBatch,
+			MaxChunkUploadBatchBytes:  heartbeat.Agent.MaxChunkUploadBatchBytes,
+			ChunkBatchUpload:          heartbeat.Agent.ChunkBatchUpload,
 			Trigger:                   "once",
 			MaxManifestRepairAttempts: maxManifestRepairAttempts,
 		}); err != nil {
@@ -489,6 +513,9 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
 				ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
+				MaxChunkCheckBatch:        heartbeat.Agent.MaxChunkCheckBatch,
+				MaxChunkUploadBatchBytes:  heartbeat.Agent.MaxChunkUploadBatchBytes,
+				ChunkBatchUpload:          heartbeat.Agent.ChunkBatchUpload,
 				CommandID:                 command.ID,
 				Trigger:                   "manual",
 				MaxManifestRepairAttempts: opts.MaxManifestRepairAttempts,
@@ -513,6 +540,9 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
 				ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
+				MaxChunkCheckBatch:        heartbeat.Agent.MaxChunkCheckBatch,
+				MaxChunkUploadBatchBytes:  heartbeat.Agent.MaxChunkUploadBatchBytes,
+				ChunkBatchUpload:          heartbeat.Agent.ChunkBatchUpload,
 				Trigger:                   "schedule",
 				MaxManifestRepairAttempts: opts.MaxManifestRepairAttempts,
 			})
@@ -622,6 +652,9 @@ type backupRunOptions struct {
 	Catalog                   *agentCatalog
 	RepositoryID              string
 	ChunkGeneration           int64
+	MaxChunkCheckBatch        int
+	MaxChunkUploadBatchBytes  int64
+	ChunkBatchUpload          bool
 	CommandID                 int64
 	Trigger                   string
 	MaxManifestRepairAttempts int
@@ -752,6 +785,241 @@ func (r *agentSkipReporter) record(event fsfilter.SkipEvent) {
 	r.logger.Warn("agent skipped path", "path", event.Path, "rel", event.Rel, "reason", event.Reason)
 }
 
+type chunkBatchStats struct {
+	Uploaded int64
+	Reused   int64
+}
+
+type chunkBatchWaiter struct {
+	entry *repository.FileEntry
+	index int
+}
+
+type pendingBatchChunk struct {
+	hash         string
+	data         []byte
+	originalSize int64
+	waiters      []chunkBatchWaiter
+}
+
+type agentChunkBatcher struct {
+	client          *agentClient
+	opts            backupRunOptions
+	maxChunks       int
+	maxRequestBytes int64
+	pending         []*pendingBatchChunk
+	pendingByHash   map[string]*pendingBatchChunk
+	pendingByEntry  map[*repository.FileEntry]int
+	requestBytes    int64
+}
+
+func newAgentChunkBatcher(client *agentClient, opts backupRunOptions) *agentChunkBatcher {
+	maxChunks := opts.MaxChunkCheckBatch
+	if maxChunks <= 0 {
+		maxChunks = 10000
+	}
+	maxRequestBytes := opts.MaxChunkUploadBatchBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = defaultAgentChunkUploadBatchBytes
+	}
+	return &agentChunkBatcher{
+		client:          client,
+		opts:            opts,
+		maxChunks:       maxChunks,
+		maxRequestBytes: maxRequestBytes,
+		pendingByHash:   make(map[string]*pendingBatchChunk),
+		pendingByEntry:  make(map[*repository.FileEntry]int),
+	}
+}
+
+func (b *agentChunkBatcher) Add(chunk []byte, entry *repository.FileEntry) (chunkBatchStats, error) {
+	if !b.opts.ChunkBatchUpload {
+		ref, uploaded, err := b.client.ensureChunk(chunk, b.opts)
+		if err != nil {
+			return chunkBatchStats{}, err
+		}
+		entry.Chunks = append(entry.Chunks, ref)
+		if uploaded {
+			return chunkBatchStats{Uploaded: 1}, nil
+		}
+		return chunkBatchStats{Reused: 1}, nil
+	}
+
+	sum := blake3.Sum256(chunk)
+	hash := hex.EncodeToString(sum[:])
+	if b.opts.Catalog != nil {
+		status, confirmedGeneration, ok, err := b.opts.Catalog.chunkStatus(hash)
+		if err != nil {
+			return chunkBatchStats{}, err
+		}
+		if ok && status == "confirmed" && confirmedGeneration >= b.opts.ChunkGeneration {
+			entry.Chunks = append(entry.Chunks, repository.ChunkRef{Hash: hash, OriginalSize: int64(len(chunk))})
+			return chunkBatchStats{Reused: 1}, nil
+		}
+	}
+
+	index := len(entry.Chunks)
+	entry.Chunks = append(entry.Chunks, repository.ChunkRef{})
+	waiter := chunkBatchWaiter{entry: entry, index: index}
+	if pending, ok := b.pendingByHash[hash]; ok {
+		pending.waiters = append(pending.waiters, waiter)
+		b.pendingByEntry[entry]++
+		return chunkBatchStats{}, nil
+	}
+
+	data := append([]byte(nil), chunk...)
+	chunkRequestBytes := int64(32 + 8 + len(data))
+	if 12+chunkRequestBytes > b.maxRequestBytes {
+		return chunkBatchStats{}, fmt.Errorf("chunk %s size %d exceeds max batch request size %d", hash, len(data), b.maxRequestBytes)
+	}
+	if len(b.pending) > 0 && (len(b.pending)+1 > b.maxChunks || b.requestBytes+chunkRequestBytes > b.maxRequestBytes) {
+		stats, err := b.Flush()
+		if err != nil {
+			return chunkBatchStats{}, err
+		}
+		if b.requestBytes == 0 {
+			b.requestBytes = 12
+		}
+		pending := &pendingBatchChunk{
+			hash:         hash,
+			data:         data,
+			originalSize: int64(len(data)),
+			waiters:      []chunkBatchWaiter{waiter},
+		}
+		b.pending = append(b.pending, pending)
+		b.pendingByHash[hash] = pending
+		b.pendingByEntry[entry]++
+		b.requestBytes += chunkRequestBytes
+		return stats, nil
+	}
+	if b.requestBytes == 0 {
+		b.requestBytes = 12
+	}
+	pending := &pendingBatchChunk{
+		hash:         hash,
+		data:         data,
+		originalSize: int64(len(data)),
+		waiters:      []chunkBatchWaiter{waiter},
+	}
+	b.pending = append(b.pending, pending)
+	b.pendingByHash[hash] = pending
+	b.pendingByEntry[entry]++
+	b.requestBytes += chunkRequestBytes
+	if len(b.pending) >= b.maxChunks || b.requestBytes >= b.maxRequestBytes {
+		return b.Flush()
+	}
+	return chunkBatchStats{}, nil
+}
+
+func (b *agentChunkBatcher) EntryPending(entry *repository.FileEntry) bool {
+	return b.pendingByEntry[entry] > 0
+}
+
+func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
+	if len(b.pending) == 0 {
+		return chunkBatchStats{}, nil
+	}
+	pending := append([]*pendingBatchChunk(nil), b.pending...)
+	hashes := make([]string, 0, len(pending))
+	byHash := make(map[string]*pendingBatchChunk, len(pending))
+	for _, chunk := range pending {
+		hashes = append(hashes, chunk.hash)
+		byHash[chunk.hash] = chunk
+	}
+	checked, err := b.client.checkChunks(hashes, b.opts.RepositoryID, b.opts.ChunkGeneration)
+	if err != nil {
+		return chunkBatchStats{}, err
+	}
+	stats := chunkBatchStats{}
+	seen := make(map[string]struct{}, len(pending))
+	for _, hash := range checked.Exists {
+		chunk, ok := byHash[hash]
+		if !ok {
+			return chunkBatchStats{}, fmt.Errorf("server check returned unexpected chunk %s", hash)
+		}
+		seen[hash] = struct{}{}
+		ref := repository.ChunkRef{Hash: hash, OriginalSize: chunk.originalSize}
+		b.fillPendingChunk(chunk, ref)
+		stats.Reused += int64(len(chunk.waiters))
+		if b.opts.Catalog != nil {
+			if err := b.opts.Catalog.markChunk(hash, chunk.originalSize, "confirmed", checked.ChunkGeneration, false); err != nil {
+				return chunkBatchStats{}, err
+			}
+		}
+	}
+	missingChunks := make([]*pendingBatchChunk, 0, len(checked.Missing))
+	for _, hash := range checked.Missing {
+		chunk, ok := byHash[hash]
+		if !ok {
+			return chunkBatchStats{}, fmt.Errorf("server check returned unexpected missing chunk %s", hash)
+		}
+		seen[hash] = struct{}{}
+		missingChunks = append(missingChunks, chunk)
+	}
+	for _, chunk := range pending {
+		if _, ok := seen[chunk.hash]; !ok {
+			return chunkBatchStats{}, fmt.Errorf("server check omitted chunk %s", chunk.hash)
+		}
+	}
+	if len(missingChunks) > 0 {
+		uploaded, err := b.client.uploadChunksBatch(missingChunks)
+		if err != nil {
+			return chunkBatchStats{}, err
+		}
+		uploadedByHash := make(map[string]uploadChunkResponse, len(uploaded.Chunks))
+		for _, chunk := range uploaded.Chunks {
+			uploadedByHash[chunk.Hash] = chunk
+		}
+		generation := uploaded.ChunkGeneration
+		if generation == 0 {
+			generation = b.opts.ChunkGeneration
+		}
+		for _, pendingChunk := range missingChunks {
+			resp, ok := uploadedByHash[pendingChunk.hash]
+			if !ok {
+				return chunkBatchStats{}, fmt.Errorf("server upload omitted chunk %s", pendingChunk.hash)
+			}
+			if resp.Ref.Hash == "" {
+				return chunkBatchStats{}, fmt.Errorf("server accepted chunk %s without ref", pendingChunk.hash)
+			}
+			if resp.Ref.Hash != pendingChunk.hash {
+				return chunkBatchStats{}, fmt.Errorf("server returned ref %s for uploaded chunk %s", resp.Ref.Hash, pendingChunk.hash)
+			}
+			b.fillPendingChunk(pendingChunk, resp.Ref)
+			if resp.Uploaded {
+				stats.Uploaded++
+				if len(pendingChunk.waiters) > 1 {
+					stats.Reused += int64(len(pendingChunk.waiters) - 1)
+				}
+			} else {
+				stats.Reused += int64(len(pendingChunk.waiters))
+			}
+			if b.opts.Catalog != nil {
+				if err := b.opts.Catalog.markChunk(pendingChunk.hash, resp.Ref.OriginalSize, "confirmed", generation, resp.Uploaded); err != nil {
+					return chunkBatchStats{}, err
+				}
+			}
+		}
+	}
+	for _, chunk := range pending {
+		delete(b.pendingByHash, chunk.hash)
+	}
+	b.pending = b.pending[:0]
+	b.requestBytes = 0
+	return stats, nil
+}
+
+func (b *agentChunkBatcher) fillPendingChunk(chunk *pendingBatchChunk, ref repository.ChunkRef) {
+	for _, waiter := range chunk.waiters {
+		waiter.entry.Chunks[waiter.index] = ref
+		if count := b.pendingByEntry[waiter.entry]; count <= 1 {
+			delete(b.pendingByEntry, waiter.entry)
+		} else {
+			b.pendingByEntry[waiter.entry] = count - 1
+		}
+	}
+}
+
 func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) (*repository.SnapshotManifest, error) {
 	manifest := &repository.SnapshotManifest{
 		CreatedAt:  time.Now().UTC(),
@@ -776,9 +1044,46 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 		return c.sendProgress(runID, progress)
 	}
 	skipReporter := &agentSkipReporter{logger: logger}
+	chunkBatcher := newAgentChunkBatcher(c, opts)
+	type pendingManifestFile struct {
+		entry  *repository.FileEntry
+		record catalogFileRecord
+	}
+	pendingFiles := make([]pendingManifestFile, 0)
 
 	multiRoot := len(roots) > 1
 	entryPaths := make(map[string]struct{})
+	finalizeFileEntry := func(pending pendingManifestFile) error {
+		if opts.Catalog != nil {
+			if err := opts.Catalog.replaceFile(pending.record, catalogChunksFromEntry(pending.entry)); err != nil {
+				logger.Warn("agent catalog file update failed", "path", pending.entry.Path, "error", err)
+			}
+		}
+		return appendManifestEntry(manifest, entryPaths, *pending.entry)
+	}
+	flushPendingFiles := func() error {
+		stats, err := chunkBatcher.Flush()
+		if err != nil {
+			return err
+		}
+		progress.UploadedChunks += stats.Uploaded
+		progress.ReusedChunks += stats.Reused
+		remaining := pendingFiles[:0]
+		for _, pending := range pendingFiles {
+			if chunkBatcher.EntryPending(pending.entry) {
+				remaining = append(remaining, pending)
+				continue
+			}
+			if err := finalizeFileEntry(pending); err != nil {
+				return err
+			}
+		}
+		pendingFiles = remaining
+		if stats.Uploaded != 0 || stats.Reused != 0 {
+			return sendProgress(true)
+		}
+		return nil
+	}
 	for _, root := range roots {
 		progress.Message = root
 		if err := sendProgress(true); err != nil {
@@ -862,20 +1167,15 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 				if err != nil {
 					return fmt.Errorf("open file %q: %w", path, err)
 				}
-				fileChunks := make([]catalogChunkRecord, 0)
+				entryPtr := &entry
 				if err := chunker.Split(file, func(chunk []byte) error {
-					ref, uploaded, err := c.ensureChunk(chunk, opts)
+					stats, err := chunkBatcher.Add(chunk, entryPtr)
 					if err != nil {
 						_ = file.Close()
 						return err
 					}
-					if uploaded {
-						progress.UploadedChunks++
-					} else {
-						progress.ReusedChunks++
-					}
-					entry.Chunks = append(entry.Chunks, ref)
-					fileChunks = append(fileChunks, catalogChunkRecord{Hash: ref.Hash, OriginalSize: ref.OriginalSize})
+					progress.UploadedChunks += stats.Uploaded
+					progress.ReusedChunks += stats.Reused
 					return sendProgress(false)
 				}); err != nil {
 					_ = file.Close()
@@ -887,14 +1187,16 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 				progress.ProcessedFiles++
 				progress.ProcessedBytes += entry.Size
 				progress.Message = entry.Path
-				if opts.Catalog != nil {
-					if err := opts.Catalog.replaceFile(record, fileChunks); err != nil {
-						logger.Warn("agent catalog file update failed", "path", entry.Path, "error", err)
-					}
+				pending := pendingManifestFile{entry: entryPtr, record: record}
+				if chunkBatcher.EntryPending(entryPtr) {
+					pendingFiles = append(pendingFiles, pending)
+				} else if err := finalizeFileEntry(pending); err != nil {
+					return err
 				}
 				if err := sendProgress(true); err != nil {
 					return err
 				}
+				return nil
 			default:
 				return nil
 			}
@@ -903,6 +1205,12 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 		if err != nil {
 			return nil, err
 		}
+		if err := flushPendingFiles(); err != nil {
+			return nil, err
+		}
+	}
+	if err := flushPendingFiles(); err != nil {
+		return nil, err
 	}
 	progress.Phase = "manifest"
 	progress.Message = "manifest ready"
@@ -930,6 +1238,17 @@ func appendManifestEntry(manifest *repository.SnapshotManifest, seen map[string]
 	seen[entry.Path] = struct{}{}
 	manifest.Entries = append(manifest.Entries, entry)
 	return nil
+}
+
+func catalogChunksFromEntry(entry *repository.FileEntry) []catalogChunkRecord {
+	if len(entry.Chunks) == 0 {
+		return nil
+	}
+	chunks := make([]catalogChunkRecord, 0, len(entry.Chunks))
+	for _, ref := range entry.Chunks {
+		chunks = append(chunks, catalogChunkRecord{Hash: ref.Hash, OriginalSize: ref.OriginalSize})
+	}
+	return chunks
 }
 
 func (c *agentClient) sendProgress(runID int64, progress agentProgress) error {
@@ -1085,6 +1404,69 @@ func (c *agentClient) checkChunks(hashes []string, repositoryID string, baseGene
 		"hashes":                hashes,
 	}, &resp)
 	return resp, err
+}
+
+func (c *agentClient) uploadChunksBatch(chunks []*pendingBatchChunk) (uploadChunksResponse, error) {
+	var body bytes.Buffer
+	body.Write(agentChunkBatchMagic)
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(chunks)))
+	body.Write(count[:])
+	for _, chunk := range chunks {
+		hashBytes, err := hex.DecodeString(chunk.hash)
+		if err != nil || len(hashBytes) != 32 {
+			return uploadChunksResponse{}, fmt.Errorf("invalid chunk hash %q", chunk.hash)
+		}
+		body.Write(hashBytes)
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(chunk.data)))
+		body.Write(length[:])
+		body.Write(chunk.data)
+	}
+	var resp uploadChunksResponse
+	status, err := c.doRawAllowStatuses(http.MethodPost, "/agent/v1/chunks/upload", bytes.NewReader(body.Bytes()), agentChunkBatchContentType, &resp, http.StatusNotFound)
+	if err != nil {
+		return uploadChunksResponse{}, err
+	}
+	if status == http.StatusNotFound {
+		return c.uploadChunksLegacy(chunks)
+	}
+	if status != http.StatusAccepted && status != http.StatusOK {
+		return uploadChunksResponse{}, fmt.Errorf("unexpected chunk batch upload status %d", status)
+	}
+	return resp, nil
+}
+
+func (c *agentClient) uploadChunksLegacy(chunks []*pendingBatchChunk) (uploadChunksResponse, error) {
+	resp := uploadChunksResponse{Status: "accepted", Chunks: make([]uploadChunkResponse, 0, len(chunks))}
+	for _, chunk := range chunks {
+		uploaded, err := c.putSingleChunk(chunk.hash, chunk.data)
+		if err != nil {
+			return uploadChunksResponse{}, err
+		}
+		resp.Chunks = append(resp.Chunks, uploaded)
+	}
+	return resp, nil
+}
+
+func (c *agentClient) putSingleChunk(hash string, chunk []byte) (uploadChunkResponse, error) {
+	var uploaded chunkResponse
+	status, err := c.doRaw(http.MethodPut, "/agent/v1/chunks/"+hash, bytes.NewReader(chunk), "application/octet-stream", &uploaded)
+	if err != nil {
+		return uploadChunkResponse{}, err
+	}
+	if status != http.StatusCreated && status != http.StatusOK {
+		return uploadChunkResponse{}, fmt.Errorf("unexpected chunk upload status %d", status)
+	}
+	if uploaded.Ref.Hash == "" {
+		return uploadChunkResponse{}, fmt.Errorf("server accepted chunk %s without ref", hash)
+	}
+	return uploadChunkResponse{
+		Hash:     hash,
+		Exists:   uploaded.Exists,
+		Uploaded: status == http.StatusCreated && uploaded.Uploaded,
+		Ref:      uploaded.Ref,
+	}, nil
 }
 
 func (c *agentClient) chunkInvalidations(since int64) (invalidationsResponse, error) {

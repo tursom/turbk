@@ -45,5 +45,6 @@ agent:
   command_ttl: "30m"
   default_poll_interval: "10m"
   max_chunk_check_batch: 10000
+  max_chunk_upload_batch_bytes: "64MiB"
   max_invalidation_response_hashes: 100000
   invalidation_retention_days: 30

@@ -78,6 +78,7 @@ func TestEnvOverridesRepositoryConfig(t *testing.T) {
 	t.Setenv("TURBK_CHUNK_AVG_SIZE", "2MiB")
 	t.Setenv("TURBK_COMPRESSION", "none")
 	t.Setenv("TURBK_ENCRYPTION", "none")
+	t.Setenv("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", "32MiB")
 
 	cfg, err := Load("../../configs/turbk.example.yaml")
 	if err != nil {
@@ -86,7 +87,8 @@ func TestEnvOverridesRepositoryConfig(t *testing.T) {
 	if cfg.Repository.SegmentSize != "256MiB" ||
 		cfg.Repository.ChunkAvgSize != "2MiB" ||
 		cfg.Repository.Compression != "none" ||
-		cfg.Repository.Encryption != "none" {
-		t.Fatalf("repository env overrides were not applied: %+v", cfg.Repository)
+		cfg.Repository.Encryption != "none" ||
+		cfg.Agent.MaxChunkUploadBatchBytes != "32MiB" {
+		t.Fatalf("env overrides were not applied: repository=%+v agent=%+v", cfg.Repository, cfg.Agent)
 	}
 }

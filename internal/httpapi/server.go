@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -105,6 +107,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /agent/v1/chunks/{hash}", s.handleAgentPutChunk)
 	s.mux.HandleFunc("GET /agent/v1/chunks/invalidations", s.handleAgentChunkInvalidations)
 	s.mux.HandleFunc("POST /agent/v1/chunks/check", s.handleAgentCheckChunks)
+	s.mux.HandleFunc("POST /agent/v1/chunks/upload", s.handleAgentUploadChunks)
 	s.mux.HandleFunc("POST /agent/v1/manifests", s.handleAgentPostManifest)
 	s.mux.HandleFunc("POST /agent/v1/commands/{id}/ack", s.handleAgentCommandAck)
 	s.mux.HandleFunc("POST /agent/v1/runs/{id}/progress", s.handleAgentProgress)
@@ -901,6 +904,8 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			"poll_interval_seconds":        int64(pollInterval / time.Second),
 			"default_poll_interval":        s.cfg.Agent.DefaultPollInterval,
 			"max_chunk_check_batch":        s.cfg.Agent.MaxChunkCheckBatch,
+			"max_chunk_upload_batch_bytes": s.agentMaxChunkUploadBatchBytes(),
+			"chunk_batch_upload":           true,
 			"max_manifest_repair_attempts": 3,
 		},
 		"maintenance": map[string]any{
@@ -1128,6 +1133,71 @@ func (s *Server) handleAgentPutChunk(w http.ResponseWriter, r *http.Request) {
 		"exists":   true,
 		"uploaded": !existed,
 		"ref":      ref,
+	})
+}
+
+const agentChunkBatchContentType = "application/vnd.turbk.chunk-batch.v1"
+
+var agentChunkBatchMagic = []byte("TBKCHB1\n")
+
+type agentUploadChunk struct {
+	hash string
+	data []byte
+}
+
+func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateAgent(w, r); !ok {
+		return
+	}
+	if contentType := strings.TrimSpace(r.Header.Get("Content-Type")); contentType != "" {
+		mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+		if mediaType != agentChunkBatchContentType {
+			writeError(w, http.StatusUnsupportedMediaType, fmt.Errorf("content type must be %s", agentChunkBatchContentType))
+			return
+		}
+	}
+	maxBodyBytes := s.agentMaxChunkUploadBatchBytes()
+	chunks, err := readAgentChunkBatch(w, r, maxBodyBytes, s.cfg.Agent.MaxChunkCheckBatch)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("chunk batch exceeds max size %d", maxBodyBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	releaseRunGate, ok := s.tryEnterBackupWrite()
+	if !ok {
+		writeError(w, http.StatusConflict, errStorageMaintenanceRunning)
+		return
+	}
+	defer releaseRunGate()
+
+	repositoryState, err := s.store.RepositoryState(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	responses := make([]map[string]any, 0, len(chunks))
+	for _, chunk := range chunks {
+		ref, existed, err := s.repo.PutChunk(r.Context(), chunk.data)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		responses = append(responses, map[string]any{
+			"hash":     chunk.hash,
+			"exists":   true,
+			"uploaded": !existed,
+			"ref":      ref,
+		})
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":           "accepted",
+		"repository_id":    repositoryState.RepositoryID,
+		"chunk_generation": repositoryState.ChunkGeneration,
+		"chunks":           responses,
 	})
 }
 
@@ -2281,6 +2351,81 @@ func validateChunkHash(hash string) error {
 		return fmt.Errorf("chunk hash must be valid BLAKE3-256 hex")
 	}
 	return nil
+}
+
+func (s *Server) agentMaxChunkUploadBatchBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkUploadBatchBytes)
+	if err != nil || maxBytes <= 0 {
+		return 64 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func readAgentChunkBatch(w http.ResponseWriter, r *http.Request, maxBodyBytes int64, maxChunks int) ([]agentUploadChunk, error) {
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = 64 * 1024 * 1024
+	}
+	if maxChunks <= 0 {
+		maxChunks = 10000
+	}
+	body := http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	defer body.Close()
+
+	magic := make([]byte, len(agentChunkBatchMagic))
+	if _, err := io.ReadFull(body, magic); err != nil {
+		return nil, fmt.Errorf("read chunk batch magic: %w", err)
+	}
+	if !bytes.Equal(magic, agentChunkBatchMagic) {
+		return nil, errors.New("chunk batch magic is invalid")
+	}
+	var countBytes [4]byte
+	if _, err := io.ReadFull(body, countBytes[:]); err != nil {
+		return nil, fmt.Errorf("read chunk batch count: %w", err)
+	}
+	count := binary.BigEndian.Uint32(countBytes[:])
+	if count == 0 {
+		return nil, errors.New("chunk batch is empty")
+	}
+	if count > uint32(maxChunks) {
+		return nil, fmt.Errorf("chunk count exceeds max batch %d", maxChunks)
+	}
+	chunks := make([]agentUploadChunk, 0, int(count))
+	for i := uint32(0); i < count; i++ {
+		var hashBytes [32]byte
+		if _, err := io.ReadFull(body, hashBytes[:]); err != nil {
+			return nil, fmt.Errorf("read chunk %d hash: %w", i, err)
+		}
+		var lengthBytes [8]byte
+		if _, err := io.ReadFull(body, lengthBytes[:]); err != nil {
+			return nil, fmt.Errorf("read chunk %d length: %w", i, err)
+		}
+		dataLength := binary.BigEndian.Uint64(lengthBytes[:])
+		if dataLength > uint64(maxBodyBytes) || dataLength > uint64(^uint(0)>>1) {
+			return nil, fmt.Errorf("chunk %d length exceeds max batch size %d", i, maxBodyBytes)
+		}
+		data := make([]byte, int(dataLength))
+		if _, err := io.ReadFull(body, data); err != nil {
+			return nil, fmt.Errorf("read chunk %d body: %w", i, err)
+		}
+		hash := hex.EncodeToString(hashBytes[:])
+		actual, err := repository.HashBytes(data)
+		if err != nil {
+			return nil, fmt.Errorf("hash chunk %d: %w", i, err)
+		}
+		if actual != hash {
+			return nil, fmt.Errorf("chunk hash mismatch at index %d: header=%s body=%s", i, hash, actual)
+		}
+		chunks = append(chunks, agentUploadChunk{hash: hash, data: data})
+	}
+	var trailing [1]byte
+	n, err := body.Read(trailing[:])
+	if n > 0 {
+		return nil, errors.New("chunk batch has trailing bytes")
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("read chunk batch trailer: %w", err)
+	}
+	return chunks, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

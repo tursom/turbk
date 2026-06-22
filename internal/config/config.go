@@ -76,6 +76,7 @@ type AgentConfig struct {
 	CommandTTL                    string `json:"command_ttl" yaml:"command_ttl"`
 	DefaultPollInterval           string `json:"default_poll_interval" yaml:"default_poll_interval"`
 	MaxChunkCheckBatch            int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
+	MaxChunkUploadBatchBytes      string `json:"max_chunk_upload_batch_bytes" yaml:"max_chunk_upload_batch_bytes"`
 	MaxInvalidationResponseHashes int    `json:"max_invalidation_response_hashes" yaml:"max_invalidation_response_hashes"`
 	InvalidationRetentionDays     int    `json:"invalidation_retention_days" yaml:"invalidation_retention_days"`
 }
@@ -128,6 +129,7 @@ func Default() Config {
 			CommandTTL:                    "30m",
 			DefaultPollInterval:           "10m",
 			MaxChunkCheckBatch:            10000,
+			MaxChunkUploadBatchBytes:      "64MiB",
 			MaxInvalidationResponseHashes: 100000,
 			InvalidationRetentionDays:     30,
 		},
@@ -245,6 +247,14 @@ func (c *Config) Normalize() error {
 	if c.Agent.MaxChunkCheckBatch <= 0 {
 		c.Agent.MaxChunkCheckBatch = 10000
 	}
+	if strings.TrimSpace(c.Agent.MaxChunkUploadBatchBytes) == "" {
+		c.Agent.MaxChunkUploadBatchBytes = "64MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.MaxChunkUploadBatchBytes); err != nil {
+		return fmt.Errorf("agent.max_chunk_upload_batch_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.max_chunk_upload_batch_bytes must be positive")
+	}
 	if c.Agent.MaxInvalidationResponseHashes <= 0 {
 		c.Agent.MaxInvalidationResponseHashes = 100000
 	}
@@ -315,8 +325,45 @@ func applyEnv(c *Config) {
 	applyString("TURBK_AGENT_COMMAND_TTL", &c.Agent.CommandTTL)
 	applyString("TURBK_AGENT_DEFAULT_POLL_INTERVAL", &c.Agent.DefaultPollInterval)
 	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_BATCH", &c.Agent.MaxChunkCheckBatch)
+	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", &c.Agent.MaxChunkUploadBatchBytes)
 	applyInt("TURBK_AGENT_MAX_INVALIDATION_RESPONSE_HASHES", &c.Agent.MaxInvalidationResponseHashes)
 	applyInt("TURBK_AGENT_INVALIDATION_RETENTION_DAYS", &c.Agent.InvalidationRetentionDays)
+}
+
+func parseConfigByteSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("size is required")
+	}
+	units := []struct {
+		suffix string
+		mult   float64
+	}{
+		{"tib", 1024 * 1024 * 1024 * 1024},
+		{"tb", 1000 * 1000 * 1000 * 1000},
+		{"gib", 1024 * 1024 * 1024},
+		{"gb", 1000 * 1000 * 1000},
+		{"mib", 1024 * 1024},
+		{"mb", 1000 * 1000},
+		{"kib", 1024},
+		{"kb", 1000},
+		{"b", 1},
+	}
+	lower := strings.ToLower(value)
+	multiplier := float64(1)
+	number := lower
+	for _, unit := range units {
+		if strings.HasSuffix(lower, unit.suffix) {
+			multiplier = unit.mult
+			number = strings.TrimSpace(strings.TrimSuffix(lower, unit.suffix))
+			break
+		}
+	}
+	parsed, err := strconv.ParseFloat(number, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+	return int64(parsed * multiplier), nil
 }
 
 func splitList(value string) []string {

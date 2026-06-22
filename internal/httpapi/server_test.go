@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -1893,6 +1894,98 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestAgentBatchChunkUploadUploadsAndDeduplicates(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "batch-agent",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+
+	first := bytes.Repeat([]byte("batch-first-"), 200)
+	second := bytes.Repeat([]byte("batch-second-"), 200)
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, first, second))
+	if status != http.StatusAccepted {
+		t.Fatalf("batch upload status = %d body=%s", status, string(body))
+	}
+	var uploaded struct {
+		Chunks []struct {
+			Hash     string              `json:"hash"`
+			Uploaded bool                `json:"uploaded"`
+			Ref      repository.ChunkRef `json:"ref"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(body, &uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if len(uploaded.Chunks) != 2 || !uploaded.Chunks[0].Uploaded || !uploaded.Chunks[1].Uploaded {
+		t.Fatalf("unexpected first batch response: %+v", uploaded.Chunks)
+	}
+	statsAfterFirst, err := repo.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, first, second))
+	if status != http.StatusAccepted {
+		t.Fatalf("duplicate batch upload status = %d body=%s", status, string(body))
+	}
+	var duplicate struct {
+		Chunks []struct {
+			Uploaded bool `json:"uploaded"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(body, &duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if len(duplicate.Chunks) != 2 || duplicate.Chunks[0].Uploaded || duplicate.Chunks[1].Uploaded {
+		t.Fatalf("unexpected duplicate batch response: %+v", duplicate.Chunks)
+	}
+	statsAfterSecond, err := repo.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statsAfterSecond.Chunks != statsAfterFirst.Chunks || statsAfterSecond.SegmentBytes != statsAfterFirst.SegmentBytes {
+		t.Fatalf("duplicate batch upload changed storage stats: first=%+v second=%+v", statsAfterFirst, statsAfterSecond)
+	}
+
+	badBody := encodeAgentChunkBatch(t, []byte("bad hash body"))
+	badBody[len(agentChunkBatchMagic)+4] ^= 0xff
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, badBody)
+	if status != http.StatusBadRequest {
+		t.Fatalf("bad hash batch status = %d body=%s", status, string(body))
+	}
+}
+
 func TestAgentRunAcceptsMultipleRoots(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
@@ -2082,8 +2175,10 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 			ChunkGeneration int64  `json:"chunk_generation"`
 		} `json:"repository"`
 		Agent struct {
-			PollIntervalSeconds int64 `json:"poll_interval_seconds"`
-			CommandGeneration   int64 `json:"command_generation"`
+			PollIntervalSeconds      int64 `json:"poll_interval_seconds"`
+			CommandGeneration        int64 `json:"command_generation"`
+			MaxChunkUploadBatchBytes int64 `json:"max_chunk_upload_batch_bytes"`
+			ChunkBatchUpload         bool  `json:"chunk_batch_upload"`
 		} `json:"agent"`
 		Commands []struct {
 			ID     int64  `json:"id"`
@@ -2097,6 +2192,9 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	}
 	if heartbeat.Repository.ID == "" || heartbeat.Agent.PollIntervalSeconds != 600 {
 		t.Fatalf("heartbeat missing repository/poll state: %+v", heartbeat)
+	}
+	if !heartbeat.Agent.ChunkBatchUpload || heartbeat.Agent.MaxChunkUploadBatchBytes != 64*1024*1024 {
+		t.Fatalf("heartbeat missing chunk batch upload capability: %+v", heartbeat.Agent)
 	}
 	if len(heartbeat.Commands) != 1 || heartbeat.Commands[0].Type != "run-backup" || heartbeat.Commands[0].JobID != job.ID {
 		t.Fatalf("unexpected heartbeat commands: %+v", heartbeat.Commands)
@@ -2531,6 +2629,47 @@ func putRawAgent(t *testing.T, url, clientID, clientSecret string, body []byte) 
 		t.Fatal(err)
 	}
 	return resp.StatusCode, respBody
+}
+
+func postRawAgent(t *testing.T, url, clientID, clientSecret, contentType string, body []byte) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.SetBasicAuth(clientID, clientSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, respBody
+}
+
+func encodeAgentChunkBatch(t *testing.T, chunks ...[]byte) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	body.Write(agentChunkBatchMagic)
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(chunks)))
+	body.Write(count[:])
+	for _, chunk := range chunks {
+		sum := blake3.Sum256(chunk)
+		body.Write(sum[:])
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(chunk)))
+		body.Write(length[:])
+		body.Write(chunk)
+	}
+	return body.Bytes()
 }
 
 func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
