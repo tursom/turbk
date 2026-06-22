@@ -24,6 +24,8 @@ import { pages, type PageKey } from '../navigation';
 const agentContainerRoot = '/backup/source';
 const agentContainerStateDir = '/var/lib/turbk-agent';
 type AgentSetupMethod = 'compose' | 'docker' | 'binary' | 'systemd';
+const hostTabs = ['overview', 'access', 'jobs'] as const;
+type HostTab = (typeof hostTabs)[number];
 
 function shellQuote(value: string) {
   if (value === '') return "''";
@@ -38,6 +40,10 @@ function systemdQuote(value: string) {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 }
 
+function isHostTab(value: string | null): value is HostTab {
+  return hostTabs.includes(value as HostTab);
+}
+
 export function useBackupApp() {
   const pageKeys = new Set<PageKey>(pages.map((page) => page.key));
 
@@ -49,6 +55,14 @@ export function useBackupApp() {
 
   function pagePath(page: PageKey) {
     return `/${page}`;
+  }
+
+  function hostPagePath(hostID = selectedHostId.value, tab = activeHostTab.value) {
+    const params = new URLSearchParams();
+    if (hostID !== null) params.set('host', String(hostID));
+    params.set('tab', tab);
+    const query = params.toString();
+    return `${pagePath('hosts')}${query ? `?${query}` : ''}`;
   }
 
   function initialPage(): PageKey {
@@ -84,6 +98,9 @@ export function useBackupApp() {
   const showHostCreate = ref(false);
   const hostActionMessage = ref('');
   const selectedHostId = ref<number | null>(null);
+  const activeHostTab = ref<HostTab>('overview');
+  const hostSearch = ref('');
+  const hostSourceFilter = ref('all');
   const agentSetupHostName = ref('');
   const agentSetupSourceDir = ref('/srv/data');
   const agentSetupMethod = ref<AgentSetupMethod>('compose');
@@ -205,8 +222,8 @@ export function useBackupApp() {
   function navigatePage(page: PageKey, replace = false) {
     activePage.value = page;
     if (typeof window === 'undefined') return;
-    const nextPath = pagePath(page);
-    if (window.location.pathname === nextPath) return;
+    const nextPath = page === 'hosts' ? hostPagePath() : pagePath(page);
+    if (`${window.location.pathname}${window.location.search}` === nextPath) return;
     if (replace) {
       window.history.replaceState({ page }, '', nextPath);
     } else {
@@ -220,6 +237,30 @@ export function useBackupApp() {
     const segment = window.location.pathname.split('/').filter(Boolean)[0] ?? '';
     if (segment !== '' && !pageKeys.has(segment as PageKey)) {
       window.history.replaceState({ page }, '', pagePath(page));
+    }
+    if (page === 'hosts') syncHostStateFromLocation();
+  }
+
+  function syncHostStateFromLocation() {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const queryHostID = Number(params.get('host'));
+    if (Number.isInteger(queryHostID) && queryHostID > 0) {
+      selectedHostId.value = queryHostID;
+    }
+    const queryTab = params.get('tab');
+    activeHostTab.value = isHostTab(queryTab) ? queryTab : 'overview';
+  }
+
+  function updateHostLocation(replace = false) {
+    if (typeof window === 'undefined' || activePage.value !== 'hosts') return;
+    const nextPath = hostPagePath();
+    if (`${window.location.pathname}${window.location.search}` === nextPath) return;
+    const state = { page: 'hosts', host: selectedHostId.value, tab: activeHostTab.value };
+    if (replace) {
+      window.history.replaceState(state, '', nextPath);
+    } else {
+      window.history.pushState(state, '', nextPath);
     }
   }
 
@@ -259,6 +300,35 @@ export function useBackupApp() {
     { value: 'ftps', label: 'FTPS', title: t('hosts.ftpsPull'), description: t('hosts.ftpsPullDesc'), icon: Shield },
     { value: 'webdav', label: 'WebDAV', title: t('hosts.webdavPull'), description: t('hosts.webdavPullDesc'), icon: Database },
     { value: 'local', label: sourceTypeLabel('local'), title: t('hosts.localMount'), description: t('hosts.localMountDesc'), icon: HardDrive }
+  ]);
+
+  const hostSourceFilterOptions = computed(() => [
+    { value: 'all', label: t('common.all') },
+    ...hostSourceOptions.value.map((option) => ({ value: option.value, label: option.label }))
+  ]);
+
+  const filteredHosts = computed(() => {
+    const sourceFilter = hostSourceFilter.value;
+    const query = hostSearch.value.trim().toLowerCase();
+    return hosts.value.filter((host) => {
+      if (sourceFilter !== 'all' && host.source_type !== sourceFilter) return false;
+      if (query === '') return true;
+      const fields = [
+        String(host.id),
+        host.name,
+        host.source_type,
+        sourceTypeLabel(host.source_type),
+        statusText(host.status),
+        hostAddressText(host)
+      ];
+      return fields.some((field) => field.toLowerCase().includes(query));
+    });
+  });
+
+  const hostTabOptions = computed(() => [
+    { value: 'overview' as const, label: t('hosts.tabOverview') },
+    { value: 'access' as const, label: t('hosts.tabAccess') },
+    { value: 'jobs' as const, label: t('hosts.tabJobs') }
   ]);
 
   const credentialSourceOptions = computed(() => hostSourceOptions.value.filter((option) => !['agent', 'local'].includes(option.value)));
@@ -343,6 +413,8 @@ export function useBackupApp() {
       `TURBK_AGENT_SOURCE_DIR=${agentSetupSourceDir.value}`
     ].join('\n')
   );
+  const agentSetupStateMount = computed(() => `./agent-state:${agentContainerStateDir}`);
+  const agentSetupSourceMount = computed(() => `${agentSetupSourceDir.value}:${agentContainerRoot}:ro`);
 
   const agentComposeSetup = computed(() =>
     [
@@ -471,10 +543,12 @@ export function useBackupApp() {
     if (nextHosts.length === 0) {
       selectedHostId.value = null;
       jobHostId.value = '';
+      updateHostLocation(true);
       return;
     }
     if (selectedHostId.value === null || !nextHosts.some((host) => host.id === selectedHostId.value)) {
       selectedHostId.value = nextHosts[0].id;
+      updateHostLocation(true);
     }
     const validJobHosts = nextHosts.filter((host) => host.source_type !== 'agent');
     if (validJobHosts.length === 0) {
@@ -673,6 +747,12 @@ export function useBackupApp() {
 
   function selectHost(host: Host) {
     selectedHostId.value = host.id;
+    updateHostLocation();
+  }
+
+  function setActiveHostTab(tab: HostTab) {
+    activeHostTab.value = tab;
+    updateHostLocation();
   }
 
   function selectCredential(credential: Credential) {
@@ -1030,16 +1110,22 @@ export function useBackupApp() {
       const created = await api.createHost(payload);
       selectedHostId.value = created.host.id;
       if (sourceType === 'agent') {
+        activeHostTab.value = 'access';
         agentSetupHostName.value = name;
         agentCredentialClientId.value = created.agent?.client_id ?? created.host.agent?.client_id ?? '';
         agentCredentialSecret.value = created.agent?.client_secret ?? created.host.agent?.client_secret ?? '';
         actionMessage.value = t('message.agentClientCreated');
         hostActionMessage.value = t('message.agentClientCreated');
       } else {
+        activeHostTab.value = 'overview';
         actionMessage.value = t('message.hostCreated');
         hostActionMessage.value = t('message.hostCreated');
       }
       showHostCreate.value = false;
+      hostName.value = '';
+      hostAddress.value = '';
+      hostCredentialId.value = '';
+      updateHostLocation(true);
       await refresh();
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err);
@@ -1321,6 +1407,9 @@ export function useBackupApp() {
     showHostCreate,
     hostActionMessage,
     selectedHostId,
+    activeHostTab,
+    hostSearch,
+    hostSourceFilter,
     agentSetupHostName,
     agentSetupSourceDir,
     agentSetupMethod,
@@ -1389,6 +1478,9 @@ export function useBackupApp() {
     statRows,
     hostSummaryRows,
     hostSourceOptions,
+    hostSourceFilterOptions,
+    filteredHosts,
+    hostTabOptions,
     credentialSourceOptions,
     credentialSummaryRows,
     jobHostOptions,
@@ -1402,6 +1494,10 @@ export function useBackupApp() {
     currentServerURL,
     agentSetupClientId,
     agentSetupClientSecret,
+    agentContainerRoot,
+    agentContainerStateDir,
+    agentSetupStateMount,
+    agentSetupSourceMount,
     agentComposeEnv,
     agentComposeSetup,
     agentDockerCommand,
@@ -1420,6 +1516,7 @@ export function useBackupApp() {
     nullText,
     nullableNumber,
     selectHost,
+    setActiveHostTab,
     selectCredential,
     openHostCreate,
     openCredentialCreate,

@@ -620,6 +620,93 @@ a.text-button {
   align-items: start;
 }
 
+.hosts-workbench-view {
+  gap: 14px;
+}
+
+.hosts-toolbar {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) max-content max-content;
+  align-items: center;
+  gap: 16px;
+}
+
+.hosts-toolbar .panel-actions {
+  flex-wrap: nowrap;
+}
+
+.hosts-toolbar-metrics {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar-metric {
+  min-width: 92px;
+  min-height: 42px;
+  border: 1px solid #e4e7ec;
+  border-radius: 8px;
+  padding: 6px 10px;
+  display: grid;
+  gap: 2px;
+  background: #f8fafc;
+}
+
+.toolbar-metric strong {
+  color: #18212f;
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.toolbar-metric small {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.host-workbench-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.host-directory-panel,
+.host-workbench-detail {
+  min-height: 620px;
+}
+
+.host-directory-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(130px, 160px);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.input-with-icon {
+  position: relative;
+  display: block;
+}
+
+.input-with-icon svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #667085;
+  pointer-events: none;
+}
+
+.input-with-icon input {
+  padding-left: 34px;
+}
+
+.compact-empty {
+  min-height: 120px;
+}
+
 .full-list-panel {
   width: 100%;
 }
@@ -700,6 +787,14 @@ a.text-button {
   margin-bottom: 14px;
 }
 
+.host-detail-head.compact {
+  min-height: 64px;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
 .host-avatar {
   width: 44px;
   height: 44px;
@@ -726,6 +821,94 @@ a.text-button {
 .host-detail-head span {
   color: #667085;
   margin-top: 2px;
+}
+
+.host-detail-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #eaecf0;
+}
+
+.host-detail-status {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  color: #667085;
+}
+
+.host-tabs {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-bottom: 1px solid #eaecf0;
+  margin: 12px -18px 16px;
+  padding: 0 18px;
+  overflow-x: auto;
+}
+
+.host-tab-button {
+  min-height: 39px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #475467;
+  padding: 0 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.host-tab-button:hover,
+.host-tab-button.active {
+  color: #175cd3;
+  border-bottom-color: #2563eb;
+}
+
+.host-tab-panel {
+  min-width: 0;
+}
+
+.host-info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.host-info-section {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.host-info-section h3 {
+  margin: 0;
+  color: #18212f;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.section-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.metric-line {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: #344054;
+}
+
+.metric-line svg {
+  color: #2563eb;
 }
 
 .compact-details {
@@ -781,6 +964,61 @@ a.text-button {
 
 .agent-setup-panel .muted {
   margin-bottom: 14px;
+}
+
+.agent-access-layout {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  padding: 14px 0;
+  margin: 14px 0;
+  border-top: 1px solid #eaecf0;
+  border-bottom: 1px solid #eaecf0;
+}
+
+.agent-access-section {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.agent-access-section h3 {
+  margin: 0;
+  color: #18212f;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.agent-access-section .details {
+  gap: 8px;
+}
+
+.agent-access-section .details div {
+  grid-template-columns: minmax(92px, 122px) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.agent-access-section dd,
+.agent-access-section code {
+  overflow-wrap: anywhere;
+}
+
+.agent-access-section code {
+  color: #344054;
+  background: #f2f4f7;
+  border-radius: 6px;
+  padding: 2px 5px;
+}
+
+.agent-access-section dd small {
+  display: block;
+  margin-top: 3px;
+  color: #667085;
+}
+
+.agent-access-note {
+  margin-top: -4px;
 }
 
 .credential-copy-row {
@@ -1068,11 +1306,40 @@ td {
   .host-create-form,
   .method-selector,
   .host-management-layout,
+  .host-workbench-layout,
+  .hosts-toolbar,
+  .host-directory-tools,
+  .host-info-grid,
   .credential-management-layout,
+  .agent-access-layout,
   .agent-setup-grid,
   .agent-method-layout,
   .code-grid {
     grid-template-columns: 1fr;
+  }
+
+  .hosts-toolbar {
+    align-items: start;
+  }
+
+  .hosts-toolbar-metrics,
+  .hosts-toolbar .panel-actions {
+    justify-content: flex-start;
+  }
+
+  .host-directory-panel,
+  .host-workbench-detail {
+    min-height: auto;
+  }
+
+  .host-detail-top,
+  .section-title-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .host-detail-status {
+    justify-items: start;
   }
 
   .field.wide {
