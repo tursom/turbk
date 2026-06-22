@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1863,6 +1864,125 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestAgentRunAcceptsMultipleRoots(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "multi-root-agent",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "multi-root-agent",
+		"roots":    []string{"/data", "/data/app"},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("nested roots status = %d body=%s", status, string(body))
+	}
+
+	roots := []string{"/data/app", "/var/log/myapp"}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "multi-root-agent",
+		"roots":    roots,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create multi-root agent run status = %d body=%s", status, string(body))
+	}
+	var createdRun struct {
+		Job state.Job `json:"job"`
+		Run state.Run `json:"run"`
+	}
+	if err := json.Unmarshal(body, &createdRun); err != nil {
+		t.Fatal(err)
+	}
+	var sourceConfig struct {
+		Roots []string `json:"roots"`
+	}
+	if err := json.Unmarshal([]byte(createdRun.Job.SourceConfig), &sourceConfig); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sourceConfig.Roots, roots) {
+		t.Fatalf("source_config.roots = %#v, want %#v", sourceConfig.Roots, roots)
+	}
+
+	manifest := repository.SnapshotManifest{
+		SourceType:  "agent",
+		SourceRoots: roots,
+		Entries: []repository.FileEntry{
+			{Path: "data/app", Type: repository.EntryTypeDir, Mode: uint32(os.ModeDir | 0o755)},
+			{Path: "var/log/myapp", Type: repository.EntryTypeDir, Mode: uint32(os.ModeDir | 0o755)},
+		},
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/manifests", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"run_id":   createdRun.Run.ID,
+		"manifest": manifest,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("post multi-root manifest status = %d body=%s", status, string(body))
+	}
+	var postedManifest struct {
+		Snapshot state.Snapshot `json:"snapshot"`
+	}
+	if err := json.Unmarshal(body, &postedManifest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repo.ReadManifest("run-" + strconv.FormatInt(createdRun.Run.ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SourceRoot != "" {
+		t.Fatalf("loaded SourceRoot = %q, want empty", loaded.SourceRoot)
+	}
+	if !reflect.DeepEqual(loaded.SourceRoots, roots) {
+		t.Fatalf("loaded SourceRoots = %#v, want %#v", loaded.SourceRoots, roots)
+	}
+
+	status, body = getAuthed(t, server.URL+"/api/v1/snapshots/"+strconv.FormatInt(postedManifest.Snapshot.ID, 10)+"/tree?path=.", cookie)
+	if status != http.StatusOK {
+		t.Fatalf("snapshot tree status = %d body=%s", status, string(body))
+	}
+	var tree struct {
+		Manifest struct {
+			SourceRoots []string `json:"source_roots"`
+		} `json:"manifest"`
+	}
+	if err := json.Unmarshal(body, &tree); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(tree.Manifest.SourceRoots, roots) {
+		t.Fatalf("tree source_roots = %#v, want %#v", tree.Manifest.SourceRoots, roots)
+	}
+}
+
 func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
@@ -2055,6 +2175,20 @@ func TestAgentManifestMissingChunksIsRetryable(t *testing.T) {
 	}
 	if run.Status != "running" {
 		t.Fatalf("run status after missing chunks = %q, want running", run.Status)
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs/"+strconv.FormatInt(createdRun.Run.ID, 10)+"/finish", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"status": "failed",
+		"error":  "scan failed",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("fail run status = %d body=%s", status, string(body))
+	}
+	run, err = store.GetRun(context.Background(), createdRun.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "failed" || run.ErrorMessage.String != "scan failed" {
+		t.Fatalf("run after fail = %+v, want failed scan failed", run)
 	}
 }
 

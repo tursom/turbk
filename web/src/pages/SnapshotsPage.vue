@@ -23,6 +23,7 @@ const {
   deletingSnapshots,
   snapshotTreePath,
   snapshotTreeEntries,
+  snapshotTreeManifest,
   hostName,
   hostSourceType,
   hostAddress,
@@ -224,6 +225,15 @@ const {
       </div>
     </div>
     <div class="path-chip">{{ snapshotTreePath }}</div>
+    <div v-if="snapshotTreeManifest" class="snapshot-source-roots">
+      <span>{{ t('snapshots.sourceRoots') }}</span>
+      <code
+        v-for="root in snapshotTreeManifest.source_roots?.length ? snapshotTreeManifest.source_roots : [snapshotTreeManifest.source_root].filter(Boolean)"
+        :key="root"
+      >
+        {{ root }}
+      </code>
+    </div>
     <div v-if="snapshotTreeEntries.length === 0" class="empty-state">
       <span>{{ t('common.noRecords') }}</span>
     </div>

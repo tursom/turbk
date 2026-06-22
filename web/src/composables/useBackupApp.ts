@@ -14,6 +14,7 @@ import {
   type Run,
   type RunLog,
   type Snapshot,
+  type SnapshotTree,
   type SnapshotTreeEntry,
   type StorageHealth,
   type StorageMaintenance
@@ -21,9 +22,9 @@ import {
 import { en, locale, setLocale, t, type MessageKey } from '../i18n';
 import { pages, type PageKey } from '../navigation';
 
-const agentContainerRoot = '/backup/source';
 const agentContainerStateDir = '/var/lib/turbk-agent';
 type AgentSetupMethod = 'compose' | 'docker' | 'binary' | 'systemd';
+type AgentRunMode = 'daemon' | 'once';
 const hostTabs = ['overview', 'access', 'jobs'] as const;
 type HostTab = (typeof hostTabs)[number];
 
@@ -38,6 +39,30 @@ function yamlQuote(value: string) {
 
 function systemdQuote(value: string) {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
+}
+
+function normalizeAgentPath(value: string) {
+  const trimmed = value.trim();
+  if (trimmed === '') return '';
+  const absolute = trimmed.startsWith('/');
+  const collapsed = trimmed.replace(/\/+/g, '/');
+  const parts: string[] = [];
+  for (const part of collapsed.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  if (absolute) return `/${parts.join('/')}` || '/';
+  return parts.join('/');
+}
+
+function agentRootNested(parent: string, child: string) {
+  if (parent === child) return false;
+  if (parent === '/') return child !== '/';
+  return child.startsWith(`${parent.replace(/\/+$/, '')}/`);
 }
 
 function isHostTab(value: string | null): value is HostTab {
@@ -91,6 +116,7 @@ export function useBackupApp() {
   const deletingSnapshots = ref(false);
   const snapshotTreePath = ref('.');
   const snapshotTreeEntries = ref<SnapshotTreeEntry[]>([]);
+  const snapshotTreeManifest = ref<SnapshotTree['manifest'] | null>(null);
   const hostName = ref('');
   const hostSourceType = ref('local');
   const hostAddress = ref('');
@@ -102,7 +128,14 @@ export function useBackupApp() {
   const hostSearch = ref('');
   const hostSourceFilter = ref('all');
   const agentSetupHostName = ref('');
-  const agentSetupSourceDir = ref('/srv/data');
+  const agentSetupSourceDirs = ref(['/srv/data']);
+  const agentSetupSourceDir = computed({
+    get: () => agentSetupSourceDirs.value[0] ?? '',
+    set: (value: string) => {
+      agentSetupSourceDirs.value = [value];
+    }
+  });
+  const agentSetupRunMode = ref<AgentRunMode>('daemon');
   const agentSetupMethod = ref<AgentSetupMethod>('compose');
   const copyActionMessage = ref('');
   const credentialName = ref('');
@@ -402,22 +435,85 @@ export function useBackupApp() {
   const agentSetupClientSecret = computed(() => activeAgentCredential.value?.client_secret || agentCredentialSecret.value || 'ags_replace_me');
   const jobHostOptions = computed(() => hosts.value.filter((host) => host.source_type !== 'agent'));
 
+  const agentSetupRoots = computed(() => agentSetupSourceDirs.value.map((root) => normalizeAgentPath(root)).filter((root) => root !== ''));
+
+  const agentSetupRootErrors = computed(() => {
+    const roots = agentSetupSourceDirs.value.map((root) => normalizeAgentPath(root)).filter((root) => root !== '');
+    const errors: string[] = [];
+    if (roots.length === 0) {
+      errors.push(t('hosts.agentRootRequiredError'));
+      return errors;
+    }
+    const seen = new Set<string>();
+    for (const root of roots) {
+      if (!root.startsWith('/')) {
+        errors.push(`${root}: ${t('hosts.agentRootAbsoluteError')}`);
+        continue;
+      }
+      if (seen.has(root)) {
+        errors.push(`${root}: ${t('hosts.agentRootDuplicateError')}`);
+      }
+      seen.add(root);
+    }
+    for (let i = 0; i < roots.length; i += 1) {
+      for (let j = 0; j < roots.length; j += 1) {
+        if (i !== j && roots[i].startsWith('/') && roots[j].startsWith('/') && agentRootNested(roots[i], roots[j])) {
+          errors.push(`${roots[j]}: ${t('hosts.agentRootNestedError')} ${roots[i]}`);
+        }
+      }
+    }
+    return errors;
+  });
+
+  const agentSetupReady = computed(() => agentSetupRootErrors.value.length === 0);
+  const agentRootEnvValue = computed(() => agentSetupRoots.value.join(','));
+  const agentRootFlags = computed(() => agentSetupRoots.value.map((root) => `-root ${shellQuote(root)}`).join(' '));
+  const agentSystemdRootFlags = computed(() => agentSetupRoots.value.map((root) => `-root ${systemdQuote(root)}`).join(' '));
+  const agentRunModeOptions = computed(() => [
+    { value: 'daemon' as const, label: t('hosts.agentRunDaemon'), description: t('hosts.agentRunDaemonDesc') },
+    { value: 'once' as const, label: t('hosts.agentRunOnce'), description: t('hosts.agentRunOnceDesc') }
+  ]);
+
+  function addAgentSetupSourceDir() {
+    agentSetupSourceDirs.value.push('');
+  }
+
+  function removeAgentSetupSourceDir(index: number) {
+    if (agentSetupSourceDirs.value.length <= 1) {
+      agentSetupSourceDirs.value = [''];
+      return;
+    }
+    agentSetupSourceDirs.value.splice(index, 1);
+  }
+
   const agentComposeEnv = computed(() =>
     [
       `TURBK_SERVER_URL=${currentServerURL.value}`,
       `TURBK_AGENT_ID=${agentSetupClientId.value}`,
       `TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`,
-      `TURBK_AGENT_DAEMON=true`,
+      ...(agentSetupRunMode.value === 'daemon' ? [`TURBK_AGENT_DAEMON=true`] : []),
       `TURBK_AGENT_STATE_DIR=${agentContainerStateDir}`,
-      `TURBK_AGENT_ROOT=${agentContainerRoot}`,
-      `TURBK_AGENT_SOURCE_DIR=${agentSetupSourceDir.value}`
+      `TURBK_AGENT_ROOTS=${agentRootEnvValue.value}`
     ].join('\n')
   );
   const agentSetupStateMount = computed(() => `./agent-state:${agentContainerStateDir}`);
-  const agentSetupSourceMount = computed(() => `${agentSetupSourceDir.value}:${agentContainerRoot}:ro`);
+  const agentSetupSourceMounts = computed(() => agentSetupRoots.value.map((root) => `${root}:${root}:ro`));
+  const agentSetupSourceMount = computed(() => agentSetupSourceMounts.value.join('\n'));
 
-  const agentComposeSetup = computed(() =>
-    [
+  const agentComposeSetup = computed(() => {
+    const environment = [
+      `      TURBK_SERVER_URL: ${yamlQuote(currentServerURL.value)}`,
+      `      TURBK_AGENT_ID: ${yamlQuote(agentSetupClientId.value)}`,
+      `      TURBK_AGENT_SECRET: ${yamlQuote(agentSetupClientSecret.value)}`,
+      ...(agentSetupRunMode.value === 'daemon' ? ['      TURBK_AGENT_DAEMON: "true"'] : []),
+      `      TURBK_AGENT_STATE_DIR: ${yamlQuote(agentContainerStateDir)}`,
+      `      TURBK_AGENT_ROOTS: ${yamlQuote(agentRootEnvValue.value)}`
+    ];
+    const volumes = [
+      `      - ${yamlQuote(`./agent-state:${agentContainerStateDir}`)}`,
+      ...agentSetupRoots.value.map((root) => `      - ${yamlQuote(`${root}:${root}:ro`)}`)
+    ];
+    return [
       'mkdir -p turbk-agent && cd turbk-agent',
       "cat > compose.yaml <<'YAML'",
       'services:',
@@ -425,35 +521,30 @@ export function useBackupApp() {
       '    image: ghcr.io/tursom/turbk-agent:latest',
       '    user: "0:0"',
       '    environment:',
-      `      TURBK_SERVER_URL: ${yamlQuote(currentServerURL.value)}`,
-      `      TURBK_AGENT_ID: ${yamlQuote(agentSetupClientId.value)}`,
-      `      TURBK_AGENT_SECRET: ${yamlQuote(agentSetupClientSecret.value)}`,
-      '      TURBK_AGENT_DAEMON: "true"',
-      `      TURBK_AGENT_STATE_DIR: ${yamlQuote(agentContainerStateDir)}`,
-      `      TURBK_AGENT_ROOT: ${yamlQuote(agentContainerRoot)}`,
+      ...environment,
       '    volumes:',
-      `      - ${yamlQuote(`./agent-state:${agentContainerStateDir}`)}`,
-      `      - ${yamlQuote(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)}`,
-      '    restart: unless-stopped',
+      ...volumes,
+      ...(agentSetupRunMode.value === 'daemon' ? ['    restart: unless-stopped'] : []),
       'YAML',
-      'docker compose up -d'
-    ].join('\n')
-  );
+      agentSetupRunMode.value === 'daemon' ? 'docker compose up -d' : 'docker compose run --rm turbk-agent -once'
+    ].join('\n');
+  });
 
-  const agentDockerCommand = computed(() =>
-    [
-      'docker run -d --name turbk-agent --restart unless-stopped \\',
+  const agentDockerCommand = computed(() => {
+    const daemon = agentSetupRunMode.value === 'daemon';
+    return [
+      daemon ? 'docker run -d --name turbk-agent --restart unless-stopped \\' : 'docker run --rm --name turbk-agent-once \\',
       `  -e TURBK_SERVER_URL=${JSON.stringify(currentServerURL.value)} \\`,
       `  -e TURBK_AGENT_ID=${JSON.stringify(agentSetupClientId.value)} \\`,
       `  -e TURBK_AGENT_SECRET=${JSON.stringify(agentSetupClientSecret.value)} \\`,
-      '  -e TURBK_AGENT_DAEMON=true \\',
+      ...(daemon ? ['  -e TURBK_AGENT_DAEMON=true \\'] : []),
       `  -e TURBK_AGENT_STATE_DIR=${JSON.stringify(agentContainerStateDir)} \\`,
-      `  -e TURBK_AGENT_ROOT=${JSON.stringify(agentContainerRoot)} \\`,
+      `  -e TURBK_AGENT_ROOTS=${JSON.stringify(agentRootEnvValue.value)} \\`,
       `  -v ${JSON.stringify(`turbk-agent-state:${agentContainerStateDir}`)} \\`,
-      `  -v ${JSON.stringify(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)} \\`,
-      '  ghcr.io/tursom/turbk-agent:latest'
-    ].join('\n')
-  );
+      ...agentSetupRoots.value.map((root) => `  -v ${JSON.stringify(`${root}:${root}:ro`)} \\`),
+      daemon ? '  ghcr.io/tursom/turbk-agent:latest' : '  ghcr.io/tursom/turbk-agent:latest -once'
+    ].join('\n');
+  });
 
   const agentBinaryCommand = computed(() =>
     [
@@ -462,77 +553,80 @@ export function useBackupApp() {
       `export TURBK_AGENT_ID=${shellQuote(agentSetupClientId.value)}`,
       `export TURBK_AGENT_SECRET=${shellQuote(agentSetupClientSecret.value)}`,
       `export TURBK_AGENT_STATE_DIR=${shellQuote('/var/lib/turbk-agent')}`,
-      `./turbk-agent -root ${shellQuote(agentSetupSourceDir.value)} -daemon`
+      `./turbk-agent ${agentRootFlags.value} ${agentSetupRunMode.value === 'daemon' ? '-daemon' : '-once'}`
     ].join('\n')
   );
 
-  const agentSystemdTimer = computed(() =>
-    [
+  const agentSystemdTimer = computed(() => {
+    const daemon = agentSetupRunMode.value === 'daemon';
+    const unitName = daemon ? 'turbk-agent.service' : 'turbk-agent-once.service';
+    return [
       'sudo install -m 0755 ./turbk-agent /usr/local/bin/turbk-agent',
-      "sudo tee /etc/systemd/system/turbk-agent.service >/dev/null <<'UNIT'",
+      `sudo tee /etc/systemd/system/${unitName} >/dev/null <<'UNIT'`,
       '[Unit]',
-      'Description=Turbk agent backup run',
+      daemon ? 'Description=Turbk agent backup daemon' : 'Description=Turbk agent one-shot backup',
       'After=network-online.target',
       'Wants=network-online.target',
       '',
       '[Service]',
-      'Type=simple',
+      daemon ? 'Type=simple' : 'Type=oneshot',
       `Environment=${systemdQuote(`TURBK_SERVER_URL=${currentServerURL.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_ID=${agentSetupClientId.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_STATE_DIR=/var/lib/turbk-agent`)}`,
-      `ExecStart=/usr/local/bin/turbk-agent -root ${systemdQuote(agentSetupSourceDir.value)} -daemon`,
-      'Restart=always',
-      'RestartSec=30',
+      `ExecStart=/usr/local/bin/turbk-agent ${agentSystemdRootFlags.value} ${daemon ? '-daemon' : '-once'}`,
+      ...(daemon ? ['Restart=always', 'RestartSec=30'] : []),
       'UNIT',
       '',
       'sudo systemctl daemon-reload',
-      'sudo systemctl enable --now turbk-agent.service'
-    ].join('\n')
-  );
+      daemon ? `sudo systemctl enable --now ${unitName}` : `sudo systemctl start ${unitName}`
+    ].join('\n');
+  });
+
+  const agentRunModeLabel = computed(() => (agentSetupRunMode.value === 'daemon' ? t('hosts.agentRunDaemon') : t('hosts.agentRunOnce')));
 
   const agentSetupMethods = computed(() => [
     {
       value: 'compose' as const,
       title: t('hosts.agentMethodCompose'),
-      description: t('hosts.agentMethodComposeDesc')
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodComposeDaemonDesc' : 'hosts.agentMethodComposeOnceDesc')
     },
     {
       value: 'docker' as const,
       title: t('hosts.agentMethodDocker'),
-      description: t('hosts.agentMethodDockerDesc')
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodDockerDaemonDesc' : 'hosts.agentMethodDockerOnceDesc')
     },
     {
       value: 'binary' as const,
       title: t('hosts.agentMethodBinary'),
-      description: t('hosts.agentMethodBinaryDesc')
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodBinaryDaemonDesc' : 'hosts.agentMethodBinaryOnceDesc')
     },
     {
       value: 'systemd' as const,
       title: t('hosts.agentMethodSystemd'),
-      description: t('hosts.agentMethodSystemdDesc')
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodSystemdDaemonDesc' : 'hosts.agentMethodSystemdOnceDesc')
     }
   ]);
 
   const agentSetupSnippets = computed<Record<AgentSetupMethod, { title: string; description: string; code: string }>>(() => ({
     compose: {
-      title: t('hosts.agentMethodCompose'),
-      description: t('hosts.agentMethodComposeDesc'),
+      title: `${t('hosts.agentMethodCompose')} · ${agentRunModeLabel.value}`,
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodComposeDaemonDesc' : 'hosts.agentMethodComposeOnceDesc'),
       code: agentComposeSetup.value
     },
     docker: {
-      title: t('hosts.agentMethodDocker'),
-      description: t('hosts.agentMethodDockerDesc'),
+      title: `${t('hosts.agentMethodDocker')} · ${agentRunModeLabel.value}`,
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodDockerDaemonDesc' : 'hosts.agentMethodDockerOnceDesc'),
       code: agentDockerCommand.value
     },
     binary: {
-      title: t('hosts.agentMethodBinary'),
-      description: t('hosts.agentMethodBinaryDesc'),
+      title: `${t('hosts.agentMethodBinary')} · ${agentRunModeLabel.value}`,
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodBinaryDaemonDesc' : 'hosts.agentMethodBinaryOnceDesc'),
       code: agentBinaryCommand.value
     },
     systemd: {
-      title: t('hosts.agentMethodSystemd'),
-      description: t('hosts.agentMethodSystemdDesc'),
+      title: `${t('hosts.agentMethodSystemd')} · ${agentRunModeLabel.value}`,
+      description: t(agentSetupRunMode.value === 'daemon' ? 'hosts.agentMethodSystemdDaemonDesc' : 'hosts.agentMethodSystemdOnceDesc'),
       code: agentSystemdTimer.value
     }
   }));
@@ -619,6 +713,7 @@ export function useBackupApp() {
       if (selectedSnapshot.value && !snapshots.value.some((snapshot) => snapshot.id === selectedSnapshot.value?.id)) {
         selectedSnapshot.value = null;
         snapshotTreeEntries.value = [];
+        snapshotTreeManifest.value = null;
         snapshotTreePath.value = '.';
       }
       restoreTasks.value = arrayOrEmpty(restoreTaskResp.tasks);
@@ -921,7 +1016,10 @@ export function useBackupApp() {
 
   function sourceRoot(job: Job) {
     try {
-      const parsed = JSON.parse(job.source_config) as { root?: unknown; path?: unknown };
+      const parsed = JSON.parse(job.source_config) as { root?: unknown; roots?: unknown; path?: unknown };
+      if (Array.isArray(parsed.roots) && parsed.roots.length > 0) {
+        return parsed.roots.filter((root): root is string => typeof root === 'string').join(', ');
+      }
       if (typeof parsed.root === 'string') return parsed.root;
       if (typeof parsed.path === 'string') return parsed.path;
     } catch {
@@ -973,6 +1071,7 @@ export function useBackupApp() {
       selectedSnapshot.value = tree.snapshot;
       snapshotTreePath.value = tree.path;
       snapshotTreeEntries.value = tree.entries;
+      snapshotTreeManifest.value = tree.manifest;
       restoreSnapshotId.value = tree.snapshot.id;
       restoreEntryPath.value = tree.path;
     } catch (err) {
@@ -1400,6 +1499,7 @@ export function useBackupApp() {
     deletingSnapshots,
     snapshotTreePath,
     snapshotTreeEntries,
+    snapshotTreeManifest,
     hostName,
     hostSourceType,
     hostAddress,
@@ -1412,6 +1512,8 @@ export function useBackupApp() {
     hostSourceFilter,
     agentSetupHostName,
     agentSetupSourceDir,
+    agentSetupSourceDirs,
+    agentSetupRunMode,
     agentSetupMethod,
     copyActionMessage,
     credentialName,
@@ -1494,9 +1596,13 @@ export function useBackupApp() {
     currentServerURL,
     agentSetupClientId,
     agentSetupClientSecret,
-    agentContainerRoot,
     agentContainerStateDir,
+    agentSetupRoots,
+    agentSetupRootErrors,
+    agentSetupReady,
+    agentRunModeOptions,
     agentSetupStateMount,
+    agentSetupSourceMounts,
     agentSetupSourceMount,
     agentComposeEnv,
     agentComposeSetup,
@@ -1505,6 +1611,8 @@ export function useBackupApp() {
     agentSystemdTimer,
     agentSetupMethods,
     selectedAgentSetupSnippet,
+    addAgentSetupSourceDir,
+    removeAgentSetupSourceDir,
     refresh,
     checkSession,
     login,

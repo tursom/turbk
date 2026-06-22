@@ -59,10 +59,11 @@ func (s *Server) handleSnapshotTree(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"snapshot": snapshot,
 		"manifest": map[string]any{
-			"id":          manifest.ID,
-			"source_type": manifest.SourceType,
-			"source_root": manifest.SourceRoot,
-			"created_at":  manifest.CreatedAt,
+			"id":           manifest.ID,
+			"source_type":  manifest.SourceType,
+			"source_root":  manifest.SourceRoot,
+			"source_roots": manifest.SourceRoots,
+			"created_at":   manifest.CreatedAt,
 		},
 		"path":    queryPath,
 		"entries": childEntries(manifest, queryPath),

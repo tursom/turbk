@@ -241,6 +241,7 @@ export interface SnapshotTree {
     id: string;
     source_type: string;
     source_root: string;
+    source_roots?: string[];
     created_at: string;
   };
   path: string;

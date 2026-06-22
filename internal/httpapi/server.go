@@ -23,6 +23,7 @@ import (
 
 	"github.com/tursom/turbk/internal/config"
 	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/rootset"
 	"github.com/tursom/turbk/internal/source"
 	"github.com/tursom/turbk/internal/state"
 	"github.com/tursom/turbk/internal/version"
@@ -857,13 +858,14 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Hostname            string `json:"hostname"`
-		Root                string `json:"root"`
-		RunKey              string `json:"run_key"`
-		CommandID           int64  `json:"command_id"`
-		Trigger             string `json:"trigger"`
-		RepositoryID        string `json:"repository_id"`
-		BaseChunkGeneration int64  `json:"base_chunk_generation"`
+		Hostname            string   `json:"hostname"`
+		Root                string   `json:"root"`
+		Roots               []string `json:"roots"`
+		RunKey              string   `json:"run_key"`
+		CommandID           int64    `json:"command_id"`
+		Trigger             string   `json:"trigger"`
+		RepositoryID        string   `json:"repository_id"`
+		BaseChunkGeneration int64    `json:"base_chunk_generation"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -874,8 +876,10 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 	if req.Hostname == "" {
 		req.Hostname = agent.Subject
 	}
-	if req.Root == "" {
-		writeError(w, http.StatusBadRequest, errors.New("root is required"))
+	rootsProvided := req.Roots != nil
+	roots, err := agentRunRoots(req.Root, req.Roots)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	agentHost, err := s.store.GetHost(r.Context(), agent.HostID)
@@ -883,11 +887,18 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	sourceConfig, err := json.Marshal(map[string]any{
-		"root":     req.Root,
+	sourceConfigValue := map[string]any{
 		"hostname": req.Hostname,
 		"run_key":  req.RunKey,
-	})
+	}
+	if rootsProvided {
+		sourceConfigValue["roots"] = roots
+	} else if len(roots) == 1 {
+		sourceConfigValue["root"] = roots[0]
+	} else {
+		sourceConfigValue["roots"] = roots
+	}
+	sourceConfig, err := json.Marshal(sourceConfigValue)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1191,12 +1202,30 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 	manifest := req.Manifest
 	manifest.ID = fmt.Sprintf("run-%d", run.ID)
 	manifest.SourceType = "agent"
-	if manifest.SourceRoot == "" {
+	if len(manifest.SourceRoots) > 0 {
+		roots, err := rootset.Normalize(manifest.SourceRoots)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		manifest.SourceRoots = roots
+		if len(roots) > 1 {
+			manifest.SourceRoot = ""
+		} else if manifest.SourceRoot == "" {
+			manifest.SourceRoot = roots[0]
+			manifest.SourceRoots = nil
+		}
+	}
+	if manifest.SourceRoot == "" && len(manifest.SourceRoots) == 0 {
 		var cfg jobSourceConfig
 		_ = json.Unmarshal([]byte(job.SourceConfig), &cfg)
-		manifest.SourceRoot = cfg.Root
-		if manifest.SourceRoot == "" {
-			manifest.SourceRoot = cfg.Path
+		roots, err := rootsFromSourceConfig(cfg)
+		if err == nil {
+			if len(roots) == 1 {
+				manifest.SourceRoot = roots[0]
+			} else {
+				manifest.SourceRoots = roots
+			}
 		}
 	}
 	if err := s.canonicalizeManifestChunks(r.Context(), &manifest); err != nil {
@@ -1350,6 +1379,45 @@ func (s *Server) handleAgentFinishRun(w http.ResponseWriter, r *http.Request) {
 	if run.Status == "completed" {
 		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "completed", "", time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"status": "completed", "run": run})
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if strings.TrimSpace(req.Status) == "failed" {
+		message := strings.TrimSpace(req.Error)
+		if message == "" {
+			message = "agent run failed"
+		}
+		_ = s.store.AppendRunLog(r.Context(), run.ID, "error", message)
+		_, _ = s.store.UpdateRunProgress(r.Context(), state.UpdateRunProgressInput{
+			RunID:   run.ID,
+			Phase:   "failed",
+			Message: message,
+		})
+		if err := s.store.FailRun(r.Context(), run.ID, message, time.Now().UTC()); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "failed", message, time.Now().UTC())
+		failed, err := s.store.GetRun(r.Context(), run.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "run": failed})
 		return
 	}
 	if _, exists, err := s.store.GetSnapshotByRun(r.Context(), run.ID); err != nil {
@@ -1714,8 +1782,9 @@ func (s *Server) connectorForJob(ctx context.Context, job state.Job) (source.Con
 }
 
 type jobSourceConfig struct {
-	Root string `json:"root"`
-	Path string `json:"path"`
+	Root  string   `json:"root"`
+	Roots []string `json:"roots"`
+	Path  string   `json:"path"`
 }
 
 type sftpCredentialPayload struct {
@@ -1806,10 +1875,11 @@ func validateSourceConfig(sourceType string, raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return fmt.Errorf("source_config must be valid JSON: %w", err)
 	}
-	root := cfg.Root
-	if root == "" {
-		root = cfg.Path
+	if sourceType == "agent" {
+		_, err := rootsFromSourceConfig(cfg)
+		return err
 	}
+	root := singleSourceRoot(cfg)
 	if root == "" {
 		return errors.New("source_config.root is required")
 	}
@@ -1824,6 +1894,36 @@ func validateSourceConfig(sourceType string, raw json.RawMessage) error {
 		return fmt.Errorf("source_config.root %q is not a directory", root)
 	}
 	return nil
+}
+
+func agentRunRoots(root string, roots []string) ([]string, error) {
+	if roots != nil {
+		return rootset.Normalize(roots)
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil, errors.New("root is required")
+	}
+	return rootset.Normalize([]string{root})
+}
+
+func rootsFromSourceConfig(cfg jobSourceConfig) ([]string, error) {
+	if len(cfg.Roots) > 0 {
+		return rootset.Normalize(cfg.Roots)
+	}
+	root := singleSourceRoot(cfg)
+	if root == "" {
+		return nil, errors.New("source_config.root is required")
+	}
+	return rootset.Normalize([]string{root})
+}
+
+func singleSourceRoot(cfg jobSourceConfig) string {
+	root := strings.TrimSpace(cfg.Root)
+	if root == "" {
+		root = strings.TrimSpace(cfg.Path)
+	}
+	return root
 }
 
 func validateCredentialPayload(credentialType string, raw json.RawMessage) error {

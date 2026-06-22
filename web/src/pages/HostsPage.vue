@@ -18,7 +18,8 @@ const {
   activeHostTab,
   hostSearch,
   hostSourceFilter,
-  agentSetupSourceDir,
+  agentSetupSourceDirs,
+  agentSetupRunMode,
   copyActionMessage,
   agentCredentialClientId,
   agentCredentialSecret,
@@ -30,14 +31,20 @@ const {
   currentServerURL,
   agentSetupClientId,
   agentSetupClientSecret,
-  agentContainerRoot,
   agentContainerStateDir,
+  agentSetupRoots,
+  agentSetupRootErrors,
+  agentSetupReady,
   agentSetupStateMount,
+  agentSetupSourceMounts,
   agentSetupSourceMount,
   agentSetupMethod,
   agentSetupMethods,
+  agentRunModeOptions,
   hostTabOptions,
   selectedAgentSetupSnippet,
+  addAgentSetupSourceDir,
+  removeAgentSetupSourceDir,
   formatTime,
   nullText,
   yesNo,
@@ -327,22 +334,54 @@ const {
                       <dd><code>{{ agentSetupStateMount }}</code></dd>
                     </div>
                     <div>
-                      <dt>{{ t('hosts.agentContainerRoot') }}</dt>
-                      <dd><code>{{ agentContainerRoot }}</code></dd>
+                      <dt>{{ t('hosts.agentRoots') }}</dt>
+                      <dd class="path-stack">
+                        <code v-for="root in agentSetupRoots" :key="root">{{ root }}</code>
+                      </dd>
                     </div>
                     <div>
                       <dt>{{ t('hosts.agentSourceMount') }}</dt>
-                      <dd><code>{{ agentSetupSourceMount }}</code></dd>
+                      <dd class="path-stack">
+                        <code v-for="mount in agentSetupSourceMounts" :key="mount">{{ mount }}</code>
+                      </dd>
                     </div>
                   </dl>
                 </section>
               </div>
 
               <div class="agent-setup-grid">
-                <label class="field">
-                  <span>{{ t('hosts.sourceDir') }}</span>
-                  <input v-model="agentSetupSourceDir" type="text" />
-                </label>
+                <div class="field agent-run-mode-field">
+                  <span>{{ t('hosts.agentRunMode') }}</span>
+                  <div class="agent-run-mode-selector" role="tablist" :aria-label="t('hosts.agentRunMode')">
+                    <button
+                      v-for="mode in agentRunModeOptions"
+                      :key="mode.value"
+                      class="agent-run-mode-option"
+                      :class="{ active: agentSetupRunMode === mode.value }"
+                      type="button"
+                      role="tab"
+                      :aria-selected="agentSetupRunMode === mode.value"
+                      @click="agentSetupRunMode = mode.value"
+                    >
+                      <strong>{{ mode.label }}</strong>
+                      <small>{{ mode.description }}</small>
+                    </button>
+                  </div>
+                </div>
+                <div class="field wide agent-root-list">
+                  <span>{{ t('hosts.sourceDirs') }}</span>
+                  <div v-for="(_, index) in agentSetupSourceDirs" :key="index" class="agent-root-row">
+                    <input v-model="agentSetupSourceDirs[index]" type="text" :placeholder="t('hosts.sourceDirPlaceholder')" />
+                    <button class="icon-button" type="button" :disabled="agentSetupSourceDirs.length <= 1" @click="removeAgentSetupSourceDir(index)">
+                      <X :size="16" />
+                    </button>
+                  </div>
+                  <button class="text-button" type="button" @click="addAgentSetupSourceDir">
+                    <Plus :size="16" />
+                    <span>{{ t('hosts.addSourceDir') }}</span>
+                  </button>
+                  <small v-for="message in agentSetupRootErrors" :key="message" class="field-error">{{ message }}</small>
+                </div>
               </div>
               <p class="muted agent-access-note">{{ t('hosts.agentMountHint') }}</p>
 
@@ -366,12 +405,13 @@ const {
                 <div class="code-block agent-method-code">
                   <div class="code-title">
                     <span>{{ selectedAgentSetupSnippet.title }}</span>
-                    <button class="text-button" type="button" @click="copyText(selectedAgentSetupSnippet.code)">
+                    <button class="text-button" type="button" :disabled="!agentSetupReady" @click="copyText(selectedAgentSetupSnippet.code)">
                       <Copy :size="16" />
                       <span>{{ t('hosts.copySetup') }}</span>
                     </button>
                   </div>
                   <p class="code-description">{{ selectedAgentSetupSnippet.description }}</p>
+                  <p v-if="!agentSetupReady" class="code-warning">{{ t('hosts.agentSetupFixRoots') }}</p>
                   <pre>{{ selectedAgentSetupSnippet.code }}</pre>
                 </div>
               </div>

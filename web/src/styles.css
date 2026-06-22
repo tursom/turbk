@@ -421,6 +421,24 @@ a.text-button {
   overflow-wrap: anywhere;
 }
 
+.snapshot-source-roots {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: -4px 0 12px;
+  color: #667085;
+  font-size: 13px;
+}
+
+.snapshot-source-roots code {
+  color: #344054;
+  background: #f2f4f7;
+  border-radius: 6px;
+  padding: 3px 6px;
+  overflow-wrap: anywhere;
+}
+
 .inline-form {
   display: grid;
   grid-template-columns: minmax(180px, 260px) minmax(260px, 1fr) max-content;
@@ -1017,6 +1035,11 @@ a.text-button {
   padding: 2px 5px;
 }
 
+.path-stack {
+  display: grid;
+  gap: 5px;
+}
+
 .agent-access-section dd small {
   display: block;
   margin-top: 3px;
@@ -1075,6 +1098,71 @@ a.text-button {
   grid-template-columns: repeat(3, minmax(180px, 1fr));
   gap: 12px;
   margin: 14px 0;
+}
+
+.agent-run-mode-field {
+  align-content: start;
+}
+
+.agent-run-mode-selector {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.agent-run-mode-option {
+  min-height: 72px;
+  border: 1px solid #d9e1ea;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #344054;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-run-mode-option strong,
+.agent-run-mode-option small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-run-mode-option strong {
+  color: #101828;
+}
+
+.agent-run-mode-option small {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.agent-run-mode-option.active {
+  border-color: #1570ef;
+  background: #eff8ff;
+  box-shadow: inset 0 -3px 0 #1570ef;
+}
+
+.agent-root-list {
+  align-content: start;
+}
+
+.agent-root-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+}
+
+.agent-root-list .text-button {
+  justify-self: start;
+}
+
+.field-error {
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .code-grid {
@@ -1172,6 +1260,15 @@ a.text-button {
   font-size: 13px;
   line-height: 1.45;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.code-warning {
+  margin: 0;
+  padding: 10px 12px;
+  color: #fecaca;
+  font-size: 13px;
+  line-height: 1.45;
+  border-bottom: 1px solid rgba(254, 202, 202, 0.18);
 }
 
 .code-block pre {

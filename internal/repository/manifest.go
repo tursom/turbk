@@ -21,11 +21,12 @@ const (
 )
 
 type SnapshotManifest struct {
-	ID         string      `json:"id"`
-	CreatedAt  time.Time   `json:"created_at"`
-	SourceType string      `json:"source_type"`
-	SourceRoot string      `json:"source_root"`
-	Entries    []FileEntry `json:"entries"`
+	ID          string      `json:"id"`
+	CreatedAt   time.Time   `json:"created_at"`
+	SourceType  string      `json:"source_type"`
+	SourceRoot  string      `json:"source_root"`
+	SourceRoots []string    `json:"source_roots,omitempty"`
+	Entries     []FileEntry `json:"entries"`
 }
 
 type FileEntry struct {

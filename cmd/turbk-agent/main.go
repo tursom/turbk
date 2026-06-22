@@ -21,6 +21,7 @@ import (
 
 	"github.com/tursom/turbk/internal/fsfilter"
 	"github.com/tursom/turbk/internal/repository"
+	"github.com/tursom/turbk/internal/rootset"
 	"github.com/tursom/turbk/internal/version"
 	"github.com/zeebo/blake3"
 )
@@ -137,11 +138,48 @@ type agentProgress struct {
 	Message        string `json:"message"`
 }
 
+type rootFlag struct {
+	values  []string
+	changed bool
+}
+
+func newRootFlagFromEnv() rootFlag {
+	roots := rootset.SplitList(os.Getenv("TURBK_AGENT_ROOTS"))
+	if len(roots) == 0 {
+		if root := strings.TrimSpace(os.Getenv("TURBK_AGENT_ROOT")); root != "" {
+			roots = []string{root}
+		}
+	}
+	return rootFlag{values: roots}
+}
+
+func (f *rootFlag) Set(value string) error {
+	if !f.changed {
+		f.values = nil
+		f.changed = true
+	}
+	f.values = append(f.values, value)
+	return nil
+}
+
+func (f *rootFlag) String() string {
+	return strings.Join(f.values, ",")
+}
+
+func (f *rootFlag) Values() []string {
+	if len(f.values) == 0 {
+		return nil
+	}
+	values := make([]string, len(f.values))
+	copy(values, f.values)
+	return values
+}
+
 func main() {
 	var serverURL string
 	var clientID string
 	var clientSecret string
-	var root string
+	rootsFlag := newRootFlagFromEnv()
 	var once bool
 	var daemon bool
 	var stateDir string
@@ -154,7 +192,7 @@ func main() {
 	flag.StringVar(&serverURL, "server", os.Getenv("TURBK_SERVER_URL"), "Turbk server URL")
 	flag.StringVar(&clientID, "client-id", os.Getenv("TURBK_AGENT_ID"), "Agent client ID")
 	flag.StringVar(&clientSecret, "client-secret", os.Getenv("TURBK_AGENT_SECRET"), "Agent client secret")
-	flag.StringVar(&root, "root", os.Getenv("TURBK_AGENT_ROOT"), "Root directory to back up")
+	flag.Var(&rootsFlag, "root", "Root directory to back up; may be repeated")
 	flag.StringVar(&stateDir, "state-dir", envString("TURBK_AGENT_STATE_DIR", "/var/lib/turbk-agent"), "Persistent agent state directory")
 	flag.StringVar(&pollIntervalValue, "poll-interval", os.Getenv("TURBK_AGENT_POLL_INTERVAL"), "Daemon poll interval override")
 	flag.StringVar(&pollJitterValue, "poll-jitter", envString("TURBK_AGENT_POLL_JITTER", "1m"), "Daemon poll jitter")
@@ -176,13 +214,18 @@ func main() {
 		os.Exit(1)
 	}
 	client := newAgentClient(serverURL, clientID, clientSecret)
+	roots, err := normalizeOptionalRoots(rootsFlag.Values())
+	if err != nil {
+		logger.Error("agent roots are invalid", "error", err)
+		os.Exit(1)
+	}
 	scanOptions := fsfilter.Options{
 		ExcludePatterns:       fsfilter.SplitPatterns(excludeValue),
 		SkipPseudoFilesystems: skipPseudoFS,
 	}
 	if daemon {
 		opts := daemonOptions{
-			Root:                      root,
+			Roots:                     roots,
 			StateDir:                  stateDir,
 			PollInterval:              parseDurationOrDefault(pollIntervalValue, 0),
 			PollJitter:                parseDurationOrDefault(pollJitterValue, time.Minute),
@@ -196,7 +239,7 @@ func main() {
 		}
 		return
 	}
-	if root != "" {
+	if len(roots) > 0 {
 		catalog, err := openAgentCatalog(stateDir)
 		if err != nil {
 			logger.Warn("agent catalog unavailable; falling back to stateless once mode", "error", err)
@@ -214,7 +257,7 @@ func main() {
 				logger.Warn("agent catalog sync failed; continuing with server checks", "error", err)
 			}
 		}
-		if err := runBackupWithOptions(client, root, logger, scanOptions, backupRunOptions{
+		if err := runBackupWithOptions(client, roots, logger, scanOptions, backupRunOptions{
 			Catalog:                   catalog,
 			RepositoryID:              heartbeat.Repository.ID,
 			ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
@@ -235,6 +278,13 @@ func main() {
 		return
 	}
 	logger.Info("agent idle; pass -root to run a backup")
+}
+
+func normalizeOptionalRoots(roots []string) ([]string, error) {
+	if len(roots) == 0 {
+		return nil, nil
+	}
+	return rootset.Normalize(roots)
 }
 
 func printReady() {
@@ -335,7 +385,7 @@ func parseDurationOrDefault(value string, fallback time.Duration) time.Duration 
 }
 
 type daemonOptions struct {
-	Root                      string
+	Roots                     []string
 	StateDir                  string
 	PollInterval              time.Duration
 	PollJitter                time.Duration
@@ -403,7 +453,7 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				}
 				continue
 			}
-			if strings.TrimSpace(opts.Root) == "" {
+			if len(opts.Roots) == 0 {
 				if err := client.ackCommand(command.ID, "dropped", "root_not_configured"); err != nil {
 					logger.Warn("agent root-not-configured command drop failed", "command", command.ID, "error", err)
 				}
@@ -412,7 +462,7 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 			running = true
 			backupCommandHandled = true
 			lastBackupStarted = time.Now().UTC()
-			err := runBackupWithOptions(client, opts.Root, logger, opts.ScanOptions, backupRunOptions{
+			err := runBackupWithOptions(client, opts.Roots, logger, opts.ScanOptions, backupRunOptions{
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
 				ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
@@ -432,10 +482,10 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 			}
 		}
 
-		if !running && !backupCommandHandled && strings.TrimSpace(opts.Root) != "" && dueByInterval(lastBackupStarted, opts.BackupInterval) {
+		if !running && !backupCommandHandled && len(opts.Roots) != 0 && dueByInterval(lastBackupStarted, opts.BackupInterval) {
 			running = true
 			lastBackupStarted = time.Now().UTC()
-			err := runBackupWithOptions(client, opts.Root, logger, opts.ScanOptions, backupRunOptions{
+			err := runBackupWithOptions(client, opts.Roots, logger, opts.ScanOptions, backupRunOptions{
 				Catalog:                   catalog,
 				RepositoryID:              heartbeat.Repository.ID,
 				ChunkGeneration:           heartbeat.Repository.ChunkGeneration,
@@ -505,21 +555,26 @@ type backupRunOptions struct {
 }
 
 func runBackup(client *agentClient, root string, logger *slog.Logger, scanOptions fsfilter.Options) error {
-	return runBackupWithOptions(client, root, logger, scanOptions, backupRunOptions{Trigger: "once", MaxManifestRepairAttempts: 3})
+	return runBackupWithOptions(client, []string{root}, logger, scanOptions, backupRunOptions{Trigger: "once", MaxManifestRepairAttempts: 3})
 }
 
-func runBackupWithOptions(client *agentClient, root string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) error {
-	root = filepath.Clean(root)
-	info, err := os.Lstat(root)
+func runBackupWithOptions(client *agentClient, roots []string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) error {
+	roots, err := rootset.Normalize(roots)
 	if err != nil {
-		return fmt.Errorf("stat root %q: %w", root, err)
+		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("root %q is not a directory", root)
-	}
-	if scanOptions.SkipPseudoFilesystems {
-		if fsName, ok, err := fsfilter.PseudoFilesystemName(root); err == nil && ok {
-			return fmt.Errorf("root %q is on unsupported pseudo filesystem %s", root, fsName)
+	for _, root := range roots {
+		info, err := os.Lstat(root)
+		if err != nil {
+			return fmt.Errorf("stat root %q: %w", root, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("root %q is not a directory", root)
+		}
+		if scanOptions.SkipPseudoFilesystems {
+			if fsName, ok, err := fsfilter.PseudoFilesystemName(root); err == nil && ok {
+				return fmt.Errorf("root %q is on unsupported pseudo filesystem %s", root, fsName)
+			}
 		}
 	}
 	if opts.Trigger == "" {
@@ -529,21 +584,26 @@ func runBackupWithOptions(client *agentClient, root string, logger *slog.Logger,
 		opts.MaxManifestRepairAttempts = 3
 	}
 	hostname, _ := os.Hostname()
-	var created createRunResponse
-	if _, err := client.doJSON(http.MethodPost, "/agent/v1/runs", map[string]any{
+	createRunRequest := map[string]any{
 		"hostname":              hostname,
-		"root":                  root,
 		"command_id":            opts.CommandID,
 		"trigger":               opts.Trigger,
 		"repository_id":         opts.RepositoryID,
 		"base_chunk_generation": opts.ChunkGeneration,
-	}, &created); err != nil {
+	}
+	if len(roots) == 1 {
+		createRunRequest["root"] = roots[0]
+	} else {
+		createRunRequest["roots"] = roots
+	}
+	var created createRunResponse
+	if _, err := client.doJSON(http.MethodPost, "/agent/v1/runs", createRunRequest, &created); err != nil {
 		return err
 	}
 	if created.Run.ID <= 0 {
 		return fmt.Errorf("server did not return a run id")
 	}
-	logger.Info("agent run started", "run", created.Run.ID, "root", root)
+	logger.Info("agent run started", "run", created.Run.ID, "roots", roots)
 	localRunID := fmt.Sprintf("run-%d-%d", created.Run.ID, time.Now().UTC().UnixNano())
 	runStatus := "failed"
 	runMessage := ""
@@ -559,25 +619,33 @@ func runBackupWithOptions(client *agentClient, root string, logger *slog.Logger,
 	}
 
 	var submitted submitManifestResponse
+	manifestAccepted := false
+	failRemoteRun := func(err error) error {
+		runMessage = err.Error()
+		if !manifestAccepted {
+			if failErr := client.failRun(created.Run.ID, runMessage); failErr != nil {
+				logger.Warn("agent run failure report failed", "run", created.Run.ID, "error", failErr)
+			}
+		}
+		return err
+	}
 	for attempt := 0; attempt <= opts.MaxManifestRepairAttempts; attempt++ {
-		manifest, err := client.scanAndUpload(created.Run.ID, root, logger, scanOptions, opts)
+		manifest, err := client.scanAndUpload(created.Run.ID, roots, logger, scanOptions, opts)
 		if err != nil {
-			runMessage = err.Error()
-			return err
+			return failRemoteRun(err)
 		}
 		submitted, err = client.submitManifest(created.Run.ID, manifest)
 		if err != nil {
-			runMessage = err.Error()
-			return err
+			return failRemoteRun(err)
 		}
 		if submitted.Status != "missing_chunks" {
+			manifestAccepted = true
 			logger.Info("agent backup manifest accepted", "run", created.Run.ID, "entries", len(manifest.Entries), "status", submitted.Status, "repair_attempt", attempt)
 			break
 		}
 		if attempt >= opts.MaxManifestRepairAttempts || !submitted.Retryable {
 			err := fmt.Errorf("manifest still references %d missing chunks after %d repair attempts", len(submitted.MissingChunks), attempt)
-			runMessage = err.Error()
-			return err
+			return failRemoteRun(err)
 		}
 		logger.Warn("agent manifest references missing chunks; retrying after repair", "run", created.Run.ID, "missing_chunks", len(submitted.MissingChunks), "repair_attempt", attempt+1)
 		if opts.Catalog != nil {
@@ -611,14 +679,18 @@ func (r *agentSkipReporter) record(event fsfilter.SkipEvent) {
 	r.logger.Warn("agent skipped path", "path", event.Path, "rel", event.Rel, "reason", event.Reason)
 }
 
-func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) (*repository.SnapshotManifest, error) {
+func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) (*repository.SnapshotManifest, error) {
 	manifest := &repository.SnapshotManifest{
 		CreatedAt:  time.Now().UTC(),
 		SourceType: "agent",
-		SourceRoot: root,
+	}
+	if len(roots) == 1 {
+		manifest.SourceRoot = roots[0]
+	} else {
+		manifest.SourceRoots = append([]string(nil), roots...)
 	}
 	chunker := repository.NewChunker(agentChunkAvgSize)
-	progress := agentProgress{Phase: "scanning", Message: root}
+	progress := agentProgress{Phase: "scanning", Message: strings.Join(roots, ", ")}
 	if err := c.sendProgress(runID, progress); err != nil {
 		return nil, err
 	}
@@ -632,122 +704,132 @@ func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logge
 	}
 	skipReporter := &agentSkipReporter{logger: logger}
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	multiRoot := len(roots) > 1
+	entryPaths := make(map[string]struct{})
+	for _, root := range roots {
+		progress.Message = root
+		if err := sendProgress(true); err != nil {
+			return nil, err
 		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return fmt.Errorf("stat %q: %w", path, err)
-		}
-		if event, skip := fsfilter.ShouldSkip(root, path, info, scanOptions); skip {
-			skipReporter.record(event)
-			progress.Message = "skipped " + event.Rel
-			if err := sendProgress(false); err != nil {
-				return err
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return fmt.Errorf("rel path %q: %w", path, err)
-		}
-		entry := repository.FileEntry{
-			Path:    cleanManifestPath(rel),
-			Size:    info.Size(),
-			Mode:    uint32(info.Mode()),
-			ModTime: info.ModTime().UTC(),
-		}
-		entry.UID, entry.GID = fileOwner(info)
-		record := catalogRecordFromFile(root, entry.Path, info)
-
-		mode := info.Mode()
-		switch {
-		case mode.IsDir():
-			entry.Type = repository.EntryTypeDir
-			record.Type = string(repository.EntryTypeDir)
-			if opts.Catalog != nil {
-				_ = opts.Catalog.replaceFile(record, nil)
-			}
-		case mode&os.ModeSymlink != 0:
-			entry.Type = repository.EntryTypeSymlink
-			target, err := os.Readlink(path)
+			info, err := os.Lstat(path)
 			if err != nil {
-				return fmt.Errorf("read symlink %q: %w", path, err)
+				return fmt.Errorf("stat %q: %w", path, err)
 			}
-			entry.LinkTarget = target
-			record.Type = string(repository.EntryTypeSymlink)
-			record.LinkTarget = target
-			if opts.Catalog != nil {
-				_ = opts.Catalog.replaceFile(record, nil)
-			}
-		case mode.IsRegular():
-			entry.Type = repository.EntryTypeFile
-			record.Type = string(repository.EntryTypeFile)
-			if opts.Catalog != nil {
-				reused, err := c.tryReuseCatalogFile(opts.Catalog, record, &entry, opts)
-				if err != nil {
-					logger.Warn("agent catalog reuse failed; reading file", "path", entry.Path, "error", err)
-				} else if reused {
-					progress.ProcessedFiles++
-					progress.ProcessedBytes += entry.Size
-					progress.ReusedChunks += int64(len(entry.Chunks))
-					progress.Message = entry.Path
-					if err := sendProgress(true); err != nil {
-						return err
-					}
-					manifest.Entries = append(manifest.Entries, entry)
-					return nil
-				}
-			}
-			file, err := os.Open(path)
-			if err != nil {
-				return fmt.Errorf("open file %q: %w", path, err)
-			}
-			fileChunks := make([]catalogChunkRecord, 0)
-			if err := chunker.Split(file, func(chunk []byte) error {
-				ref, uploaded, err := c.ensureChunk(chunk, opts)
-				if err != nil {
-					_ = file.Close()
+			if event, skip := fsfilter.ShouldSkip(root, path, info, scanOptions); skip {
+				skipReporter.record(event)
+				progress.Message = "skipped " + event.Rel
+				if err := sendProgress(false); err != nil {
 					return err
 				}
-				if uploaded {
-					progress.UploadedChunks++
-				} else {
-					progress.ReusedChunks++
+				if info.IsDir() {
+					return filepath.SkipDir
 				}
-				entry.Chunks = append(entry.Chunks, ref)
-				fileChunks = append(fileChunks, catalogChunkRecord{Hash: ref.Hash, OriginalSize: ref.OriginalSize})
-				return sendProgress(false)
-			}); err != nil {
-				_ = file.Close()
-				return fmt.Errorf("chunk file %q: %w", path, err)
+				return nil
 			}
-			if err := file.Close(); err != nil {
-				return fmt.Errorf("close file %q: %w", path, err)
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return fmt.Errorf("rel path %q: %w", path, err)
 			}
-			progress.ProcessedFiles++
-			progress.ProcessedBytes += entry.Size
-			progress.Message = entry.Path
-			if opts.Catalog != nil {
-				if err := opts.Catalog.replaceFile(record, fileChunks); err != nil {
-					logger.Warn("agent catalog file update failed", "path", entry.Path, "error", err)
+			catalogPath := cleanManifestPath(rel)
+			entry := repository.FileEntry{
+				Path:    manifestEntryPath(root, catalogPath, multiRoot),
+				Size:    info.Size(),
+				Mode:    uint32(info.Mode()),
+				ModTime: info.ModTime().UTC(),
+			}
+			entry.UID, entry.GID = fileOwner(info)
+			record := catalogRecordFromFile(root, catalogPath, info)
+
+			mode := info.Mode()
+			switch {
+			case mode.IsDir():
+				entry.Type = repository.EntryTypeDir
+				record.Type = string(repository.EntryTypeDir)
+				if opts.Catalog != nil {
+					_ = opts.Catalog.replaceFile(record, nil)
 				}
+			case mode&os.ModeSymlink != 0:
+				entry.Type = repository.EntryTypeSymlink
+				target, err := os.Readlink(path)
+				if err != nil {
+					return fmt.Errorf("read symlink %q: %w", path, err)
+				}
+				entry.LinkTarget = target
+				record.Type = string(repository.EntryTypeSymlink)
+				record.LinkTarget = target
+				if opts.Catalog != nil {
+					_ = opts.Catalog.replaceFile(record, nil)
+				}
+			case mode.IsRegular():
+				entry.Type = repository.EntryTypeFile
+				record.Type = string(repository.EntryTypeFile)
+				if opts.Catalog != nil {
+					reused, err := c.tryReuseCatalogFile(opts.Catalog, record, &entry, opts)
+					if err != nil {
+						logger.Warn("agent catalog reuse failed; reading file", "path", entry.Path, "error", err)
+					} else if reused {
+						progress.ProcessedFiles++
+						progress.ProcessedBytes += entry.Size
+						progress.ReusedChunks += int64(len(entry.Chunks))
+						progress.Message = entry.Path
+						if err := sendProgress(true); err != nil {
+							return err
+						}
+						if err := appendManifestEntry(manifest, entryPaths, entry); err != nil {
+							return err
+						}
+						return nil
+					}
+				}
+				file, err := os.Open(path)
+				if err != nil {
+					return fmt.Errorf("open file %q: %w", path, err)
+				}
+				fileChunks := make([]catalogChunkRecord, 0)
+				if err := chunker.Split(file, func(chunk []byte) error {
+					ref, uploaded, err := c.ensureChunk(chunk, opts)
+					if err != nil {
+						_ = file.Close()
+						return err
+					}
+					if uploaded {
+						progress.UploadedChunks++
+					} else {
+						progress.ReusedChunks++
+					}
+					entry.Chunks = append(entry.Chunks, ref)
+					fileChunks = append(fileChunks, catalogChunkRecord{Hash: ref.Hash, OriginalSize: ref.OriginalSize})
+					return sendProgress(false)
+				}); err != nil {
+					_ = file.Close()
+					return fmt.Errorf("chunk file %q: %w", path, err)
+				}
+				if err := file.Close(); err != nil {
+					return fmt.Errorf("close file %q: %w", path, err)
+				}
+				progress.ProcessedFiles++
+				progress.ProcessedBytes += entry.Size
+				progress.Message = entry.Path
+				if opts.Catalog != nil {
+					if err := opts.Catalog.replaceFile(record, fileChunks); err != nil {
+						logger.Warn("agent catalog file update failed", "path", entry.Path, "error", err)
+					}
+				}
+				if err := sendProgress(true); err != nil {
+					return err
+				}
+			default:
+				return nil
 			}
-			if err := sendProgress(true); err != nil {
-				return err
-			}
-		default:
-			return nil
+			return appendManifestEntry(manifest, entryPaths, entry)
+		})
+		if err != nil {
+			return nil, err
 		}
-		manifest.Entries = append(manifest.Entries, entry)
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	progress.Phase = "manifest"
 	progress.Message = "manifest ready"
@@ -758,12 +840,43 @@ func (c *agentClient) scanAndUpload(runID int64, root string, logger *slog.Logge
 	return manifest, nil
 }
 
+func manifestEntryPath(root, catalogPath string, multiRoot bool) string {
+	if !multiRoot {
+		return catalogPath
+	}
+	if catalogPath == "." {
+		return cleanManifestPath(rootset.ManifestPrefix(root))
+	}
+	return cleanManifestPath(filepath.Join(rootset.ManifestPrefix(root), catalogPath))
+}
+
+func appendManifestEntry(manifest *repository.SnapshotManifest, seen map[string]struct{}, entry repository.FileEntry) error {
+	if _, ok := seen[entry.Path]; ok {
+		return fmt.Errorf("manifest entry path %q is duplicated", entry.Path)
+	}
+	seen[entry.Path] = struct{}{}
+	manifest.Entries = append(manifest.Entries, entry)
+	return nil
+}
+
 func (c *agentClient) sendProgress(runID int64, progress agentProgress) error {
 	if runID <= 0 {
 		return fmt.Errorf("run id is required for progress")
 	}
 	var resp map[string]any
 	_, err := c.doJSON(http.MethodPost, fmt.Sprintf("/agent/v1/runs/%d/progress", runID), progress, &resp)
+	return err
+}
+
+func (c *agentClient) failRun(runID int64, message string) error {
+	if runID <= 0 {
+		return nil
+	}
+	var resp map[string]any
+	_, err := c.doJSON(http.MethodPost, fmt.Sprintf("/agent/v1/runs/%d/finish", runID), map[string]any{
+		"status": "failed",
+		"error":  message,
+	}, &resp)
 	return err
 }
 
