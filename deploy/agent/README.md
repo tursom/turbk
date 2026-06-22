@@ -16,6 +16,8 @@ cp .env.example .env
 - `TURBK_AGENT_ID`：服务端生成的 Client ID。
 - `TURBK_AGENT_SECRET`：服务端生成的 Client Secret。
 - `TURBK_AGENT_SOURCE_DIR`：宿主机上要备份的目录。
+- `TURBK_AGENT_STATE_HOST_DIR`：宿主机上保存 agent 本地 catalog 的目录，必须持久化。
+- `TURBK_AGENT_BACKUP_INTERVAL`：daemon 本地定期备份间隔，默认 `24h`；服务端手动运行会通过轮询 command 触发。
 - `TURBK_AGENT_EXCLUDES`：可选，逗号或换行分隔的排除规则，规则相对被备份目录，例如 `overlay2/*/merged/proc/**`。
 - `TURBK_AGENT_SKIP_PSEUDO_FS`：可选，默认 `true`，自动跳过 procfs、sysfs、cgroup 等 Linux 伪文件系统。
 
@@ -25,17 +27,19 @@ cp .env.example .env
 
 ```bash
 docker compose pull
-docker compose run --rm turbk-agent
+docker compose up -d
 ```
 
 从源码构建 agent 镜像：
 
 ```bash
 docker compose build
-docker compose run --rm turbk-agent
+docker compose up -d
 ```
 
-compose 会把 `TURBK_AGENT_SOURCE_DIR` 只读挂载到容器内固定路径 `/backup/source`，并执行一次备份。需要定时备份时，可以在被备份主机上用 cron 或 systemd timer 定时运行同一条 `docker compose run --rm turbk-agent` 命令。
+compose 会把 `TURBK_AGENT_SOURCE_DIR` 只读挂载到容器内固定路径 `/backup/source`，并把 `TURBK_AGENT_STATE_HOST_DIR` 持久挂载到 `/var/lib/turbk-agent`。agent 默认以 daemon 模式常驻运行，本地 SQLite catalog 会记录文件元数据、文件 chunk 列表和服务端已确认 chunk 状态。删除 state 目录不会损坏服务端数据，但下次启动会退化为重新扫描和重新向服务端确认 chunk。
+
+daemon 默认每 10 分钟轮询一次服务端，领取 Web 手动运行产生的 command；本地定期备份由 `TURBK_AGENT_BACKUP_INTERVAL` 控制，默认 `24h`。同一时间只执行一个备份，忙碌时收到的多余手动 command 会被标记为 dropped。
 
 如果备份 Docker 数据目录，运行中的 overlay `merged` 目录可能包含容器内的 `/proc`、`/sys`、`/dev` 等挂载视图。agent 默认会按文件系统类型跳过 procfs、sysfs、cgroup 等伪文件系统；仍需要额外排除路径时，可以在 `.env` 中配置：
 
@@ -47,9 +51,9 @@ TURBK_AGENT_EXCLUDES=overlay2/*/merged/proc/**,overlay2/*/merged/sys/**
 
 主机详情里的“客户端接入”面板会按当前主机生成可复制的接入配置，适合像 Tunnel 接入页一样直接交给被备份主机执行：
 
-- Docker Compose：生成 `compose.yaml` 并运行一次客户端容器，适合长期保留配置。
-- Docker run：直接运行一次客户端容器，适合临时验证或脚本化调用。
-- Linux 二进制：在不能使用 Docker 的主机上直接运行 `turbk-agent`。
-- systemd 定时器：安装 `turbk-agent.service` 和 `turbk-agent.timer`，默认每天 02:00 执行一次。
+- Docker Compose：生成 `compose.yaml` 并运行常驻客户端服务，适合长期保留配置。
+- Docker run：直接运行常驻客户端容器，适合不保留 compose 文件的主机。
+- Linux 二进制：在不能使用 Docker 的主机上直接运行 `turbk-agent -daemon`。
+- systemd 服务：安装长期运行的 `turbk-agent.service`。
 
 无论选择哪种方式，客户端都只需要 `TURBK_SERVER_URL`、`TURBK_AGENT_ID`、`TURBK_AGENT_SECRET` 和被备份目录。Agent host 与 agent job 在服务端一对一绑定，客户端不需要也不能选择任务。Docker 方式会把被备份目录只读挂载到容器内固定路径 `/backup/source`，这个路径是实现细节，不需要用户自行选择。

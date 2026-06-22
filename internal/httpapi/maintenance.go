@@ -326,6 +326,17 @@ func (s *Server) cleanupErrorBackupData(ctx context.Context, activeSnapshots []s
 	report.RemovedChunks = chunkCleanup.Count
 	report.RemovedLogicalBytes = chunkCleanup.LogicalBytes
 	report.RemovedCompressedBytes = chunkCleanup.CompressedBytes
+	if len(chunkCleanup.Hashes) > 0 {
+		if _, err := s.store.BumpChunkGeneration(ctx, chunkCleanup.Hashes, "cleanup-errors", now); err != nil {
+			return cleanupReport{}, err
+		}
+	}
+	if s.cfg.Agent.InvalidationRetentionDays > 0 {
+		cutoff := now.AddDate(0, 0, -s.cfg.Agent.InvalidationRetentionDays)
+		if _, err := s.store.PruneChunkInvalidations(ctx, cutoff); err != nil {
+			s.logger.Warn("prune chunk invalidation journal", "error", err)
+		}
+	}
 	return report, nil
 }
 
@@ -414,11 +425,16 @@ func (s *Server) compactRepository(ctx context.Context, snapshots []state.Snapsh
 		}
 	}
 
-	removedChunks, err := s.repo.DeleteUnreferencedChunks(ctx, keepHashes)
+	chunkCleanup, err := s.repo.DeleteUnreferencedChunkStats(ctx, keepHashes)
 	if err != nil {
 		return compactReport{}, err
 	}
-	report.RemovedChunks = removedChunks
+	report.RemovedChunks = chunkCleanup.Count
+	if len(chunkCleanup.Hashes) > 0 {
+		if _, err := s.store.BumpChunkGeneration(ctx, chunkCleanup.Hashes, "compact", time.Now().UTC()); err != nil {
+			return compactReport{}, err
+		}
+	}
 
 	keepSegments := make(map[int64]struct{})
 	for _, ref := range newRefs {

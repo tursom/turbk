@@ -102,6 +102,7 @@ func (i *chunkIndex) deleteUnreferenced(keep map[string]struct{}, cutoff time.Ti
 		stats.Count++
 		stats.LogicalBytes += ref.OriginalSize
 		stats.CompressedBytes += ref.CompressedSize
+		stats.Hashes = append(stats.Hashes, hash)
 	}
 	if err := iter.Error(); err != nil {
 		return CleanupStats{}, fmt.Errorf("iterate chunk index: %w", err)

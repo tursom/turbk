@@ -1863,6 +1863,201 @@ func TestAgentPushPublishesSnapshotAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "daemon-host",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Host       state.Host       `json:"host"`
+		Credential state.Credential `json:"credential"`
+		Agent      struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.FindOrCreateAgentJob(context.Background(), state.AgentJobInput{
+		HostID:       createdAgent.Host.ID,
+		CredentialID: createdAgent.Credential.ID,
+		Name:         "Agent backup - daemon-host",
+		SourceConfig: json.RawMessage(`{"root":"/backup/source"}`),
+		Timezone:     "Asia/Shanghai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body = postJSONAuthed(t, server.URL+"/api/v1/jobs/"+strconv.FormatInt(job.ID, 10)+"/run", cookie, nil)
+	if status != http.StatusAccepted {
+		t.Fatalf("queue agent job status = %d body=%s", status, string(body))
+	}
+
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/heartbeat", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname":       "daemon-hostname",
+		"version":        "test",
+		"mode":           "daemon",
+		"state_dir":      "/var/lib/turbk-agent",
+		"catalog_status": "ok",
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("agent heartbeat status = %d body=%s", status, string(body))
+	}
+	var heartbeat struct {
+		Repository struct {
+			ID              string `json:"id"`
+			ChunkGeneration int64  `json:"chunk_generation"`
+		} `json:"repository"`
+		Agent struct {
+			PollIntervalSeconds int64 `json:"poll_interval_seconds"`
+			CommandGeneration   int64 `json:"command_generation"`
+		} `json:"agent"`
+		Commands []struct {
+			ID     int64  `json:"id"`
+			Type   string `json:"type"`
+			JobID  int64  `json:"job_id"`
+			Status string `json:"status"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(body, &heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.Repository.ID == "" || heartbeat.Agent.PollIntervalSeconds != 600 {
+		t.Fatalf("heartbeat missing repository/poll state: %+v", heartbeat)
+	}
+	if len(heartbeat.Commands) != 1 || heartbeat.Commands[0].Type != "run-backup" || heartbeat.Commands[0].JobID != job.ID {
+		t.Fatalf("unexpected heartbeat commands: %+v", heartbeat.Commands)
+	}
+
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/commands/"+strconv.FormatInt(heartbeat.Commands[0].ID, 10)+"/ack", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"status": "dropped",
+		"reason": "agent_busy",
+	})
+	if status != http.StatusAccepted {
+		t.Fatalf("ack command status = %d body=%s", status, string(body))
+	}
+	updatedHost, err := store.GetHost(context.Background(), createdAgent.Host.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedHost.AgentStatus == nil || updatedHost.AgentStatus.LastDroppedReason.String != "agent_busy" {
+		t.Fatalf("agent dropped reason was not recorded: %+v", updatedHost.AgentStatus)
+	}
+}
+
+func TestAgentManifestMissingChunksIsRetryable(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "repair-host",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "repair-host",
+		"root":     "/backup/source",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent run status = %d body=%s", status, string(body))
+	}
+	var createdRun struct {
+		Run state.Run `json:"run"`
+	}
+	if err := json.Unmarshal(body, &createdRun); err != nil {
+		t.Fatal(err)
+	}
+
+	missingHash := strings.Repeat("a", 64)
+	manifest := repository.SnapshotManifest{
+		SourceType: "agent",
+		SourceRoot: "/backup/source",
+		Entries: []repository.FileEntry{
+			{Path: ".", Type: repository.EntryTypeDir, Mode: uint32(os.ModeDir | 0o755)},
+			{Path: "data.txt", Type: repository.EntryTypeFile, Size: 10, Mode: 0o644, Chunks: []repository.ChunkRef{{Hash: missingHash, OriginalSize: 10}}},
+		},
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/manifests", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"run_id":   createdRun.Run.ID,
+		"manifest": manifest,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("missing manifest status = %d body=%s", status, string(body))
+	}
+	var missingResp struct {
+		Status        string `json:"status"`
+		Retryable     bool   `json:"retryable"`
+		MissingChunks []struct {
+			Hash  string   `json:"hash"`
+			Paths []string `json:"paths"`
+		} `json:"missing_chunks"`
+	}
+	if err := json.Unmarshal(body, &missingResp); err != nil {
+		t.Fatal(err)
+	}
+	if missingResp.Status != "missing_chunks" || !missingResp.Retryable || len(missingResp.MissingChunks) != 1 || missingResp.MissingChunks[0].Hash != missingHash {
+		t.Fatalf("unexpected missing chunks response: %+v", missingResp)
+	}
+	run, err := store.GetRun(context.Background(), createdRun.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "running" {
+		t.Fatalf("run status after missing chunks = %q, want running", run.Status)
+	}
+}
+
 func postJSON(t *testing.T, url string, value any) (int, []byte) {
 	t.Helper()
 	return requestJSON(t, http.MethodPost, url, "", value)

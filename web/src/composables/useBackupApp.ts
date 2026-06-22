@@ -22,6 +22,7 @@ import { en, locale, setLocale, t, type MessageKey } from '../i18n';
 import { pages, type PageKey } from '../navigation';
 
 const agentContainerRoot = '/backup/source';
+const agentContainerStateDir = '/var/lib/turbk-agent';
 type AgentSetupMethod = 'compose' | 'docker' | 'binary' | 'systemd';
 
 function shellQuote(value: string) {
@@ -336,6 +337,9 @@ export function useBackupApp() {
       `TURBK_SERVER_URL=${currentServerURL.value}`,
       `TURBK_AGENT_ID=${agentSetupClientId.value}`,
       `TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`,
+      `TURBK_AGENT_DAEMON=true`,
+      `TURBK_AGENT_STATE_DIR=${agentContainerStateDir}`,
+      `TURBK_AGENT_ROOT=${agentContainerRoot}`,
       `TURBK_AGENT_SOURCE_DIR=${agentSetupSourceDir.value}`
     ].join('\n')
   );
@@ -352,28 +356,30 @@ export function useBackupApp() {
       `      TURBK_SERVER_URL: ${yamlQuote(currentServerURL.value)}`,
       `      TURBK_AGENT_ID: ${yamlQuote(agentSetupClientId.value)}`,
       `      TURBK_AGENT_SECRET: ${yamlQuote(agentSetupClientSecret.value)}`,
+      '      TURBK_AGENT_DAEMON: "true"',
+      `      TURBK_AGENT_STATE_DIR: ${yamlQuote(agentContainerStateDir)}`,
+      `      TURBK_AGENT_ROOT: ${yamlQuote(agentContainerRoot)}`,
       '    volumes:',
+      `      - ${yamlQuote(`./agent-state:${agentContainerStateDir}`)}`,
       `      - ${yamlQuote(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)}`,
-      '    command:',
-      '      - "-root"',
-      `      - ${yamlQuote(agentContainerRoot)}`,
-      '      - "-once"',
-      '    restart: "no"',
+      '    restart: unless-stopped',
       'YAML',
-      'docker compose run --rm turbk-agent'
+      'docker compose up -d'
     ].join('\n')
   );
 
   const agentDockerCommand = computed(() =>
     [
-      'docker run --rm \\',
+      'docker run -d --name turbk-agent --restart unless-stopped \\',
       `  -e TURBK_SERVER_URL=${JSON.stringify(currentServerURL.value)} \\`,
       `  -e TURBK_AGENT_ID=${JSON.stringify(agentSetupClientId.value)} \\`,
       `  -e TURBK_AGENT_SECRET=${JSON.stringify(agentSetupClientSecret.value)} \\`,
+      '  -e TURBK_AGENT_DAEMON=true \\',
+      `  -e TURBK_AGENT_STATE_DIR=${JSON.stringify(agentContainerStateDir)} \\`,
+      `  -e TURBK_AGENT_ROOT=${JSON.stringify(agentContainerRoot)} \\`,
+      `  -v ${JSON.stringify(`turbk-agent-state:${agentContainerStateDir}`)} \\`,
       `  -v ${JSON.stringify(`${agentSetupSourceDir.value}:${agentContainerRoot}:ro`)} \\`,
-      '  ghcr.io/tursom/turbk-agent:latest \\',
-      `  -root ${JSON.stringify(agentContainerRoot)} \\`,
-      '  -once'
+      '  ghcr.io/tursom/turbk-agent:latest'
     ].join('\n')
   );
 
@@ -383,7 +389,8 @@ export function useBackupApp() {
       `export TURBK_SERVER_URL=${shellQuote(currentServerURL.value)}`,
       `export TURBK_AGENT_ID=${shellQuote(agentSetupClientId.value)}`,
       `export TURBK_AGENT_SECRET=${shellQuote(agentSetupClientSecret.value)}`,
-      `./turbk-agent -root ${shellQuote(agentSetupSourceDir.value)} -once`
+      `export TURBK_AGENT_STATE_DIR=${shellQuote('/var/lib/turbk-agent')}`,
+      `./turbk-agent -root ${shellQuote(agentSetupSourceDir.value)} -daemon`
     ].join('\n')
   );
 
@@ -397,28 +404,18 @@ export function useBackupApp() {
       'Wants=network-online.target',
       '',
       '[Service]',
-      'Type=oneshot',
+      'Type=simple',
       `Environment=${systemdQuote(`TURBK_SERVER_URL=${currentServerURL.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_ID=${agentSetupClientId.value}`)}`,
       `Environment=${systemdQuote(`TURBK_AGENT_SECRET=${agentSetupClientSecret.value}`)}`,
-      `ExecStart=/usr/local/bin/turbk-agent -root ${systemdQuote(agentSetupSourceDir.value)} -once`,
-      'UNIT',
-      '',
-      "sudo tee /etc/systemd/system/turbk-agent.timer >/dev/null <<'UNIT'",
-      '[Unit]',
-      'Description=Run Turbk agent backup every day',
-      '',
-      '[Timer]',
-      'OnCalendar=*-*-* 02:00:00',
-      'Persistent=true',
-      'Unit=turbk-agent.service',
-      '',
-      '[Install]',
-      'WantedBy=timers.target',
+      `Environment=${systemdQuote(`TURBK_AGENT_STATE_DIR=/var/lib/turbk-agent`)}`,
+      `ExecStart=/usr/local/bin/turbk-agent -root ${systemdQuote(agentSetupSourceDir.value)} -daemon`,
+      'Restart=always',
+      'RestartSec=30',
       'UNIT',
       '',
       'sudo systemctl daemon-reload',
-      'sudo systemctl enable --now turbk-agent.timer'
+      'sudo systemctl enable --now turbk-agent.service'
     ].join('\n')
   );
 
@@ -1238,7 +1235,13 @@ export function useBackupApp() {
     runningJobId.value = job.id;
     try {
       const result = await api.runJob(job.id);
-      actionMessage.value = t('message.runStatus', { id: result.run.id, status: statusText(result.status) });
+      if (result.run) {
+        actionMessage.value = t('message.runStatus', { id: result.run.id, status: statusText(result.status) });
+      } else if (result.command) {
+        actionMessage.value = t('message.commandStatus', { id: result.command.id, status: statusText(result.status) });
+      } else {
+        actionMessage.value = statusText(result.status);
+      }
       await refresh();
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err);

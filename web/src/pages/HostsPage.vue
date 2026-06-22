@@ -279,6 +279,46 @@ const {
             <dt>{{ t('field.lastSeen') }}</dt>
             <dd>{{ hostLastSeenText(selectedHost) }}</dd>
           </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('field.mode') }}</dt>
+            <dd>{{ selectedHost.agent_status?.mode || '-' }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentCatalog') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.catalog_status) }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentRepository') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.repository_id) }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentChunkGeneration') }}</dt>
+            <dd>{{ selectedHost.agent_status?.chunk_generation ?? '-' }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentConfigGeneration') }}</dt>
+            <dd>{{ selectedHost.agent_status?.config_generation ?? '-' }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentCommandGeneration') }}</dt>
+            <dd>{{ selectedHost.agent_status?.command_generation ?? '-' }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentRunningRun') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.running_run_id) }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentLastError') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.last_error) }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentLastDropped') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.last_dropped_reason) }}</dd>
+          </div>
+          <div v-if="selectedHost.source_type === 'agent'">
+            <dt>{{ t('hosts.agentLastDroppedAt') }}</dt>
+            <dd>{{ nullText(selectedHost.agent_status?.last_dropped_at) }}</dd>
+          </div>
           <div>
             <dt>{{ t('field.created') }}</dt>
             <dd>{{ formatTime(selectedHost.created_at) }}</dd>

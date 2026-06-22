@@ -78,6 +78,15 @@ func (s *Store) init(ctx context.Context) error {
 	if err := s.ensureSnapshotCleanupColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAgentHeartbeatColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureAgentCommandColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureRepositoryState(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -261,6 +270,9 @@ func (s *Store) CreateHost(ctx context.Context, input CreateHostInput) (Host, er
 	if err != nil {
 		return Host{}, fmt.Errorf("get created host id: %w", err)
 	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Host{}, err
+	}
 	return s.GetHost(ctx, id)
 }
 
@@ -322,6 +334,9 @@ func (s *Store) UpdateHost(ctx context.Context, input UpdateHostInput) (Host, er
 	}
 	if changed == 0 {
 		return Host{}, fmt.Errorf("host %d not found", input.ID)
+	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Host{}, err
 	}
 	return s.GetHost(ctx, input.ID)
 }
@@ -486,19 +501,60 @@ func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
 	return snapshots, rows.Err()
 }
 
-func (s *Store) UpsertAgentHeartbeat(ctx context.Context, hostID int64, subject, hostname, version string, now time.Time) error {
+func (s *Store) UpsertAgentHeartbeat(ctx context.Context, input AgentHeartbeatInput) error {
+	input.Subject = strings.TrimSpace(input.Subject)
+	input.Hostname = strings.TrimSpace(input.Hostname)
+	input.Version = strings.TrimSpace(input.Version)
+	input.Mode = strings.TrimSpace(input.Mode)
+	input.StateDir = strings.TrimSpace(input.StateDir)
+	input.CatalogStatus = strings.TrimSpace(input.CatalogStatus)
+	input.RepositoryID = strings.TrimSpace(input.RepositoryID)
+	input.LastError = strings.TrimSpace(input.LastError)
+	if input.Mode == "" {
+		input.Mode = "once"
+	}
+	if input.Version == "" {
+		input.Version = "unknown"
+	}
+	if input.Now.IsZero() {
+		input.Now = time.Now().UTC()
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO agent_heartbeats (token_subject, hostname, agent_version, last_seen_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO agent_heartbeats (
+			token_subject, hostname, agent_version, mode, state_dir, catalog_status, repository_id,
+			chunk_generation, config_generation, command_generation, running_run_id, last_error, last_seen_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(token_subject) DO UPDATE SET
 			hostname = excluded.hostname,
 			agent_version = excluded.agent_version,
+			mode = excluded.mode,
+			state_dir = excluded.state_dir,
+			catalog_status = excluded.catalog_status,
+			repository_id = excluded.repository_id,
+			chunk_generation = excluded.chunk_generation,
+			config_generation = excluded.config_generation,
+			command_generation = excluded.command_generation,
+			running_run_id = excluded.running_run_id,
+			last_error = excluded.last_error,
 			last_seen_at = excluded.last_seen_at`,
-		subject, hostname, version, now.UTC())
+		input.Subject,
+		input.Hostname,
+		input.Version,
+		input.Mode,
+		nullString(input.StateDir),
+		nullString(input.CatalogStatus),
+		nullString(input.RepositoryID),
+		nonNegative(input.ChunkGeneration),
+		nonNegative(input.ConfigGeneration),
+		nonNegative(input.CommandGeneration),
+		input.RunningRunID,
+		nullString(input.LastError),
+		input.Now.UTC())
 	if err != nil {
 		return fmt.Errorf("upsert agent heartbeat: %w", err)
 	}
-	if _, err := s.UpdateHostStatus(ctx, hostID, hostname, "online", now); err != nil {
+	if _, err := s.UpdateHostStatus(ctx, input.HostID, input.Hostname, "online", input.Now); err != nil {
 		return fmt.Errorf("update agent host: %w", err)
 	}
 	return nil
@@ -549,6 +605,13 @@ func (s *Store) hydrateHostAgent(ctx context.Context, host *Host) error {
 	}
 	if ok {
 		host.Agent = &agent
+		heartbeat, exists, err := s.GetAgentHeartbeat(ctx, agent.Subject)
+		if err != nil {
+			return err
+		}
+		if exists {
+			host.AgentStatus = &heartbeat
+		}
 	}
 	return nil
 }
@@ -569,6 +632,7 @@ type Host struct {
 	CredentialID sql.NullInt64      `json:"credential_id"`
 	Credential   *CredentialSummary `json:"credential,omitempty"`
 	Agent        *AgentCredential   `json:"agent,omitempty"`
+	AgentStatus  *AgentHeartbeat    `json:"agent_status,omitempty"`
 	Status       string             `json:"status"`
 	LastSeenAt   sql.NullTime       `json:"last_seen_at"`
 	CreatedAt    time.Time          `json:"created_at"`
@@ -763,8 +827,49 @@ var schema = []string{
 		token_subject TEXT PRIMARY KEY,
 		hostname TEXT NOT NULL,
 		agent_version TEXT NOT NULL,
+		mode TEXT NOT NULL DEFAULT 'once',
+		state_dir TEXT,
+		catalog_status TEXT,
+		repository_id TEXT,
+		chunk_generation INTEGER NOT NULL DEFAULT 0,
+		config_generation INTEGER NOT NULL DEFAULT 0,
+		command_generation INTEGER NOT NULL DEFAULT 0,
+		running_run_id INTEGER,
+		last_error TEXT,
+		last_dropped_reason TEXT,
+		last_dropped_at DATETIME,
 		last_seen_at DATETIME NOT NULL
 	)`,
+	`CREATE TABLE IF NOT EXISTS repository_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`,
+	`CREATE TABLE IF NOT EXISTS chunk_invalidations (
+		generation INTEGER NOT NULL,
+		hash TEXT NOT NULL,
+		reason TEXT NOT NULL,
+		created_at DATETIME NOT NULL,
+		PRIMARY KEY (generation, hash)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_chunk_invalidations_created_at ON chunk_invalidations(created_at)`,
+	`CREATE TABLE IF NOT EXISTS agent_commands (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+		job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+		run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+		type TEXT NOT NULL,
+		status TEXT NOT NULL,
+		payload TEXT NOT NULL DEFAULT '{}',
+		reason TEXT,
+		created_by TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		expires_at DATETIME NOT NULL,
+		claimed_at DATETIME,
+		finished_at DATETIME
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_agent_commands_host_status ON agent_commands(host_id, status, expires_at)`,
 	`CREATE TABLE IF NOT EXISTS web_sessions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			token_hash TEXT NOT NULL UNIQUE,

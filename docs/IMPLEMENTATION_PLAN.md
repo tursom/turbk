@@ -514,7 +514,7 @@ server:
 
 auth:
   username: "admin"
-  password: "change-me"
+  password: "admin"
   session_ttl_hours: 24
 
 paths:

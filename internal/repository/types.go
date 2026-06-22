@@ -37,7 +37,8 @@ type Stats struct {
 }
 
 type CleanupStats struct {
-	Count           int64 `json:"count"`
-	LogicalBytes    int64 `json:"logical_bytes"`
-	CompressedBytes int64 `json:"compressed_bytes"`
+	Count           int64    `json:"count"`
+	LogicalBytes    int64    `json:"logical_bytes"`
+	CompressedBytes int64    `json:"compressed_bytes"`
+	Hashes          []string `json:"hashes,omitempty"`
 }

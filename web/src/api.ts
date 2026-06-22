@@ -27,6 +27,13 @@ export interface Bootstrap {
     timezone: string;
     max_concurrent_runs: number;
   };
+  agent: {
+    command_ttl: string;
+    default_poll_interval: string;
+    max_chunk_check_batch: number;
+    max_invalidation_response_hashes: number;
+    invalidation_retention_days: number;
+  };
   auth: {
     username: string;
     session_ttl_hours: number;
@@ -79,10 +86,46 @@ export interface Host {
   credential_id: unknown;
   credential?: CredentialSummary;
   agent?: AgentCredential;
+  agent_status?: AgentStatus;
   status: string;
   last_seen_at: unknown;
   created_at: string;
   updated_at: string;
+}
+
+export interface AgentStatus {
+  token_subject: string;
+  hostname: string;
+  agent_version: string;
+  mode: string;
+  state_dir: unknown;
+  catalog_status: unknown;
+  repository_id: unknown;
+  chunk_generation: number;
+  config_generation: number;
+  command_generation: number;
+  running_run_id: unknown;
+  last_error: unknown;
+  last_dropped_reason: unknown;
+  last_dropped_at: unknown;
+  last_seen_at: string;
+}
+
+export interface AgentCommand {
+  id: number;
+  host_id: number;
+  job_id?: number;
+  run_id?: number;
+  type: string;
+  status: string;
+  payload?: Record<string, unknown>;
+  reason?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  claimed_at?: string;
+  finished_at?: string;
 }
 
 export interface CredentialSummary {
@@ -422,7 +465,7 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   runJob: (id: number) =>
-    request<{ status: string; run: Run; snapshot?: Snapshot; manifest?: Record<string, unknown> }>(`/api/v1/jobs/${id}/run`, {
+    request<{ status: string; run?: Run; command?: AgentCommand; snapshot?: Snapshot; manifest?: Record<string, unknown> }>(`/api/v1/jobs/${id}/run`, {
       method: 'POST'
     }),
   runs: () => request<{ runs: Run[] }>('/api/v1/runs'),

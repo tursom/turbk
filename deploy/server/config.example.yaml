@@ -14,7 +14,7 @@ server:
 
 auth:
   username: "admin"
-  password: "change-me"
+  password: "admin"
   session_ttl_hours: 24
 
 paths:
@@ -50,3 +50,10 @@ maintenance:
   keep_deleted_metadata_days: 30
   compact_min_reclaim_ratio: 0.15
   compact_min_reclaim_bytes: "1GiB"
+
+agent:
+  command_ttl: "30m"
+  default_poll_interval: "10m"
+  max_chunk_check_batch: 10000
+  max_invalidation_response_hashes: 100000
+  invalidation_retention_days: 30

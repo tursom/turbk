@@ -26,7 +26,7 @@ go run ./cmd/turbk -config configs/turbk.example.yaml
 - Health API: `http://localhost:8080/api/v1/health`
 - Storage API: `http://localhost:8080/api/v1/storage/health`
 
-管理后台默认账号为 `admin` / `admin`，生产部署应在配置文件的 `auth` 段修改 `username`、`password` 和 `session_ttl_hours`。命令行访问管理 API 时先登录保存 Cookie：
+管理后台初始账号统一为 `admin` / `admin`。生产部署首次登录后应在 Settings 页面或通过 API 修改管理员账号和密码，不需要额外的一次性初始化口令。命令行访问管理 API 时先登录保存 Cookie：
 
 ```bash
 curl -c /tmp/turbk.cookie -X POST http://localhost:8080/api/v1/auth/login \
@@ -85,6 +85,18 @@ go run ./cmd/turbk-agent \
   -client-secret "$TURBK_AGENT_SECRET" \
   -root /data/source \
   -once
+```
+
+Agent daemon 常驻模式：
+
+```bash
+go run ./cmd/turbk-agent \
+  -server http://localhost:8080 \
+  -client-id "$TURBK_AGENT_ID" \
+  -client-secret "$TURBK_AGENT_SECRET" \
+  -root /data/source \
+  -state-dir /var/lib/turbk-agent \
+  -daemon
 ```
 
 Agent 默认启用 `-skip-pseudo-fs=true`，会跳过 procfs、sysfs、cgroup 等 Linux 伪文件系统，避免读取 `/proc/*/attr/*` 这类伪文件导致备份失败。需要额外排除路径时可用 `-exclude` 或 `TURBK_AGENT_EXCLUDES`，规则相对备份根目录，多个规则用逗号或换行分隔。
@@ -210,7 +222,7 @@ curl -b /tmp/turbk.cookie http://localhost:8080/api/v1/runs/1/logs
 ```bash
 cp .env.example .env
 cp deploy/server/config.example.yaml config.yaml
-# 修改 config.yaml 中的 auth.password、server.public_url 和仓库参数
+# 修改 config.yaml 中的 server.public_url 和仓库参数；首次登录后修改默认管理员密码
 # 按需修改 .env 中的 TURBK_HTTP_PORT 与宿主机挂载目录
 docker compose build
 docker compose up -d
@@ -228,7 +240,7 @@ docker compose up -d
 ```bash
 cp .env.example .env
 cp deploy/server/config.example.yaml config.yaml
-# 修改 config.yaml 中的 auth.password、server.public_url 和仓库参数
+# 修改 config.yaml 中的 server.public_url 和仓库参数；首次登录后修改默认管理员密码
 # 按需修改 .env 中的 TURBK_HTTP_PORT 与宿主机挂载目录
 docker compose pull
 docker compose up -d --no-build
@@ -276,7 +288,7 @@ repository:
 
 容器默认以 `root` 运行，便于读写宿主机挂载进来的备份源、仓库盘和恢复目录。
 镜像 runtime 使用 `alpine:3.22`，构建阶段使用 `golang:1.26-alpine` 和 `node:22-alpine`。
-部署时必须修改 `config.yaml` 里的 `auth.password`，不要沿用示例密码。
+部署后请使用默认初始账号 `admin` / `admin` 登录，并立即在 Settings 页面或通过 `PATCH /api/v1/settings` 修改管理员密码。
 
 ## Agent Docker
 
@@ -287,7 +299,7 @@ cd deploy/agent
 cp .env.example .env
 # 填写 TURBK_SERVER_URL、TURBK_AGENT_ID、TURBK_AGENT_SECRET 和 TURBK_AGENT_SOURCE_DIR
 docker compose pull
-docker compose run --rm turbk-agent
+docker compose up -d
 ```
 
 备份 Docker 数据目录时，运行中的 `overlay2/*/merged` 可能包含容器内的 `/proc`、`/sys` 等挂载视图。agent 默认跳过 Linux 伪文件系统；如需路径级排除，可在 `deploy/agent/.env` 设置 `TURBK_AGENT_EXCLUDES=overlay2/*/merged/proc/**,overlay2/*/merged/sys/**`。
@@ -297,12 +309,12 @@ docker compose run --rm turbk-agent
 ```bash
 cd deploy/agent
 docker compose build
-docker compose run --rm turbk-agent
+docker compose up -d
 ```
 
-agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 agent 是一次性执行模型；需要定时备份时，在被备份主机上用 cron 或 systemd timer 定时运行 `docker compose run --rm turbk-agent`。
+agent compose 默认镜像名是 `ghcr.io/tursom/turbk-agent:latest`。它不暴露端口，只把被备份目录以只读方式挂载进容器，然后由 `turbk-agent` 主动连接服务端。当前 compose 默认以 daemon 模式常驻运行，并把本地 catalog 持久化到 `./agent-state`。daemon 默认每 10 分钟轮询服务端 command，本地定期备份间隔默认 `24h`。
 
-Web UI 的主机详情页会为 Agent 主机生成多种接入方式：Docker Compose、Docker run、Linux 二进制和 systemd timer。推荐优先从页面复制对应配置，避免手工拼写 Client ID、Secret 和服务端地址。
+Web UI 的主机详情页会为 Agent 主机生成多种接入方式：Docker Compose、Docker run、Linux 二进制和 systemd service。推荐优先从页面复制对应配置，避免手工拼写 Client ID、Secret 和服务端地址。
 
 ## 开发验证
 

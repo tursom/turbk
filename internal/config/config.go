@@ -20,6 +20,7 @@ type Config struct {
 	Scheduler   SchedulerConfig   `json:"scheduler" yaml:"scheduler"`
 	Retention   RetentionConfig   `json:"retention" yaml:"retention"`
 	Maintenance MaintenanceConfig `json:"maintenance" yaml:"maintenance"`
+	Agent       AgentConfig       `json:"agent" yaml:"agent"`
 }
 
 type ServerConfig struct {
@@ -71,6 +72,14 @@ type MaintenanceConfig struct {
 	CompactMinReclaimBytes  string  `json:"compact_min_reclaim_bytes" yaml:"compact_min_reclaim_bytes"`
 }
 
+type AgentConfig struct {
+	CommandTTL                    string `json:"command_ttl" yaml:"command_ttl"`
+	DefaultPollInterval           string `json:"default_poll_interval" yaml:"default_poll_interval"`
+	MaxChunkCheckBatch            int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
+	MaxInvalidationResponseHashes int    `json:"max_invalidation_response_hashes" yaml:"max_invalidation_response_hashes"`
+	InvalidationRetentionDays     int    `json:"invalidation_retention_days" yaml:"invalidation_retention_days"`
+}
+
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
@@ -114,6 +123,13 @@ func Default() Config {
 			KeepDeletedMetadataDays: 30,
 			CompactMinReclaimRatio:  0.15,
 			CompactMinReclaimBytes:  "1GiB",
+		},
+		Agent: AgentConfig{
+			CommandTTL:                    "30m",
+			DefaultPollInterval:           "10m",
+			MaxChunkCheckBatch:            10000,
+			MaxInvalidationResponseHashes: 100000,
+			InvalidationRetentionDays:     30,
 		},
 	}
 }
@@ -210,6 +226,31 @@ func (c *Config) Normalize() error {
 	if c.Maintenance.CompactMinReclaimBytes == "" {
 		c.Maintenance.CompactMinReclaimBytes = "1GiB"
 	}
+	if c.Agent.CommandTTL == "" {
+		c.Agent.CommandTTL = "30m"
+	}
+	if duration, err := time.ParseDuration(c.Agent.CommandTTL); err != nil {
+		return fmt.Errorf("agent.command_ttl must be a duration: %w", err)
+	} else if duration <= 0 {
+		return errors.New("agent.command_ttl must be positive")
+	}
+	if c.Agent.DefaultPollInterval == "" {
+		c.Agent.DefaultPollInterval = "10m"
+	}
+	if duration, err := time.ParseDuration(c.Agent.DefaultPollInterval); err != nil {
+		return fmt.Errorf("agent.default_poll_interval must be a duration: %w", err)
+	} else if duration <= 0 {
+		return errors.New("agent.default_poll_interval must be positive")
+	}
+	if c.Agent.MaxChunkCheckBatch <= 0 {
+		c.Agent.MaxChunkCheckBatch = 10000
+	}
+	if c.Agent.MaxInvalidationResponseHashes <= 0 {
+		c.Agent.MaxInvalidationResponseHashes = 100000
+	}
+	if c.Agent.InvalidationRetentionDays < 0 {
+		return errors.New("agent.invalidation_retention_days must be non-negative")
+	}
 	return nil
 }
 
@@ -271,6 +312,11 @@ func applyEnv(c *Config) {
 	applyInt("TURBK_MAINTENANCE_KEEP_DELETED_METADATA_DAYS", &c.Maintenance.KeepDeletedMetadataDays)
 	applyFloat("TURBK_MAINTENANCE_COMPACT_MIN_RECLAIM_RATIO", &c.Maintenance.CompactMinReclaimRatio)
 	applyString("TURBK_MAINTENANCE_COMPACT_MIN_RECLAIM_BYTES", &c.Maintenance.CompactMinReclaimBytes)
+	applyString("TURBK_AGENT_COMMAND_TTL", &c.Agent.CommandTTL)
+	applyString("TURBK_AGENT_DEFAULT_POLL_INTERVAL", &c.Agent.DefaultPollInterval)
+	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_BATCH", &c.Agent.MaxChunkCheckBatch)
+	applyInt("TURBK_AGENT_MAX_INVALIDATION_RESPONSE_HASHES", &c.Agent.MaxInvalidationResponseHashes)
+	applyInt("TURBK_AGENT_INVALIDATION_RETENTION_DAYS", &c.Agent.InvalidationRetentionDays)
 }
 
 func splitList(value string) []string {

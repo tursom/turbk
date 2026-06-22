@@ -55,6 +55,24 @@ func TestExampleConfigsLoad(t *testing.T) {
 	}
 }
 
+func TestExampleConfigsUseDefaultInitialAdmin(t *testing.T) {
+	paths := []string{
+		"../../configs/turbk.example.yaml",
+		"../../deploy/server/config.example.yaml",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%q) error = %v", path, err)
+			}
+			if cfg.Auth.Username != "admin" || cfg.Auth.Password != "admin" {
+				t.Fatalf("initial admin = %q/%q, want admin/admin", cfg.Auth.Username, cfg.Auth.Password)
+			}
+		})
+	}
+}
+
 func TestEnvOverridesRepositoryConfig(t *testing.T) {
 	t.Setenv("TURBK_SEGMENT_SIZE", "256MiB")
 	t.Setenv("TURBK_CHUNK_AVG_SIZE", "2MiB")

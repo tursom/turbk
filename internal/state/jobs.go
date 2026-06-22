@@ -133,6 +133,9 @@ func (s *Store) CreateJob(ctx context.Context, input CreateJobInput) (Job, error
 	if err != nil {
 		return Job{}, fmt.Errorf("get created job id: %w", err)
 	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Job{}, err
+	}
 	return s.GetJob(ctx, id)
 }
 
@@ -173,6 +176,9 @@ func (s *Store) UpdateJob(ctx context.Context, input UpdateJobInput) (Job, error
 	}
 	if changed == 0 {
 		return Job{}, fmt.Errorf("job %d not found", input.ID)
+	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Job{}, err
 	}
 	return s.GetJob(ctx, input.ID)
 }
@@ -240,6 +246,9 @@ func (s *Store) FindOrCreateAgentJob(ctx context.Context, input AgentJobInput) (
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, false, fmt.Errorf("commit agent job create: %w", err)
+	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Job{}, false, err
 	}
 	job, err := s.GetJob(ctx, id)
 	return job, true, err

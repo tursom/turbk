@@ -214,6 +214,9 @@ func (s *Store) CreateAgentHost(ctx context.Context, input CreateAgentHostInput)
 	if err != nil {
 		return Host{}, Credential{}, err
 	}
+	if _, err := s.BumpConfigGeneration(ctx); err != nil {
+		return Host{}, Credential{}, err
+	}
 	credential.ClientID = input.ClientID
 	credential.ClientSecret = input.ClientSecret
 	credential.Subject = input.Subject

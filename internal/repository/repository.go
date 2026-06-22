@@ -178,9 +178,14 @@ func (r *Repository) RewriteChunkRef(ctx context.Context, oldRef ChunkRef) (Chun
 }
 
 func (r *Repository) DeleteUnreferencedChunks(_ context.Context, keep map[string]struct{}) (int64, error) {
+	stats, err := r.DeleteUnreferencedChunkStats(context.Background(), keep)
+	return stats.Count, err
+}
+
+func (r *Repository) DeleteUnreferencedChunkStats(_ context.Context, keep map[string]struct{}) (CleanupStats, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.index.DeleteUnreferenced(keep)
+	return r.index.deleteUnreferenced(keep, time.Time{})
 }
 
 func (r *Repository) DeleteUnreferencedChunksOlderThan(_ context.Context, keep map[string]struct{}, cutoff time.Time) (CleanupStats, error) {

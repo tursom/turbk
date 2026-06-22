@@ -205,9 +205,9 @@ const {
             </button>
           </div>
           <div v-else class="button-row">
-            <button class="text-button" type="button" :disabled="runningJobId === job.id || job.source_type === 'agent'" @click="runJob(job)">
+            <button class="text-button" type="button" :disabled="runningJobId === job.id" @click="runJob(job)">
               <Play :size="16" />
-              <span>{{ job.source_type === 'agent' ? t('common.agent') : runningJobId === job.id ? t('common.running') : t('common.run') }}</span>
+              <span>{{ runningJobId === job.id ? t('common.running') : t('common.run') }}</span>
             </button>
             <button class="text-button" type="button" :disabled="savingJobId === job.id" @click="toggleJob(job)">
               <Power :size="16" />

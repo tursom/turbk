@@ -15,6 +15,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,7 +102,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /agent/v1/runs", s.handleAgentCreateRun)
 	s.mux.HandleFunc("GET /agent/v1/chunks/{hash}", s.handleAgentGetChunk)
 	s.mux.HandleFunc("PUT /agent/v1/chunks/{hash}", s.handleAgentPutChunk)
+	s.mux.HandleFunc("GET /agent/v1/chunks/invalidations", s.handleAgentChunkInvalidations)
+	s.mux.HandleFunc("POST /agent/v1/chunks/check", s.handleAgentCheckChunks)
 	s.mux.HandleFunc("POST /agent/v1/manifests", s.handleAgentPostManifest)
+	s.mux.HandleFunc("POST /agent/v1/commands/{id}/ack", s.handleAgentCommandAck)
 	s.mux.HandleFunc("POST /agent/v1/runs/{id}/progress", s.handleAgentProgress)
 	s.mux.HandleFunc("POST /agent/v1/runs/{id}/finish", s.handleAgentFinishRun)
 	s.mux.HandleFunc("/", s.handleWeb)
@@ -149,6 +153,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		},
 		"repository":  s.cfg.Repository,
 		"scheduler":   s.cfg.Scheduler,
+		"agent":       s.cfg.Agent,
 		"retention":   settings.Retention,
 		"maintenance": settings.Maintenance,
 		"auth": map[string]any{
@@ -596,7 +601,31 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if job.SourceType == "agent" {
-		writeError(w, http.StatusBadRequest, errors.New("agent jobs must be started by turbk-agent"))
+		if !job.HostID.Valid {
+			writeError(w, http.StatusBadRequest, errors.New("agent job host_id is required"))
+			return
+		}
+		ttl, err := time.ParseDuration(s.cfg.Agent.CommandTTL)
+		if err != nil || ttl <= 0 {
+			ttl = 30 * time.Minute
+		}
+		command, err := s.store.CreateAgentCommand(r.Context(), state.CreateAgentCommandInput{
+			HostID:    job.HostID.Int64,
+			JobID:     sql.NullInt64{Int64: job.ID, Valid: true},
+			Type:      "run-backup",
+			Payload:   mustJSON(map[string]any{"job_id": job.ID}),
+			CreatedBy: "web",
+			ExpiresAt: time.Now().UTC().Add(ttl),
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status":  "queued",
+			"job":     job,
+			"command": agentCommandResponse(command),
+		})
 		return
 	}
 	releaseRunGate, ok := s.tryEnterBackupWrite()
@@ -731,8 +760,17 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Hostname string `json:"hostname"`
-		Version  string `json:"version"`
+		Hostname          string `json:"hostname"`
+		Version           string `json:"version"`
+		Mode              string `json:"mode"`
+		StateDir          string `json:"state_dir"`
+		CatalogStatus     string `json:"catalog_status"`
+		RepositoryID      string `json:"repository_id"`
+		ChunkGeneration   int64  `json:"chunk_generation"`
+		ConfigGeneration  int64  `json:"config_generation"`
+		CommandGeneration int64  `json:"command_generation"`
+		RunningRunID      *int64 `json:"running_run_id"`
+		LastError         string `json:"last_error"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -746,15 +784,70 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		req.Version = "unknown"
 	}
 	now := time.Now().UTC()
-	if err := s.store.UpsertAgentHeartbeat(r.Context(), agent.HostID, agent.Subject, req.Hostname, req.Version, now); err != nil {
+	runningRunID := sql.NullInt64{}
+	if req.RunningRunID != nil && *req.RunningRunID > 0 {
+		runningRunID = sql.NullInt64{Int64: *req.RunningRunID, Valid: true}
+	}
+	if err := s.store.UpsertAgentHeartbeat(r.Context(), state.AgentHeartbeatInput{
+		HostID:            agent.HostID,
+		Subject:           agent.Subject,
+		Hostname:          req.Hostname,
+		Version:           req.Version,
+		Mode:              req.Mode,
+		StateDir:          req.StateDir,
+		CatalogStatus:     req.CatalogStatus,
+		RepositoryID:      req.RepositoryID,
+		ChunkGeneration:   req.ChunkGeneration,
+		ConfigGeneration:  req.ConfigGeneration,
+		CommandGeneration: req.CommandGeneration,
+		RunningRunID:      runningRunID,
+		LastError:         req.LastError,
+		Now:               now,
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if _, err := s.store.ExpireAgentCommands(r.Context(), now); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	repositoryState, err := s.store.RepositoryState(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	commands, err := s.store.ListPendingAgentCommands(r.Context(), agent.HostID, 10, now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	commandPayloads := make([]map[string]any, 0, len(commands))
+	for _, command := range commands {
+		commandPayloads = append(commandPayloads, agentCommandResponse(command))
+	}
+	pollInterval := s.agentPollInterval()
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":      "accepted",
 		"client_id":   agent.Credential.ClientID,
 		"subject":     agent.Subject,
 		"server_time": now,
+		"repository": map[string]any{
+			"id":                          repositoryState.RepositoryID,
+			"chunk_generation":            repositoryState.ChunkGeneration,
+			"invalidation_available_from": repositoryState.InvalidationAvailableFrom,
+		},
+		"agent": map[string]any{
+			"config_generation":            repositoryState.ConfigGeneration,
+			"command_generation":           repositoryState.CommandGeneration,
+			"poll_interval_seconds":        int64(pollInterval / time.Second),
+			"default_poll_interval":        s.cfg.Agent.DefaultPollInterval,
+			"max_chunk_check_batch":        s.cfg.Agent.MaxChunkCheckBatch,
+			"max_manifest_repair_attempts": 3,
+		},
+		"maintenance": map[string]any{
+			"write_available": true,
+		},
+		"commands": commandPayloads,
 	})
 }
 
@@ -764,9 +857,13 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Hostname string `json:"hostname"`
-		Root     string `json:"root"`
-		RunKey   string `json:"run_key"`
+		Hostname            string `json:"hostname"`
+		Root                string `json:"root"`
+		RunKey              string `json:"run_key"`
+		CommandID           int64  `json:"command_id"`
+		Trigger             string `json:"trigger"`
+		RepositoryID        string `json:"repository_id"`
+		BaseChunkGeneration int64  `json:"base_chunk_generation"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -824,6 +921,12 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 					_ = s.store.MarkRunRunning(r.Context(), active.ID, time.Now().UTC())
 					active, _ = s.store.GetRun(r.Context(), active.ID)
 				}
+				if req.CommandID > 0 {
+					if _, err := s.store.MarkAgentCommandRunning(r.Context(), req.CommandID, agent.HostID, active.ID, time.Now().UTC()); err != nil {
+						writeError(w, http.StatusBadRequest, err)
+						return
+					}
+				}
 				_ = s.store.AppendRunLog(r.Context(), active.ID, "info", "agent run resumed")
 				writeJSON(w, http.StatusOK, map[string]any{
 					"status":      "running",
@@ -842,6 +945,13 @@ func (s *Server) handleAgentCreateRun(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.MarkRunRunning(r.Context(), run.ID, now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if req.CommandID > 0 {
+		if _, err := s.store.MarkAgentCommandRunning(r.Context(), req.CommandID, agent.HostID, run.ID, now); err != nil {
+			_ = s.store.FailRun(r.Context(), run.ID, err.Error(), time.Now().UTC())
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	_ = s.store.AppendRunLog(r.Context(), run.ID, "info", "agent run started")
 	running, err := s.store.GetRun(r.Context(), run.ID)
@@ -925,6 +1035,121 @@ func (s *Server) handleAgentPutChunk(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAgentChunkInvalidations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateAgent(w, r); !ok {
+		return
+	}
+	var since int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("since")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 0 {
+			writeError(w, http.StatusBadRequest, errors.New("since must be a non-negative integer"))
+			return
+		}
+		since = value
+	}
+	result, err := s.store.ChunkInvalidationsSince(r.Context(), since, s.cfg.Agent.MaxInvalidationResponseHashes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	resp := map[string]any{
+		"repository_id":      result.RepositoryState.RepositoryID,
+		"from_generation":    result.FromGeneration,
+		"to_generation":      result.ToGeneration,
+		"complete":           result.Complete,
+		"invalidated_hashes": result.Hashes,
+	}
+	if result.Reason != "" {
+		resp["reason"] = result.Reason
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAgentCheckChunks(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticateAgent(w, r); !ok {
+		return
+	}
+	var req struct {
+		RepositoryID        string   `json:"repository_id"`
+		BaseChunkGeneration int64    `json:"base_chunk_generation"`
+		Hashes              []string `json:"hashes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Hashes) > s.cfg.Agent.MaxChunkCheckBatch {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("hashes exceeds max batch %d", s.cfg.Agent.MaxChunkCheckBatch))
+		return
+	}
+	repositoryState, err := s.store.RepositoryState(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if req.RepositoryID != "" && req.RepositoryID != repositoryState.RepositoryID {
+		writeError(w, http.StatusConflict, fmt.Errorf("repository_id changed: current=%s", repositoryState.RepositoryID))
+		return
+	}
+	exists := make([]string, 0, len(req.Hashes))
+	missing := make([]string, 0)
+	seen := make(map[string]struct{}, len(req.Hashes))
+	for _, hash := range req.Hashes {
+		hash = strings.TrimSpace(hash)
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		if err := validateChunkHash(hash); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		ok, err := s.repo.HasChunk(r.Context(), hash)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if ok {
+			exists = append(exists, hash)
+		} else {
+			missing = append(missing, hash)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"repository_id":    repositoryState.RepositoryID,
+		"chunk_generation": repositoryState.ChunkGeneration,
+		"exists":           exists,
+		"missing":          missing,
+	})
+}
+
+func (s *Server) handleAgentCommandAck(w http.ResponseWriter, r *http.Request) {
+	agent, ok := s.authenticateAgent(w, r)
+	if !ok {
+		return
+	}
+	commandID, err := parsePathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var req struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	command, err := s.store.AckAgentCommand(r.Context(), commandID, agent.HostID, req.Status, req.Reason, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "command": agentCommandResponse(command)})
+}
+
 func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request) {
 	agent, ok := s.authenticateAgent(w, r)
 	if !ok {
@@ -950,6 +1175,7 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	} else if exists {
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "completed", "", time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":   "completed",
 			"run":      run,
@@ -974,14 +1200,33 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if err := s.canonicalizeManifestChunks(r.Context(), &manifest); err != nil {
+		var missingErr *missingManifestChunksError
+		if errors.As(err, &missingErr) {
+			_ = s.store.AppendRunLog(r.Context(), run.ID, "warn", err.Error())
+			repositoryState, stateErr := s.store.RepositoryState(r.Context())
+			if stateErr != nil {
+				writeError(w, http.StatusInternalServerError, stateErr)
+				return
+			}
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"status":           "missing_chunks",
+				"repository_id":    repositoryState.RepositoryID,
+				"chunk_generation": repositoryState.ChunkGeneration,
+				"missing_chunks":   missingErr.Missing,
+				"retryable":        true,
+			})
+			return
+		}
 		_ = s.store.AppendRunLog(r.Context(), run.ID, "error", err.Error())
 		_ = s.store.FailRun(r.Context(), run.ID, err.Error(), time.Now().UTC())
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "failed", err.Error(), time.Now().UTC())
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := s.repo.WriteManifest(&manifest); err != nil {
 		_ = s.store.AppendRunLog(r.Context(), run.ID, "error", err.Error())
 		_ = s.store.FailRun(r.Context(), run.ID, err.Error(), time.Now().UTC())
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "failed", err.Error(), time.Now().UTC())
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -998,6 +1243,7 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		_ = s.store.AppendRunLog(r.Context(), run.ID, "error", err.Error())
 		_ = s.store.FailRun(r.Context(), run.ID, err.Error(), time.Now().UTC())
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "failed", err.Error(), time.Now().UTC())
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1018,6 +1264,7 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "completed", "", time.Now().UTC())
 	completed, err := s.store.GetRun(r.Context(), run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1101,6 +1348,7 @@ func (s *Server) handleAgentFinishRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if run.Status == "completed" {
+		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "completed", "", time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"status": "completed", "run": run})
 		return
 	}
@@ -1115,6 +1363,7 @@ func (s *Server) handleAgentFinishRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "completed", "", time.Now().UTC())
 	completed, err := s.store.GetRun(r.Context(), run.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1177,10 +1426,27 @@ func (s *Server) authorizeAgentRun(w http.ResponseWriter, r *http.Request, agent
 	return job, run, true
 }
 
+type missingManifestChunk struct {
+	Hash  string   `json:"hash"`
+	Paths []string `json:"paths"`
+}
+
+type missingManifestChunksError struct {
+	Missing []missingManifestChunk
+}
+
+func (e *missingManifestChunksError) Error() string {
+	if e == nil || len(e.Missing) == 0 {
+		return "manifest references missing chunks"
+	}
+	return fmt.Sprintf("manifest references %d missing chunks", len(e.Missing))
+}
+
 func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repository.SnapshotManifest) error {
 	if len(manifest.Entries) == 0 {
 		return errors.New("manifest entries are required")
 	}
+	missingByHash := make(map[string]map[string]struct{})
 	for entryIndex := range manifest.Entries {
 		entry := &manifest.Entries[entryIndex]
 		switch entry.Type {
@@ -1191,6 +1457,7 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 				return fmt.Errorf("file %q has no chunks", entry.Path)
 			}
 			var chunkTotal int64
+			entryMissing := false
 			for chunkIndex := range entry.Chunks {
 				hash := entry.Chunks[chunkIndex].Hash
 				if err := validateChunkHash(hash); err != nil {
@@ -1201,10 +1468,20 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 					return err
 				}
 				if !exists {
-					return fmt.Errorf("file %q references missing chunk %s", entry.Path, hash)
+					paths := missingByHash[hash]
+					if paths == nil {
+						paths = make(map[string]struct{})
+						missingByHash[hash] = paths
+					}
+					paths[entry.Path] = struct{}{}
+					entryMissing = true
+					continue
 				}
 				entry.Chunks[chunkIndex] = ref
 				chunkTotal += ref.OriginalSize
+			}
+			if entryMissing {
+				continue
 			}
 			if chunkTotal != entry.Size {
 				return fmt.Errorf("file %q size %d does not match chunk bytes %d", entry.Path, entry.Size, chunkTotal)
@@ -1212,6 +1489,24 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 		default:
 			return fmt.Errorf("manifest entry %q has unsupported type %q", entry.Path, entry.Type)
 		}
+	}
+	if len(missingByHash) > 0 {
+		hashes := make([]string, 0, len(missingByHash))
+		for hash := range missingByHash {
+			hashes = append(hashes, hash)
+		}
+		sort.Strings(hashes)
+		missing := make([]missingManifestChunk, 0, len(hashes))
+		for _, hash := range hashes {
+			pathSet := missingByHash[hash]
+			paths := make([]string, 0, len(pathSet))
+			for path := range pathSet {
+				paths = append(paths, path)
+			}
+			sort.Strings(paths)
+			missing = append(missing, missingManifestChunk{Hash: hash, Paths: paths})
+		}
+		return &missingManifestChunksError{Missing: missing}
 	}
 	return nil
 }
@@ -1597,6 +1892,46 @@ func isSupportedSourceType(sourceType string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Server) agentPollInterval() time.Duration {
+	interval, err := time.ParseDuration(s.cfg.Agent.DefaultPollInterval)
+	if err != nil || interval <= 0 {
+		return 10 * time.Minute
+	}
+	return interval
+}
+
+func agentCommandResponse(command state.AgentCommand) map[string]any {
+	resp := map[string]any{
+		"id":         command.ID,
+		"host_id":    command.HostID,
+		"type":       command.Type,
+		"status":     command.Status,
+		"payload":    command.Payload,
+		"created_at": command.CreatedAt,
+		"updated_at": command.UpdatedAt,
+		"expires_at": command.ExpiresAt,
+	}
+	if command.JobID.Valid {
+		resp["job_id"] = command.JobID.Int64
+	}
+	if command.RunID.Valid {
+		resp["run_id"] = command.RunID.Int64
+	}
+	if command.Reason.Valid {
+		resp["reason"] = command.Reason.String
+	}
+	if command.CreatedBy.Valid {
+		resp["created_by"] = command.CreatedBy.String
+	}
+	if command.ClaimedAt.Valid {
+		resp["claimed_at"] = command.ClaimedAt.Time
+	}
+	if command.FinishedAt.Valid {
+		resp["finished_at"] = command.FinishedAt.Time
+	}
+	return resp
 }
 
 func manifestTotals(manifest *repository.SnapshotManifest) (fileCount int64, totalSize int64) {
