@@ -24,6 +24,18 @@ type Repository struct {
 	mu      sync.Mutex
 }
 
+type PutChunkResult struct {
+	Ref     ChunkRef
+	Existed bool
+}
+
+type putChunkRequest struct {
+	index      int
+	data       []byte
+	hash       [32]byte
+	hashString string
+}
+
 func Open(ctx context.Context, cfg config.Config) (*Repository, error) {
 	segmentSize, err := parseSize(cfg.Repository.SegmentSize, defaultSegmentSize)
 	if err != nil {
@@ -116,26 +128,82 @@ func (r *Repository) Close() error {
 	return err
 }
 
-func (r *Repository) PutChunk(_ context.Context, data []byte) (ChunkRef, bool, error) {
-	hash := blake3.Sum256(data)
-	hashString := hex.EncodeToString(hash[:])
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if ref, ok, err := r.index.Get(hashString); err != nil {
-		return ChunkRef{}, false, err
-	} else if ok {
-		return ref, true, nil
-	}
-	ref, err := r.writer.WriteChunk(hash, data)
+func (r *Repository) PutChunk(ctx context.Context, data []byte) (ChunkRef, bool, error) {
+	results, err := r.PutChunks(ctx, [][]byte{data})
 	if err != nil {
 		return ChunkRef{}, false, err
 	}
-	if err := r.index.Put(ref); err != nil {
-		return ChunkRef{}, false, err
+	if len(results) != 1 {
+		return ChunkRef{}, false, fmt.Errorf("put chunk returned %d results", len(results))
 	}
-	return ref, false, nil
+	return results[0].Ref, results[0].Existed, nil
+}
+
+func (r *Repository) PutChunks(ctx context.Context, chunks [][]byte) ([]PutChunkResult, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	requests := make([]putChunkRequest, len(chunks))
+	for i, data := range chunks {
+		hash := blake3.Sum256(data)
+		requests[i] = putChunkRequest{
+			index:      i,
+			data:       data,
+			hash:       hash,
+			hashString: hex.EncodeToString(hash[:]),
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	results := make([]PutChunkResult, len(chunks))
+	pendingByHash := make(map[string]int)
+	aliasesByPending := make(map[int][]int)
+	pendingResultIndexes := make([]int, 0, len(chunks))
+	pendingWrites := make([]segmentWriteChunk, 0, len(chunks))
+	for _, request := range requests {
+		if pendingIndex, ok := pendingByHash[request.hashString]; ok {
+			aliasesByPending[pendingIndex] = append(aliasesByPending[pendingIndex], request.index)
+			continue
+		}
+		if ref, ok, err := r.index.Get(request.hashString); err != nil {
+			return nil, err
+		} else if ok {
+			results[request.index] = PutChunkResult{Ref: ref, Existed: true}
+			continue
+		}
+		pendingByHash[request.hashString] = len(pendingWrites)
+		pendingResultIndexes = append(pendingResultIndexes, request.index)
+		pendingWrites = append(pendingWrites, segmentWriteChunk{Hash: request.hash, Data: request.data})
+	}
+	if len(pendingWrites) == 0 {
+		return results, nil
+	}
+	refs, err := r.writer.WriteChunks(pendingWrites)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) != len(pendingWrites) {
+		return nil, fmt.Errorf("put chunks wrote %d refs for %d chunks", len(refs), len(pendingWrites))
+	}
+	if err := r.index.PutBatch(refs); err != nil {
+		return nil, err
+	}
+	for pendingIndex, ref := range refs {
+		resultIndex := pendingResultIndexes[pendingIndex]
+		results[resultIndex] = PutChunkResult{Ref: ref}
+		for _, aliasIndex := range aliasesByPending[pendingIndex] {
+			results[aliasIndex] = PutChunkResult{Ref: ref, Existed: true}
+		}
+	}
+	return results, nil
 }
 
 func (r *Repository) RotateSegmentForMaintenance(_ context.Context) (int64, error) {

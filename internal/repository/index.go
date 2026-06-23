@@ -48,12 +48,29 @@ func (i *chunkIndex) Get(hash string) (ChunkRef, bool, error) {
 }
 
 func (i *chunkIndex) Put(ref ChunkRef) error {
-	data, err := json.Marshal(ref)
-	if err != nil {
-		return fmt.Errorf("encode chunk index value: %w", err)
+	return i.PutBatch([]ChunkRef{ref})
+}
+
+func (i *chunkIndex) PutBatch(refs []ChunkRef) error {
+	if len(refs) == 0 {
+		return nil
 	}
-	if err := i.db.Set(indexKey(ref.Hash), data, pebble.Sync); err != nil {
-		return fmt.Errorf("put chunk index: %w", err)
+	batch := i.db.NewBatch()
+	defer batch.Close()
+	for _, ref := range refs {
+		if ref.Hash == "" {
+			return fmt.Errorf("chunk index ref hash is required")
+		}
+		data, err := json.Marshal(ref)
+		if err != nil {
+			return fmt.Errorf("encode chunk index value: %w", err)
+		}
+		if err := batch.Set(indexKey(ref.Hash), data, nil); err != nil {
+			return fmt.Errorf("stage chunk index %s: %w", ref.Hash, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("put chunk index batch: %w", err)
 	}
 	return nil
 }

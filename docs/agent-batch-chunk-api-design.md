@@ -335,15 +335,14 @@ defer releaseRunGate()
 
 ### 9.3 Repository 写入
 
-首版可以循环调用现有 `repo.PutChunk(ctx, data)`，保持去重和 segment 写入逻辑不变。
+当前实现使用 `repo.PutChunks(ctx, chunks)`：
 
-后续优化：
+- 每个批次在 repository 内只加一次 mutex。
+- 同一批内重复 chunk 只写入一次，重复项返回同一个 `ChunkRef`。
+- chunk index 使用 Pebble batch 提交，避免逐 chunk `pebble.Sync`。
+- segment writer 连续写多个 record 后再 sync；跨 segment rotate 前会先 sync 当前 segment。
 
-- 增加 `repo.PutChunks(ctx, chunks)`，在 repository 内只加一次 mutex。
-- chunk index 批量写。
-- segment writer 连续写多个 record 后再 sync 或按策略 sync。
-
-首版不改变 repository 写入一致性，优先降低公网 RTT。
+这个改动不改变 repository 写入一致性，只把单 chunk 的同步写放大改为按批次同步。
 
 ## 10. 兼容与灰度
 

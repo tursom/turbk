@@ -107,6 +107,65 @@ func TestPutChunkDeduplicatesAndReadsBack(t *testing.T) {
 	}
 }
 
+func TestPutChunksDeduplicatesWithinBatchAndReadsBack(t *testing.T) {
+	repo := testRepository(t, 256, 4096)
+	ctx := context.Background()
+	first := bytes.Repeat([]byte("batch-first-"), 200)
+	second := bytes.Repeat([]byte("batch-second-"), 200)
+
+	results, err := repo.PutChunks(ctx, [][]byte{first, second, first})
+	if err != nil {
+		t.Fatalf("PutChunks() error = %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("PutChunks() results = %d, want 3", len(results))
+	}
+	if results[0].Existed || results[1].Existed || !results[2].Existed {
+		t.Fatalf("unexpected batch existence flags: %+v", results)
+	}
+	if results[0].Ref != results[2].Ref {
+		t.Fatalf("duplicate chunk ref mismatch:\n%+v\n%+v", results[0].Ref, results[2].Ref)
+	}
+	statsAfterFirst, err := repo.Stats()
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if statsAfterFirst.Chunks != 2 {
+		t.Fatalf("chunks after first PutChunks = %d, want 2", statsAfterFirst.Chunks)
+	}
+	for _, tc := range []struct {
+		name string
+		ref  ChunkRef
+		want []byte
+	}{
+		{name: "first", ref: results[0].Ref, want: first},
+		{name: "second", ref: results[1].Ref, want: second},
+	} {
+		got, err := repo.ReadChunk(ctx, tc.ref.Hash)
+		if err != nil {
+			t.Fatalf("ReadChunk(%s) error = %v", tc.name, err)
+		}
+		if !bytes.Equal(got, tc.want) {
+			t.Fatalf("ReadChunk(%s) returned unexpected data", tc.name)
+		}
+	}
+
+	duplicateResults, err := repo.PutChunks(ctx, [][]byte{first, second})
+	if err != nil {
+		t.Fatalf("duplicate PutChunks() error = %v", err)
+	}
+	if len(duplicateResults) != 2 || !duplicateResults[0].Existed || !duplicateResults[1].Existed {
+		t.Fatalf("unexpected duplicate batch results: %+v", duplicateResults)
+	}
+	statsAfterSecond, err := repo.Stats()
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if statsAfterSecond.Chunks != statsAfterFirst.Chunks || statsAfterSecond.SegmentBytes != statsAfterFirst.SegmentBytes {
+		t.Fatalf("duplicate PutChunks changed storage stats: first=%+v second=%+v", statsAfterFirst, statsAfterSecond)
+	}
+}
+
 func TestReadChunkDetectsCorruptRecord(t *testing.T) {
 	repo := testRepository(t, 256, 4096)
 	ctx := context.Background()

@@ -39,6 +39,11 @@ type segmentWriter struct {
 	encoder   *zstd.Encoder
 }
 
+type segmentWriteChunk struct {
+	Hash [32]byte
+	Data []byte
+}
+
 func openSegmentWriter(repoDir string, maxSize int64, encryptor cipher.AEAD, encoder *zstd.Encoder) (*segmentWriter, error) {
 	dir := filepath.Join(repoDir, "segments")
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -78,32 +83,62 @@ func (w *segmentWriter) Close() error {
 }
 
 func (w *segmentWriter) WriteChunk(hash [32]byte, data []byte) (ChunkRef, error) {
-	record, compressedSize, err := w.encodeRecord(hash, data)
+	refs, err := w.WriteChunks([]segmentWriteChunk{{Hash: hash, Data: data}})
 	if err != nil {
 		return ChunkRef{}, err
 	}
-	if w.offset > 0 && w.offset+int64(len(record)) > w.maxSize {
-		if err := w.rotate(); err != nil {
-			return ChunkRef{}, err
+	if len(refs) != 1 {
+		return ChunkRef{}, fmt.Errorf("write segment chunk returned %d refs", len(refs))
+	}
+	return refs[0], nil
+}
+
+func (w *segmentWriter) WriteChunks(chunks []segmentWriteChunk) ([]ChunkRef, error) {
+	refs := make([]ChunkRef, 0, len(chunks))
+	dirty := false
+	syncDirty := func() error {
+		if !dirty {
+			return nil
 		}
+		if err := w.file.Sync(); err != nil {
+			return fmt.Errorf("sync segment records: %w", err)
+		}
+		dirty = false
+		return nil
 	}
-	offset := w.offset
-	if _, err := w.file.Write(record); err != nil {
-		return ChunkRef{}, fmt.Errorf("write segment record: %w", err)
+	for _, chunk := range chunks {
+		record, compressedSize, err := w.encodeRecord(chunk.Hash, chunk.Data)
+		if err != nil {
+			return nil, err
+		}
+		if w.offset > 0 && w.offset+int64(len(record)) > w.maxSize {
+			if err := syncDirty(); err != nil {
+				return nil, err
+			}
+			if err := w.rotate(); err != nil {
+				return nil, err
+			}
+		}
+		offset := w.offset
+		if _, err := w.file.Write(record); err != nil {
+			return nil, fmt.Errorf("write segment record: %w", err)
+		}
+		dirty = true
+		w.offset += int64(len(record))
+		refs = append(refs, ChunkRef{
+			Hash:           hex.EncodeToString(chunk.Hash[:]),
+			SegmentID:      w.id,
+			Offset:         offset,
+			Length:         int64(len(record)),
+			OriginalSize:   int64(len(chunk.Data)),
+			CompressedSize: int64(compressedSize),
+			CreatedAt:      time.Now().UTC(),
+		})
 	}
-	if err := w.file.Sync(); err != nil {
-		return ChunkRef{}, fmt.Errorf("sync segment record: %w", err)
+	if err := syncDirty(); err != nil {
+		return nil, err
 	}
-	w.offset += int64(len(record))
-	return ChunkRef{
-		Hash:           hex.EncodeToString(hash[:]),
-		SegmentID:      w.id,
-		Offset:         offset,
-		Length:         int64(len(record)),
-		OriginalSize:   int64(len(data)),
-		CompressedSize: int64(compressedSize),
-		CreatedAt:      time.Now().UTC(),
-	}, nil
+	return refs, nil
 }
 
 func (w *segmentWriter) encodeRecord(hash [32]byte, data []byte) ([]byte, int, error) {

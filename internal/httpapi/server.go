@@ -1187,18 +1187,31 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	chunkData := make([][]byte, len(chunks))
+	for i, chunk := range chunks {
+		chunkData[i] = chunk.data
+	}
+	results, err := s.repo.PutChunks(r.Context(), chunkData)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if len(results) != len(chunks) {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("chunk batch wrote %d results for %d chunks", len(results), len(chunks)))
+		return
+	}
 	responses := make([]map[string]any, 0, len(chunks))
-	for _, chunk := range chunks {
-		ref, existed, err := s.repo.PutChunk(r.Context(), chunk.data)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+	for i, chunk := range chunks {
+		result := results[i]
+		if result.Ref.Hash != chunk.hash {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("chunk batch ref hash mismatch: request=%s ref=%s", chunk.hash, result.Ref.Hash))
 			return
 		}
 		responses = append(responses, map[string]any{
 			"hash":     chunk.hash,
 			"exists":   true,
-			"uploaded": !existed,
-			"ref":      ref,
+			"uploaded": !result.Existed,
+			"ref":      result.Ref,
 		})
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{

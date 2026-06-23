@@ -1604,24 +1604,12 @@ func (c *agentClient) checkChunks(hashes []string, repositoryID string, baseGene
 }
 
 func (c *agentClient) uploadChunksBatch(chunks []*pendingBatchChunk) (uploadChunksResponse, error) {
-	var body bytes.Buffer
-	body.Write(agentChunkBatchMagic)
-	var count [4]byte
-	binary.BigEndian.PutUint32(count[:], uint32(len(chunks)))
-	body.Write(count[:])
-	for _, chunk := range chunks {
-		hashBytes, err := hex.DecodeString(chunk.hash)
-		if err != nil || len(hashBytes) != 32 {
-			return uploadChunksResponse{}, fmt.Errorf("invalid chunk hash %q", chunk.hash)
-		}
-		body.Write(hashBytes)
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(chunk.data)))
-		body.Write(length[:])
-		body.Write(chunk.data)
+	body, err := newAgentChunkBatchBody(chunks)
+	if err != nil {
+		return uploadChunksResponse{}, err
 	}
 	var resp uploadChunksResponse
-	status, err := c.doRawAllowStatuses(http.MethodPost, "/agent/v1/chunks/upload", bytes.NewReader(body.Bytes()), agentChunkBatchContentType, &resp, http.StatusNotFound)
+	status, err := c.doRawAllowStatuses(http.MethodPost, "/agent/v1/chunks/upload", body, agentChunkBatchContentType, &resp, http.StatusNotFound)
 	if err != nil {
 		return uploadChunksResponse{}, err
 	}
@@ -1632,6 +1620,35 @@ func (c *agentClient) uploadChunksBatch(chunks []*pendingBatchChunk) (uploadChun
 		return uploadChunksResponse{}, fmt.Errorf("unexpected chunk batch upload status %d", status)
 	}
 	return resp, nil
+}
+
+type agentChunkBatchBody struct {
+	io.Reader
+	size int64
+}
+
+func (b agentChunkBatchBody) Size() int64 {
+	return b.size
+}
+
+func newAgentChunkBatchBody(chunks []*pendingBatchChunk) (agentChunkBatchBody, error) {
+	readers := make([]io.Reader, 0, 2+len(chunks)*3)
+	readers = append(readers, bytes.NewReader(agentChunkBatchMagic))
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(chunks)))
+	readers = append(readers, bytes.NewReader(count[:]))
+	size := int64(len(agentChunkBatchMagic) + len(count))
+	for _, chunk := range chunks {
+		hashBytes, err := hex.DecodeString(chunk.hash)
+		if err != nil || len(hashBytes) != 32 {
+			return agentChunkBatchBody{}, fmt.Errorf("invalid chunk hash %q", chunk.hash)
+		}
+		length := make([]byte, 8)
+		binary.BigEndian.PutUint64(length, uint64(len(chunk.data)))
+		readers = append(readers, bytes.NewReader(hashBytes), bytes.NewReader(length), bytes.NewReader(chunk.data))
+		size += int64(32 + len(length) + len(chunk.data))
+	}
+	return agentChunkBatchBody{Reader: io.MultiReader(readers...), size: size}, nil
 }
 
 func (c *agentClient) uploadChunksLegacy(chunks []*pendingBatchChunk) (uploadChunksResponse, error) {
@@ -1756,6 +1773,9 @@ func (c *agentClient) doRawAllowStatuses(method, path string, body io.Reader, co
 	req, err := http.NewRequest(method, c.serverURL+path, body)
 	if err != nil {
 		return 0, err
+	}
+	if sized, ok := body.(interface{ Size() int64 }); ok {
+		req.ContentLength = sized.Size()
 	}
 	req.Header.Set("Accept", "application/json")
 	if contentType != "" && body != nil {
