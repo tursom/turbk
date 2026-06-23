@@ -300,6 +300,73 @@ func TestScanAndUploadBatchesChunkCheckAndUpload(t *testing.T) {
 	}
 }
 
+func TestUploadChunksBatchAcceptsLargeJSONResponse(t *testing.T) {
+	const chunkCount = 6000
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/chunks/upload" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		chunks := decodeAgentChunkBatchRequest(t, r.Body)
+		if len(chunks) != chunkCount {
+			t.Fatalf("uploaded chunks = %d, want %d", len(chunks), chunkCount)
+		}
+		respChunks := make([]uploadChunkResponse, 0, len(chunks))
+		for i, chunk := range chunks {
+			respChunks = append(respChunks, uploadChunkResponse{
+				Hash:     chunk.hash,
+				Exists:   true,
+				Uploaded: true,
+				Ref: repository.ChunkRef{
+					Hash:           chunk.hash,
+					SegmentID:      1,
+					Offset:         int64(i),
+					Length:         int64(len(chunk.data)),
+					OriginalSize:   int64(len(chunk.data)),
+					CompressedSize: int64(len(chunk.data)),
+				},
+			})
+		}
+		var response bytes.Buffer
+		if err := json.NewEncoder(&response).Encode(uploadChunksResponse{
+			Status:          "accepted",
+			RepositoryID:    "repo-test",
+			ChunkGeneration: 9,
+			Chunks:          respChunks,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if response.Len() <= 1024*1024 {
+			t.Fatalf("test response size = %d, want larger than legacy 1MiB response limit", response.Len())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		if _, err := w.Write(response.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	chunks := make([]*pendingBatchChunk, 0, chunkCount)
+	for i := 0; i < chunkCount; i++ {
+		data := make([]byte, 16)
+		binary.BigEndian.PutUint64(data[8:], uint64(i))
+		sum := blake3.Sum256(data)
+		chunks = append(chunks, &pendingBatchChunk{
+			hash: hex.EncodeToString(sum[:]),
+			data: data,
+		})
+	}
+
+	client := newAgentClient(server.URL, "", "")
+	uploaded, err := client.uploadChunksBatch(chunks)
+	if err != nil {
+		t.Fatalf("uploadChunksBatch() error = %v", err)
+	}
+	if len(uploaded.Chunks) != chunkCount {
+		t.Fatalf("uploaded chunks = %d, want %d", len(uploaded.Chunks), chunkCount)
+	}
+}
+
 func TestPebbleChunkStatusKeyIsBinary(t *testing.T) {
 	hash := testChunkHash("binary key")
 	key, err := encodePebbleChunkStatusKey(hash)

@@ -33,6 +33,7 @@ const defaultAgentBackupSchedule = "0 0 * * *"
 const defaultAgentChunkUploadBatchBytes = int64(64 * 1024 * 1024)
 const defaultAgentFileCatalogBatchFiles = 1000
 const defaultAgentFileCatalogBatchBytes = int64(16 * 1024 * 1024)
+const defaultAgentResponseBodyLimit = int64(64 * 1024 * 1024)
 const agentChunkBatchContentType = "application/vnd.turbk.chunk-batch.v1"
 
 var agentChunkBatchMagic = []byte("TBKCHB1\n")
@@ -1789,7 +1790,7 @@ func (c *agentClient) doRawAllowStatuses(method, path string, body io.Reader, co
 		return 0, err
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	respBody, err := readAgentResponseBody(resp.Body)
 	if err != nil {
 		return resp.StatusCode, err
 	}
@@ -1809,6 +1810,17 @@ func (c *agentClient) doRawAllowStatuses(method, path string, body io.Reader, co
 		}
 	}
 	return resp.StatusCode, nil
+}
+
+func readAgentResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, defaultAgentResponseBodyLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > defaultAgentResponseBodyLimit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", defaultAgentResponseBodyLimit)
+	}
+	return data, nil
 }
 
 func fileOwner(info fs.FileInfo) (int, int) {
