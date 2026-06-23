@@ -997,6 +997,9 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 	if err != nil {
 		return chunkBatchStats{}, err
 	}
+	if err := validateChunkCheckResponse(hashes, b.opts.RepositoryID, checked); err != nil {
+		return chunkBatchStats{}, err
+	}
 	stats := chunkBatchStats{}
 	catalogUpdates := make([]agentChunkStatusUpdate, 0, len(pending))
 	seen := make(map[string]struct{}, len(pending))
@@ -1433,6 +1436,9 @@ func (c *agentClient) ensureCatalogChunksConfirmed(catalog *agentCatalog, chunks
 	if err != nil {
 		return false, err
 	}
+	if err := validateChunkCheckResponse(stale, opts.RepositoryID, checked); err != nil {
+		return false, err
+	}
 	missing := make(map[string]struct{}, len(checked.Missing))
 	updates := make([]agentChunkStatusUpdate, 0, len(checked.Exists)+len(checked.Missing))
 	for _, hash := range checked.Exists {
@@ -1455,6 +1461,53 @@ func (c *agentClient) ensureCatalogChunksConfirmed(catalog *agentCatalog, chunks
 		return false, err
 	}
 	return len(missing) == 0, nil
+}
+
+func validateChunkCheckResponse(requested []string, repositoryID string, checked checkChunksResponse) error {
+	if repositoryID != "" && checked.RepositoryID != "" && checked.RepositoryID != repositoryID {
+		return fmt.Errorf("server check repository_id = %q, want %q", checked.RepositoryID, repositoryID)
+	}
+	requestedSet := make(map[string]struct{}, len(requested))
+	for _, hash := range requested {
+		hash = strings.TrimSpace(hash)
+		if hash == "" {
+			return fmt.Errorf("server check request contains empty chunk hash")
+		}
+		requestedSet[hash] = struct{}{}
+	}
+	seen := make(map[string]string, len(requestedSet))
+	for _, hash := range checked.Exists {
+		hash = strings.TrimSpace(hash)
+		if _, ok := requestedSet[hash]; !ok {
+			return fmt.Errorf("server check returned unexpected existing chunk %s", hash)
+		}
+		if previous, ok := seen[hash]; ok {
+			if previous == "existing" {
+				return fmt.Errorf("server check returned duplicate existing chunk %s", hash)
+			}
+			return fmt.Errorf("server check returned chunk %s as both %s and existing", hash, previous)
+		}
+		seen[hash] = "existing"
+	}
+	for _, hash := range checked.Missing {
+		hash = strings.TrimSpace(hash)
+		if _, ok := requestedSet[hash]; !ok {
+			return fmt.Errorf("server check returned unexpected missing chunk %s", hash)
+		}
+		if previous, ok := seen[hash]; ok {
+			if previous == "missing" {
+				return fmt.Errorf("server check returned duplicate missing chunk %s", hash)
+			}
+			return fmt.Errorf("server check returned chunk %s as both %s and missing", hash, previous)
+		}
+		seen[hash] = "missing"
+	}
+	for hash := range requestedSet {
+		if _, ok := seen[hash]; !ok {
+			return fmt.Errorf("server check omitted chunk %s", hash)
+		}
+	}
+	return nil
 }
 
 func catalogRecordFromFile(root, rel string, info fs.FileInfo) catalogFileRecord {

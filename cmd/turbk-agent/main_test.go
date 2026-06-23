@@ -442,6 +442,96 @@ func TestPebbleFileKeyAndRecordRoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidateChunkCheckResponseRejectsMalformedCoverage(t *testing.T) {
+	hashA := testChunkHash("check-a")
+	hashB := testChunkHash("check-b")
+	other := testChunkHash("check-other")
+	requested := []string{hashA, hashB}
+
+	if err := validateChunkCheckResponse(requested, "repo-test", checkChunksResponse{
+		RepositoryID: "repo-test",
+		Exists:       []string{hashA},
+		Missing:      []string{hashB},
+	}); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		checked checkChunksResponse
+		want    string
+	}{
+		{
+			name:    "omitted",
+			checked: checkChunksResponse{RepositoryID: "repo-test", Exists: []string{hashA}},
+			want:    "omitted chunk " + hashB,
+		},
+		{
+			name:    "unexpected exists",
+			checked: checkChunksResponse{RepositoryID: "repo-test", Exists: []string{hashA, other}, Missing: []string{hashB}},
+			want:    "unexpected existing chunk " + other,
+		},
+		{
+			name:    "duplicate exists",
+			checked: checkChunksResponse{RepositoryID: "repo-test", Exists: []string{hashA, hashA}, Missing: []string{hashB}},
+			want:    "duplicate existing chunk " + hashA,
+		},
+		{
+			name:    "both exists and missing",
+			checked: checkChunksResponse{RepositoryID: "repo-test", Exists: []string{hashA}, Missing: []string{hashA, hashB}},
+			want:    "as both existing and missing",
+		},
+		{
+			name:    "repository mismatch",
+			checked: checkChunksResponse{RepositoryID: "other-repo", Exists: []string{hashA}, Missing: []string{hashB}},
+			want:    `repository_id = "other-repo"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateChunkCheckResponse(requested, "repo-test", tc.checked)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnsureCatalogChunksConfirmedRejectsIncompleteCheckResponse(t *testing.T) {
+	t.Setenv("TURBK_AGENT_CATALOG_BACKEND", "hybrid")
+	hash := testChunkHash("catalog reuse stale chunk")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/chunks/check" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"repository_id":    "repo-test",
+			"chunk_generation": 7,
+			"exists":           []string{},
+			"missing":          []string{},
+		})
+	}))
+	defer server.Close()
+
+	catalog, err := openAgentCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	ok, err := client.ensureCatalogChunksConfirmed(catalog, []catalogChunkRecord{
+		{Hash: hash, OriginalSize: 123},
+	}, backupRunOptions{RepositoryID: "repo-test", ChunkGeneration: 7})
+	if err == nil || !strings.Contains(err.Error(), "omitted chunk "+hash) {
+		t.Fatalf("ensureCatalogChunksConfirmed() ok=%v error=%v, want omitted chunk error", ok, err)
+	}
+	if ok {
+		t.Fatal("ensureCatalogChunksConfirmed() ok=true for incomplete server response")
+	}
+}
+
 func TestOpenAgentCatalogSQLiteBackendUsesSQLiteChunks(t *testing.T) {
 	t.Setenv("TURBK_AGENT_CATALOG_BACKEND", "sqlite")
 	catalog, err := openAgentCatalog(t.TempDir())
