@@ -532,6 +532,150 @@ func TestEnsureCatalogChunksConfirmedRejectsIncompleteCheckResponse(t *testing.T
 	}
 }
 
+func TestEnsureCatalogChunksConfirmedSplitsCheckRequests(t *testing.T) {
+	t.Setenv("TURBK_AGENT_CATALOG_BACKEND", "hybrid")
+	chunks := []catalogChunkRecord{
+		{Hash: testChunkHash("split-check-a"), OriginalSize: 101},
+		{Hash: testChunkHash("split-check-b"), OriginalSize: 102},
+		{Hash: testChunkHash("split-check-c"), OriginalSize: 103},
+		{Hash: testChunkHash("split-check-d"), OriginalSize: 104},
+		{Hash: testChunkHash("split-check-e"), OriginalSize: 105},
+	}
+	var batchSizes []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/chunks/check" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var req struct {
+			Hashes []string `json:"hashes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode check request: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.Hashes) > 2 {
+			t.Errorf("check batch size = %d, want <= 2", len(req.Hashes))
+			http.Error(w, "too many hashes", http.StatusBadRequest)
+			return
+		}
+		batchSizes = append(batchSizes, len(req.Hashes))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"repository_id":    "repo-test",
+			"chunk_generation": 9,
+			"exists":           req.Hashes,
+			"missing":          []string{},
+		})
+	}))
+	defer server.Close()
+
+	catalog, err := openAgentCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	ok, err := client.ensureCatalogChunksConfirmed(catalog, chunks, backupRunOptions{
+		RepositoryID:       "repo-test",
+		ChunkGeneration:    9,
+		MaxChunkCheckBatch: 2,
+	})
+	if err != nil {
+		t.Fatalf("ensureCatalogChunksConfirmed() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ensureCatalogChunksConfirmed() ok=false, want true")
+	}
+	if len(batchSizes) != 3 || batchSizes[0] != 2 || batchSizes[1] != 2 || batchSizes[2] != 1 {
+		t.Fatalf("check batch sizes = %v, want [2 2 1]", batchSizes)
+	}
+	for _, chunk := range chunks {
+		status, generation, ok, err := catalog.chunkStatus(chunk.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || status != "confirmed" || generation != 9 {
+			t.Fatalf("catalog chunk %s = status=%q generation=%d ok=%v, want confirmed generation 9", chunk.Hash, status, generation, ok)
+		}
+	}
+}
+
+func TestValidateChunkUploadResponseRejectsMalformedCoverage(t *testing.T) {
+	hashA := testChunkHash("upload-a")
+	hashB := testChunkHash("upload-b")
+	other := testChunkHash("upload-other")
+	requested := []*pendingBatchChunk{
+		{hash: hashA},
+		{hash: hashB},
+	}
+	validChunk := func(hash string) uploadChunkResponse {
+		return uploadChunkResponse{
+			Hash:     hash,
+			Exists:   true,
+			Uploaded: true,
+			Ref:      repository.ChunkRef{Hash: hash, OriginalSize: 123},
+		}
+	}
+	if _, err := validateChunkUploadResponse(requested, "repo-test", uploadChunksResponse{
+		RepositoryID: "repo-test",
+		Chunks:       []uploadChunkResponse{validChunk(hashA), validChunk(hashB)},
+	}); err != nil {
+		t.Fatalf("valid upload response rejected: %v", err)
+	}
+	tests := []struct {
+		name     string
+		response uploadChunksResponse
+		want     string
+	}{
+		{
+			name:     "omitted",
+			response: uploadChunksResponse{RepositoryID: "repo-test", Chunks: []uploadChunkResponse{validChunk(hashA)}},
+			want:     "omitted chunk " + hashB,
+		},
+		{
+			name:     "unexpected",
+			response: uploadChunksResponse{RepositoryID: "repo-test", Chunks: []uploadChunkResponse{validChunk(hashA), validChunk(hashB), validChunk(other)}},
+			want:     "unexpected chunk " + other,
+		},
+		{
+			name:     "duplicate",
+			response: uploadChunksResponse{RepositoryID: "repo-test", Chunks: []uploadChunkResponse{validChunk(hashA), validChunk(hashA), validChunk(hashB)}},
+			want:     "duplicate chunk " + hashA,
+		},
+		{
+			name:     "repository mismatch",
+			response: uploadChunksResponse{RepositoryID: "other-repo", Chunks: []uploadChunkResponse{validChunk(hashA), validChunk(hashB)}},
+			want:     `repository_id = "other-repo"`,
+		},
+		{
+			name: "not exists",
+			response: uploadChunksResponse{RepositoryID: "repo-test", Chunks: []uploadChunkResponse{
+				validChunk(hashA),
+				{Hash: hashB, Exists: false, Ref: repository.ChunkRef{Hash: hashB, OriginalSize: 123}},
+			}},
+			want: "did not confirm chunk " + hashB,
+		},
+		{
+			name: "ref mismatch",
+			response: uploadChunksResponse{RepositoryID: "repo-test", Chunks: []uploadChunkResponse{
+				validChunk(hashA),
+				{Hash: hashB, Exists: true, Ref: repository.ChunkRef{Hash: hashA, OriginalSize: 123}},
+			}},
+			want: "returned ref " + hashA,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateChunkUploadResponse(requested, "repo-test", tc.response)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestOpenAgentCatalogSQLiteBackendUsesSQLiteChunks(t *testing.T) {
 	t.Setenv("TURBK_AGENT_CATALOG_BACKEND", "sqlite")
 	catalog, err := openAgentCatalog(t.TempDir())

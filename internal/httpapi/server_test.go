@@ -1933,6 +1933,17 @@ func TestAgentBatchChunkUploadUploadsAndDeduplicates(t *testing.T) {
 
 	first := bytes.Repeat([]byte("batch-first-"), 200)
 	second := bytes.Repeat([]byte("batch-second-"), 200)
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, first))
+	if status != http.StatusConflict {
+		t.Fatalf("batch upload without active run status = %d body=%s", status, string(body))
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "batch-agent",
+		"root":     "/batch/source",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent run status = %d body=%s", status, string(body))
+	}
 	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, first, second))
 	if status != http.StatusAccepted {
 		t.Fatalf("batch upload status = %d body=%s", status, string(body))
@@ -1983,6 +1994,62 @@ func TestAgentBatchChunkUploadUploadsAndDeduplicates(t *testing.T) {
 	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, badBody)
 	if status != http.StatusBadRequest {
 		t.Fatalf("bad hash batch status = %d body=%s", status, string(body))
+	}
+}
+
+func TestAgentBatchChunkUploadRejectsLimits(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	cfg.Agent.MaxChunkCheckBatch = 1
+	cfg.Agent.MaxChunkUploadBatchBytes = "64B"
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "batch-limit-agent",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "batch-limit-agent",
+		"root":     "/batch/limit/source",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent run status = %d body=%s", status, string(body))
+	}
+
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, []byte("a"), []byte("b")))
+	if status != http.StatusBadRequest {
+		t.Fatalf("oversized count batch status = %d body=%s", status, string(body))
+	}
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, bytes.Repeat([]byte("x"), 100)))
+	if status != http.StatusRequestEntityTooLarge && status != http.StatusBadRequest {
+		t.Fatalf("oversized byte batch status = %d body=%s", status, string(body))
 	}
 }
 

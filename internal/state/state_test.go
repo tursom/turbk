@@ -334,6 +334,30 @@ func TestAgentJobIsOneToOneWithHost(t *testing.T) {
 	if len(jobs) != 1 {
 		t.Fatalf("agent host has %d jobs, want 1: %+v", len(jobs), jobs)
 	}
+	if _, _, exists, err := store.GetActiveAgentRunForHost(ctx, host.ID); err != nil {
+		t.Fatalf("GetActiveAgentRunForHost(before run) error = %v", err)
+	} else if exists {
+		t.Fatal("GetActiveAgentRunForHost(before run) returned an active run")
+	}
+	run, err := store.CreateRun(ctx, second)
+	if err != nil {
+		t.Fatalf("CreateRun(agent) error = %v", err)
+	}
+	activeJob, activeRun, exists, err := store.GetActiveAgentRunForHost(ctx, host.ID)
+	if err != nil {
+		t.Fatalf("GetActiveAgentRunForHost(active) error = %v", err)
+	}
+	if !exists || activeJob.ID != second.ID || activeRun.ID != run.ID {
+		t.Fatalf("active agent run = job %+v run %+v exists=%v, want job %d run %d", activeJob, activeRun, exists, second.ID, run.ID)
+	}
+	if err := store.CompleteRun(ctx, run.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("CompleteRun(agent) error = %v", err)
+	}
+	if _, _, exists, err := store.GetActiveAgentRunForHost(ctx, host.ID); err != nil {
+		t.Fatalf("GetActiveAgentRunForHost(after complete) error = %v", err)
+	} else if exists {
+		t.Fatal("GetActiveAgentRunForHost(after complete) returned an active run")
+	}
 }
 
 func TestRetentionPolicyExpiresOlderSnapshots(t *testing.T) {

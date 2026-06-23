@@ -372,6 +372,40 @@ func (s *Store) GetActiveRunForJob(ctx context.Context, jobID int64) (Run, bool,
 	return run, true, nil
 }
 
+func (s *Store) GetActiveAgentRunForHost(ctx context.Context, hostID int64) (Job, Run, bool, error) {
+	if hostID <= 0 {
+		return Job{}, Run{}, false, errors.New("agent host_id is required")
+	}
+	var runID int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT runs.id
+		FROM runs
+		JOIN jobs ON jobs.id = runs.job_id
+		WHERE jobs.source_type = 'agent'
+			AND jobs.host_id = ?
+			AND runs.status IN ('pending', 'running')
+		ORDER BY runs.id DESC
+		LIMIT 1`, hostID).Scan(&runID)
+	if err == sql.ErrNoRows {
+		return Job{}, Run{}, false, nil
+	}
+	if err != nil {
+		return Job{}, Run{}, false, fmt.Errorf("get active agent run for host %d: %w", hostID, err)
+	}
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return Job{}, Run{}, false, err
+	}
+	if !run.JobID.Valid {
+		return Job{}, Run{}, false, fmt.Errorf("active agent run %d has no job", run.ID)
+	}
+	job, err := s.GetJob(ctx, run.JobID.Int64)
+	if err != nil {
+		return Job{}, Run{}, false, err
+	}
+	return job, run, true, nil
+}
+
 func (s *Store) HasRunCreatedSince(ctx context.Context, jobID int64, since time.Time) (bool, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx, `

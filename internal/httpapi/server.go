@@ -1092,12 +1092,16 @@ func (s *Server) handleAgentGetChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentPutChunk(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateAgent(w, r); !ok {
+	agent, ok := s.authenticateAgent(w, r)
+	if !ok {
 		return
 	}
 	hash := r.PathValue("hash")
 	if err := validateChunkHash(hash); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, _, ok := s.authorizeAgentActiveRun(w, r, agent); !ok {
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256*1024*1024))
@@ -1146,7 +1150,8 @@ type agentUploadChunk struct {
 }
 
 func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticateAgent(w, r); !ok {
+	agent, ok := s.authenticateAgent(w, r)
+	if !ok {
 		return
 	}
 	if contentType := strings.TrimSpace(r.Header.Get("Content-Type")); contentType != "" {
@@ -1155,6 +1160,9 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusUnsupportedMediaType, fmt.Errorf("content type must be %s", agentChunkBatchContentType))
 			return
 		}
+	}
+	if _, _, ok := s.authorizeAgentActiveRun(w, r, agent); !ok {
+		return
 	}
 	maxBodyBytes := s.agentMaxChunkUploadBatchBytes()
 	chunks, err := readAgentChunkBatch(w, r, maxBodyBytes, s.cfg.Agent.MaxChunkCheckBatch)
@@ -1700,6 +1708,23 @@ func (s *Server) authorizeAgentRun(w http.ResponseWriter, r *http.Request, agent
 	job, err := s.store.GetJob(r.Context(), run.JobID.Int64)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err)
+		return state.Job{}, state.Run{}, false
+	}
+	if job.SourceType != "agent" || !job.HostID.Valid || job.HostID.Int64 != agent.HostID {
+		writeError(w, http.StatusForbidden, errors.New("agent credential is not allowed to access this run"))
+		return state.Job{}, state.Run{}, false
+	}
+	return job, run, true
+}
+
+func (s *Server) authorizeAgentActiveRun(w http.ResponseWriter, r *http.Request, agent agentAuthContext) (state.Job, state.Run, bool) {
+	job, run, exists, err := s.store.GetActiveAgentRunForHost(r.Context(), agent.HostID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return state.Job{}, state.Run{}, false
+	}
+	if !exists {
+		writeError(w, http.StatusConflict, errors.New("agent has no active run"))
 		return state.Job{}, state.Run{}, false
 	}
 	if job.SourceType != "agent" || !job.HostID.Valid || job.HostID.Int64 != agent.HostID {
