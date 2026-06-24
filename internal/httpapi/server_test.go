@@ -164,6 +164,71 @@ func TestManagementListAPIsReturnEmptyArrays(t *testing.T) {
 	}
 }
 
+func TestJSONSuccessResponsesSupportGzip(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	server := httptest.NewServer(New(cfg, store, repo, nil).Handler())
+	defer server.Close()
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/v1/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("success Content-Encoding = %q, want gzip", resp.Header.Get("Content-Encoding"))
+	}
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = gz.Close()
+	if !bytes.Contains(body, []byte(`"status"`)) {
+		t.Fatalf("gzip body = %s", string(body))
+	}
+
+	req, err = http.NewRequest(http.MethodPost, server.URL+"/agent/v1/heartbeat", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 400 {
+		t.Fatalf("bad heartbeat status = %d, want error", resp.StatusCode)
+	}
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		t.Fatal("error response should not be gzip encoded")
+	}
+}
+
 func TestLocalJobRunPublishesSnapshotAndDeduplicates(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -1989,6 +2054,61 @@ func TestAgentBatchChunkUploadUploadsAndDeduplicates(t *testing.T) {
 		t.Fatalf("duplicate batch upload changed storage stats: first=%+v second=%+v", statsAfterFirst, statsAfterSecond)
 	}
 
+	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload?compact_response=1", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, first, second))
+	if status != http.StatusAccepted {
+		t.Fatalf("compact duplicate batch upload status = %d body=%s", status, string(body))
+	}
+	var compactUpload struct {
+		Chunks []map[string]json.RawMessage `json:"chunks"`
+	}
+	if err := json.Unmarshal(body, &compactUpload); err != nil {
+		t.Fatal(err)
+	}
+	if len(compactUpload.Chunks) != 2 {
+		t.Fatalf("compact upload chunks = %d, want 2", len(compactUpload.Chunks))
+	}
+	for _, chunk := range compactUpload.Chunks {
+		if _, ok := chunk["ref"]; ok {
+			t.Fatalf("compact upload chunk unexpectedly includes ref: %s", string(body))
+		}
+		if _, ok := chunk["exists"]; ok {
+			t.Fatalf("compact upload chunk unexpectedly includes exists: %s", string(body))
+		}
+		if len(chunk["hash"]) == 0 || len(chunk["uploaded"]) == 0 || len(chunk["original_size"]) == 0 {
+			t.Fatalf("compact upload chunk missing compact fields: %v", chunk)
+		}
+	}
+
+	firstHash, err := repository.HashBytes(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingHash, err := repository.HashBytes([]byte("missing compact check chunk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/chunks/check", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hashes":           []string{firstHash, missingHash},
+		"compact_response": true,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("compact chunk check status = %d body=%s", status, string(body))
+	}
+	var compactCheck map[string]json.RawMessage
+	if err := json.Unmarshal(body, &compactCheck); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := compactCheck["exists"]; ok {
+		t.Fatalf("compact chunk check unexpectedly includes exists: %s", string(body))
+	}
+	var missing []string
+	if err := json.Unmarshal(compactCheck["missing"], &missing); err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != missingHash {
+		t.Fatalf("compact chunk check missing = %v, want [%s]", missing, missingHash)
+	}
+
 	badBody := encodeAgentChunkBatch(t, []byte("bad hash body"))
 	badBody[len(agentChunkBatchMagic)+4] ^= 0xff
 	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, badBody)
@@ -2050,6 +2170,226 @@ func TestAgentBatchChunkUploadRejectsLimits(t *testing.T) {
 	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, bytes.Repeat([]byte("x"), 100)))
 	if status != http.StatusRequestEntityTooLarge && status != http.StatusBadRequest {
 		t.Fatalf("oversized byte batch status = %d body=%s", status, string(body))
+	}
+}
+
+func TestPackedManifestCanonicalizeRestoreVerifyAndCompact(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+	api := New(cfg, store, repo, nil)
+
+	packData, indexes, err := repository.EncodePack([]repository.PackFilePayload{
+		{Path: "a.txt", Mode: 0o644, ModTime: time.Unix(1710000000, 0), Data: []byte("alpha")},
+		{Path: "dir/b.txt", Mode: 0o600, ModTime: time.Unix(1710000010, 0), Data: []byte("bravo-data")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packRef, _, err := repo.PutChunk(context.Background(), packData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regularRef, _, err := repo.PutChunk(context.Background(), []byte("regular-data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &repository.SnapshotManifest{
+		ID:         "packed-snapshot",
+		CreatedAt:  time.Now().UTC(),
+		SourceType: "agent",
+		Packs: []repository.PackManifest{{
+			ID:     "pack-1",
+			Format: repository.PackFormatTBKPack1,
+			Chunks: []repository.ChunkRef{{Hash: packRef.Hash, OriginalSize: packRef.OriginalSize}},
+		}},
+		Entries: []repository.FileEntry{
+			{
+				Path:    ".",
+				Type:    repository.EntryTypeDir,
+				Mode:    0o755,
+				ModTime: time.Unix(1710000000, 0),
+			},
+			{
+				Path:    "dir",
+				Type:    repository.EntryTypeDir,
+				Mode:    0o755,
+				ModTime: time.Unix(1710000000, 0),
+			},
+			{
+				Path:    "a.txt",
+				Type:    repository.EntryTypePackedFile,
+				Size:    int64(len("alpha")),
+				Mode:    0o644,
+				ModTime: time.Unix(1710000000, 0),
+				Pack:    &repository.PackFileRef{ID: "pack-1", Offset: indexes[0].Offset, Length: indexes[0].Length},
+			},
+			{
+				Path:    "dir/b.txt",
+				Type:    repository.EntryTypePackedFile,
+				Size:    int64(len("bravo-data")),
+				Mode:    0o600,
+				ModTime: time.Unix(1710000010, 0),
+				Pack:    &repository.PackFileRef{ID: "pack-1", Offset: indexes[1].Offset, Length: indexes[1].Length},
+			},
+			{
+				Path:    "regular.txt",
+				Type:    repository.EntryTypeFile,
+				Size:    int64(len("regular-data")),
+				Mode:    0o644,
+				ModTime: time.Unix(1710000020, 0),
+				Chunks:  []repository.ChunkRef{{Hash: regularRef.Hash, OriginalSize: regularRef.OriginalSize}},
+			},
+			{
+				Path:    "empty.txt",
+				Type:    repository.EntryTypeFile,
+				Size:    0,
+				Mode:    0o644,
+				ModTime: time.Unix(1710000030, 0),
+			},
+			{
+				Path:       "link",
+				Type:       repository.EntryTypeSymlink,
+				Mode:       0o777,
+				ModTime:    time.Unix(1710000040, 0),
+				LinkTarget: "a.txt",
+			},
+		},
+	}
+	if err := api.canonicalizeManifestChunks(context.Background(), manifest); err != nil {
+		t.Fatalf("canonicalize packed manifest: %v", err)
+	}
+	if manifest.Packs[0].Chunks[0].SegmentID == 0 || manifest.Packs[0].Chunks[0].Length == 0 {
+		t.Fatalf("pack chunk was not canonicalized: %+v", manifest.Packs[0].Chunks[0])
+	}
+	var file bytes.Buffer
+	if err := api.writeFileEntry(context.Background(), &file, manifest, manifest.Entries[3]); err != nil {
+		t.Fatalf("write packed file: %v", err)
+	}
+	if file.String() != "bravo-data" {
+		t.Fatalf("packed file bytes = %q", file.String())
+	}
+	restoreRoot := filepath.Join(root, "restore")
+	restoreTarget := filepath.Join(restoreRoot, "snapshot")
+	if err := api.restoreEntry(context.Background(), manifest, manifest.Entries[0], ".", restoreTarget, restoreRoot); err != nil {
+		t.Fatalf("restore packed directory: %v", err)
+	}
+	for path, want := range map[string]string{
+		"a.txt":       "alpha",
+		"dir/b.txt":   "bravo-data",
+		"regular.txt": "regular-data",
+		"empty.txt":   "",
+	} {
+		data, err := os.ReadFile(filepath.Join(restoreTarget, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatalf("read restored %s: %v", path, err)
+		}
+		if string(data) != want {
+			t.Fatalf("restored %s = %q, want %q", path, string(data), want)
+		}
+	}
+	linkTarget, err := os.Readlink(filepath.Join(restoreTarget, "link"))
+	if err != nil {
+		t.Fatalf("read restored symlink: %v", err)
+	}
+	if linkTarget != "a.txt" {
+		t.Fatalf("restored symlink target = %q", linkTarget)
+	}
+	if err := repo.WriteManifest(manifest); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.CreateSnapshot(context.Background(), state.CreateSnapshotInput{
+		SourceType:  "agent",
+		ManifestRef: manifest.ID,
+		FileCount:   4,
+		TotalSize:   int64(len("alpha") + len("bravo-data") + len("regular-data")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := api.verifyReferencedChunks(context.Background(), []state.Snapshot{snapshot})
+	if verify.MissingIndex != 0 || verify.CorruptChunks != 0 || len(verify.Errors) != 0 || verify.VerifiedChunks == 0 {
+		t.Fatalf("verify packed snapshot = %+v", verify)
+	}
+	compact, err := api.compactRepository(context.Background(), []state.Snapshot{snapshot})
+	if err != nil {
+		t.Fatalf("compact packed snapshot: %v", err)
+	}
+	if compact.RewrittenChunks == 0 {
+		t.Fatalf("compact report = %+v, want rewritten pack chunk", compact)
+	}
+	compactedManifest, err := repo.ReadManifest(manifest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := repo.ReadPackedFile(context.Background(), compactedManifest, compactedManifest.Entries[2])
+	if err != nil {
+		t.Fatalf("read compacted packed file: %v", err)
+	}
+	if string(restored) != "alpha" {
+		t.Fatalf("compacted packed file bytes = %q", string(restored))
+	}
+}
+
+func TestPackedManifestCanonicalizeRejectsInvalidRange(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+	api := New(cfg, store, repo, nil)
+
+	packData, indexes, err := repository.EncodePack([]repository.PackFilePayload{
+		{Path: "a.txt", Mode: 0o644, ModTime: time.Now(), Data: []byte("alpha")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packRef, _, err := repo.PutChunk(context.Background(), packData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &repository.SnapshotManifest{
+		ID:         "bad-packed-snapshot",
+		CreatedAt:  time.Now().UTC(),
+		SourceType: "agent",
+		Packs: []repository.PackManifest{{
+			ID:     "pack-1",
+			Format: repository.PackFormatTBKPack1,
+			Chunks: []repository.ChunkRef{{Hash: packRef.Hash, OriginalSize: packRef.OriginalSize}},
+		}},
+		Entries: []repository.FileEntry{{
+			Path: "a.txt",
+			Type: repository.EntryTypePackedFile,
+			Size: int64(len("alpha")),
+			Pack: &repository.PackFileRef{ID: "pack-1", Offset: indexes[0].Offset, Length: indexes[0].Length + 1},
+		}},
+	}
+	err = api.canonicalizeManifestChunks(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "range does not match") {
+		t.Fatalf("canonicalize invalid packed range error = %v", err)
 	}
 }
 
@@ -2242,10 +2582,17 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 			ChunkGeneration int64  `json:"chunk_generation"`
 		} `json:"repository"`
 		Agent struct {
-			PollIntervalSeconds      int64 `json:"poll_interval_seconds"`
-			CommandGeneration        int64 `json:"command_generation"`
-			MaxChunkUploadBatchBytes int64 `json:"max_chunk_upload_batch_bytes"`
-			ChunkBatchUpload         bool  `json:"chunk_batch_upload"`
+			PollIntervalSeconds        int64 `json:"poll_interval_seconds"`
+			CommandGeneration          int64 `json:"command_generation"`
+			MaxChunkUploadBatchBytes   int64 `json:"max_chunk_upload_batch_bytes"`
+			MaxChunkResponseBytes      int64 `json:"max_chunk_response_bytes"`
+			ChunkBatchUpload           bool  `json:"chunk_batch_upload"`
+			CompactChunkCheckResponse  bool  `json:"compact_chunk_check_response"`
+			CompactChunkUploadResponse bool  `json:"compact_chunk_upload_response"`
+			SmallFilePack              bool  `json:"small_file_pack"`
+			SmallFilePackEnabled       bool  `json:"small_file_pack_enabled"`
+			SmallFilePackMaxFileSize   int64 `json:"small_file_pack_max_file_size"`
+			SmallFilePackTargetSize    int64 `json:"small_file_pack_target_size"`
 		} `json:"agent"`
 		Commands []struct {
 			ID     int64  `json:"id"`
@@ -2260,8 +2607,14 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	if heartbeat.Repository.ID == "" || heartbeat.Agent.PollIntervalSeconds != 600 {
 		t.Fatalf("heartbeat missing repository/poll state: %+v", heartbeat)
 	}
-	if !heartbeat.Agent.ChunkBatchUpload || heartbeat.Agent.MaxChunkUploadBatchBytes != 64*1024*1024 {
+	if !heartbeat.Agent.ChunkBatchUpload || heartbeat.Agent.MaxChunkUploadBatchBytes != 64*1024*1024 || heartbeat.Agent.MaxChunkResponseBytes != 64*1024*1024 {
 		t.Fatalf("heartbeat missing chunk batch upload capability: %+v", heartbeat.Agent)
+	}
+	if !heartbeat.Agent.CompactChunkCheckResponse || !heartbeat.Agent.CompactChunkUploadResponse {
+		t.Fatalf("heartbeat missing compact chunk response capabilities: %+v", heartbeat.Agent)
+	}
+	if !heartbeat.Agent.SmallFilePack || heartbeat.Agent.SmallFilePackEnabled || heartbeat.Agent.SmallFilePackMaxFileSize != 64*1024 || heartbeat.Agent.SmallFilePackTargetSize != 8*1024*1024 {
+		t.Fatalf("heartbeat missing small-file pack capabilities: %+v", heartbeat.Agent)
 	}
 	if len(heartbeat.Commands) != 1 || heartbeat.Commands[0].Type != "run-backup" || heartbeat.Commands[0].JobID != job.ID {
 		t.Fatalf("unexpected heartbeat commands: %+v", heartbeat.Commands)

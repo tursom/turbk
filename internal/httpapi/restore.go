@@ -107,7 +107,7 @@ func (s *Server) handleSnapshotDownload(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", entry.Size))
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": safeDownloadName(entryPath, "file")}))
-	if err := s.writeFileEntry(r.Context(), w, entry); err != nil {
+	if err := s.writeFileEntry(r.Context(), w, manifest, entry); err != nil {
 		s.logger.Error("write snapshot file", "snapshot", manifest.ID, "path", entryPath, "error", err)
 	}
 }
@@ -267,10 +267,14 @@ func treeEntryFromManifest(entry repository.FileEntry, name string, synthetic bo
 	if entry.Path == "." {
 		name = "."
 	}
+	entryType := entry.Type
+	if entryType == repository.EntryTypePackedFile {
+		entryType = repository.EntryTypeFile
+	}
 	return snapshotTreeEntry{
 		Path:       entry.Path,
 		Name:       name,
-		Type:       entry.Type,
+		Type:       entryType,
 		Size:       entry.Size,
 		Mode:       entry.Mode,
 		ModTime:    entry.ModTime,
@@ -316,14 +320,14 @@ func (s *Server) writeDirectoryTarGz(ctx context.Context, dst io.Writer, manifes
 				continue
 			}
 		}
-		if err := s.writeTarEntry(ctx, tw, entry); err != nil {
+		if err := s.writeTarEntry(ctx, tw, manifest, entry); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Server) writeTarEntry(ctx context.Context, tw *tar.Writer, entry repository.FileEntry) error {
+func (s *Server) writeTarEntry(ctx context.Context, tw *tar.Writer, manifest *repository.SnapshotManifest, entry repository.FileEntry) error {
 	name := entry.Path
 	if name == "." {
 		name = "snapshot"
@@ -344,7 +348,7 @@ func (s *Server) writeTarEntry(ctx context.Context, tw *tar.Writer, entry reposi
 		header.Typeflag = tar.TypeSymlink
 		header.Size = 0
 		header.Linkname = entry.LinkTarget
-	case repository.EntryTypeFile:
+	case repository.EntryTypeFile, repository.EntryTypePackedFile:
 		header.Typeflag = tar.TypeReg
 	default:
 		return fmt.Errorf("unsupported manifest entry type %q", entry.Type)
@@ -352,31 +356,44 @@ func (s *Server) writeTarEntry(ctx context.Context, tw *tar.Writer, entry reposi
 	if err := tw.WriteHeader(header); err != nil {
 		return err
 	}
-	if entry.Type != repository.EntryTypeFile {
+	if entry.Type != repository.EntryTypeFile && entry.Type != repository.EntryTypePackedFile {
 		return nil
 	}
-	return s.writeFileEntry(ctx, tw, entry)
+	return s.writeFileEntry(ctx, tw, manifest, entry)
 }
 
-func (s *Server) writeFileEntry(ctx context.Context, dst io.Writer, entry repository.FileEntry) error {
-	for _, ref := range entry.Chunks {
-		if err := ctx.Err(); err != nil {
-			return err
+func (s *Server) writeFileEntry(ctx context.Context, dst io.Writer, manifest *repository.SnapshotManifest, entry repository.FileEntry) error {
+	switch entry.Type {
+	case repository.EntryTypeFile:
+		for _, ref := range entry.Chunks {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			data, err := s.repo.ReadChunkRef(ctx, ref)
+			if err != nil {
+				return err
+			}
+			if _, err := dst.Write(data); err != nil {
+				return err
+			}
 		}
-		data, err := s.repo.ReadChunkRef(ctx, ref)
+	case repository.EntryTypePackedFile:
+		data, err := s.repo.ReadPackedFile(ctx, manifest, entry)
 		if err != nil {
 			return err
 		}
 		if _, err := dst.Write(data); err != nil {
 			return err
 		}
+	default:
+		return fmt.Errorf("unsupported manifest entry type %q", entry.Type)
 	}
 	return nil
 }
 
 func (s *Server) restoreEntry(ctx context.Context, manifest *repository.SnapshotManifest, entry repository.FileEntry, entryPath, targetPath, restoreRoot string) error {
 	if entry.Type != repository.EntryTypeDir {
-		return s.restoreSingleEntry(ctx, entry, targetPath, restoreRoot)
+		return s.restoreSingleEntry(ctx, manifest, entry, targetPath, restoreRoot)
 	}
 	for _, current := range manifest.Entries {
 		if current.Path != entryPath {
@@ -389,14 +406,14 @@ func (s *Server) restoreEntry(ctx context.Context, manifest *repository.Snapshot
 		if rel != "" {
 			target = filepath.Join(targetPath, filepath.FromSlash(rel))
 		}
-		if err := s.restoreSingleEntry(ctx, current, target, restoreRoot); err != nil {
+		if err := s.restoreSingleEntry(ctx, manifest, current, target, restoreRoot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Server) restoreSingleEntry(ctx context.Context, entry repository.FileEntry, targetPath, restoreRoot string) error {
+func (s *Server) restoreSingleEntry(ctx context.Context, manifest *repository.SnapshotManifest, entry repository.FileEntry, targetPath, restoreRoot string) error {
 	if err := ensureRestoreParentSafe(restoreRoot, targetPath); err != nil {
 		return err
 	}
@@ -415,7 +432,7 @@ func (s *Server) restoreSingleEntry(ctx context.Context, entry repository.FileEn
 			return fmt.Errorf("create restore symlink %q: %w", targetPath, err)
 		}
 		return nil
-	case repository.EntryTypeFile:
+	case repository.EntryTypeFile, repository.EntryTypePackedFile:
 		if err := ensureRestoreTargetNotDir(targetPath); err != nil {
 			return err
 		}
@@ -424,7 +441,7 @@ func (s *Server) restoreSingleEntry(ctx context.Context, entry repository.FileEn
 		if err != nil {
 			return fmt.Errorf("create restore file %q: %w", targetPath, err)
 		}
-		if err := s.writeFileEntry(ctx, file, entry); err != nil {
+		if err := s.writeFileEntry(ctx, file, manifest, entry); err != nil {
 			_ = file.Close()
 			return fmt.Errorf("write restore file %q: %w", targetPath, err)
 		}

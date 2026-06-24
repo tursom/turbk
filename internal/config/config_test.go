@@ -79,6 +79,10 @@ func TestEnvOverridesRepositoryConfig(t *testing.T) {
 	t.Setenv("TURBK_COMPRESSION", "none")
 	t.Setenv("TURBK_ENCRYPTION", "none")
 	t.Setenv("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", "32MiB")
+	t.Setenv("TURBK_AGENT_MAX_CHUNK_RESPONSE_BYTES", "16MiB")
+	t.Setenv("TURBK_AGENT_SMALL_FILE_PACK_ENABLED", "true")
+	t.Setenv("TURBK_AGENT_SMALL_FILE_PACK_MAX_FILE_SIZE", "128KiB")
+	t.Setenv("TURBK_AGENT_SMALL_FILE_PACK_TARGET_SIZE", "16MiB")
 
 	cfg, err := Load("../../configs/turbk.example.yaml")
 	if err != nil {
@@ -88,7 +92,11 @@ func TestEnvOverridesRepositoryConfig(t *testing.T) {
 		cfg.Repository.ChunkAvgSize != "2MiB" ||
 		cfg.Repository.Compression != "none" ||
 		cfg.Repository.Encryption != "none" ||
-		cfg.Agent.MaxChunkUploadBatchBytes != "32MiB" {
+		cfg.Agent.MaxChunkUploadBatchBytes != "32MiB" ||
+		cfg.Agent.MaxChunkResponseBytes != "16MiB" ||
+		!cfg.Agent.SmallFilePackEnabled ||
+		cfg.Agent.SmallFilePackMaxFileSize != "128KiB" ||
+		cfg.Agent.SmallFilePackTargetSize != "16MiB" {
 		t.Fatalf("env overrides were not applied: repository=%+v agent=%+v", cfg.Repository, cfg.Agent)
 	}
 }

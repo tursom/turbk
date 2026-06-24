@@ -15,30 +15,45 @@ import (
 type EntryType string
 
 const (
-	EntryTypeFile    EntryType = "file"
-	EntryTypeDir     EntryType = "dir"
-	EntryTypeSymlink EntryType = "symlink"
+	EntryTypeFile       EntryType = "file"
+	EntryTypePackedFile EntryType = "packed_file"
+	EntryTypeDir        EntryType = "dir"
+	EntryTypeSymlink    EntryType = "symlink"
 )
 
 type SnapshotManifest struct {
-	ID          string      `json:"id"`
-	CreatedAt   time.Time   `json:"created_at"`
-	SourceType  string      `json:"source_type"`
-	SourceRoot  string      `json:"source_root"`
-	SourceRoots []string    `json:"source_roots,omitempty"`
-	Entries     []FileEntry `json:"entries"`
+	ID          string         `json:"id"`
+	CreatedAt   time.Time      `json:"created_at"`
+	SourceType  string         `json:"source_type"`
+	SourceRoot  string         `json:"source_root"`
+	SourceRoots []string       `json:"source_roots,omitempty"`
+	Packs       []PackManifest `json:"packs,omitempty"`
+	Entries     []FileEntry    `json:"entries"`
 }
 
 type FileEntry struct {
-	Path       string     `json:"path"`
-	Type       EntryType  `json:"type"`
-	Size       int64      `json:"size"`
-	Mode       uint32     `json:"mode"`
-	UID        int        `json:"uid"`
-	GID        int        `json:"gid"`
-	ModTime    time.Time  `json:"mod_time"`
-	LinkTarget string     `json:"link_target,omitempty"`
-	Chunks     []ChunkRef `json:"chunks,omitempty"`
+	Path       string       `json:"path"`
+	Type       EntryType    `json:"type"`
+	Size       int64        `json:"size"`
+	Mode       uint32       `json:"mode"`
+	UID        int          `json:"uid"`
+	GID        int          `json:"gid"`
+	ModTime    time.Time    `json:"mod_time"`
+	LinkTarget string       `json:"link_target,omitempty"`
+	Chunks     []ChunkRef   `json:"chunks,omitempty"`
+	Pack       *PackFileRef `json:"pack,omitempty"`
+}
+
+type PackManifest struct {
+	ID     string     `json:"id"`
+	Format string     `json:"format"`
+	Chunks []ChunkRef `json:"chunks"`
+}
+
+type PackFileRef struct {
+	ID     string `json:"id"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
 }
 
 func (r *Repository) WriteManifest(manifest *SnapshotManifest) error {

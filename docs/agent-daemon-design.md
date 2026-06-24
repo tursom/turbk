@@ -8,6 +8,7 @@
 
 - [Agent Chunk 批量接口设计](agent-batch-chunk-api-design.md)
 - [Agent Pebble Catalog 写入优化设计](agent-pebble-catalog-design.md)
+- [Agent 小文件备份优化设计](agent-small-file-optimization-design.md)
 
 ## 1. 背景
 

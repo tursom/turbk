@@ -312,12 +312,25 @@ func (r *Repository) RestoreFile(ctx context.Context, snapshotID, manifestEntryP
 	if err != nil {
 		return fmt.Errorf("create restore target: %w", err)
 	}
-	for _, ref := range entry.Chunks {
-		if err := ctx.Err(); err != nil {
-			_ = file.Close()
-			return err
+	switch entry.Type {
+	case EntryTypeFile:
+		for _, ref := range entry.Chunks {
+			if err := ctx.Err(); err != nil {
+				_ = file.Close()
+				return err
+			}
+			data, err := r.ReadChunkRef(ctx, ref)
+			if err != nil {
+				_ = file.Close()
+				return err
+			}
+			if _, err := file.Write(data); err != nil {
+				_ = file.Close()
+				return fmt.Errorf("write restore target: %w", err)
+			}
 		}
-		data, err := r.ReadChunkRef(ctx, ref)
+	case EntryTypePackedFile:
+		data, err := r.ReadPackedFile(ctx, manifest, entry)
 		if err != nil {
 			_ = file.Close()
 			return err
@@ -326,6 +339,9 @@ func (r *Repository) RestoreFile(ctx context.Context, snapshotID, manifestEntryP
 			_ = file.Close()
 			return fmt.Errorf("write restore target: %w", err)
 		}
+	default:
+		_ = file.Close()
+		return fmt.Errorf("unsupported manifest entry type %q", entry.Type)
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close restore target: %w", err)

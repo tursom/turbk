@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -68,7 +69,7 @@ func New(cfg config.Config, store *state.Store, repo *repository.Repository, log
 }
 
 func (s *Server) Handler() http.Handler {
-	return withAccessLog(s.logger, s.withManagementAuth(s.mux))
+	return withAccessLog(s.logger, gzipJSONResponses(s.withManagementAuth(s.mux)))
 }
 
 func (s *Server) routes() {
@@ -822,17 +823,19 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Hostname          string `json:"hostname"`
-		Version           string `json:"version"`
-		Mode              string `json:"mode"`
-		StateDir          string `json:"state_dir"`
-		CatalogStatus     string `json:"catalog_status"`
-		RepositoryID      string `json:"repository_id"`
-		ChunkGeneration   int64  `json:"chunk_generation"`
-		ConfigGeneration  int64  `json:"config_generation"`
-		CommandGeneration int64  `json:"command_generation"`
-		RunningRunID      *int64 `json:"running_run_id"`
-		LastError         string `json:"last_error"`
+		Hostname                   string `json:"hostname"`
+		Version                    string `json:"version"`
+		Mode                       string `json:"mode"`
+		StateDir                   string `json:"state_dir"`
+		CatalogStatus              string `json:"catalog_status"`
+		RepositoryID               string `json:"repository_id"`
+		ChunkGeneration            int64  `json:"chunk_generation"`
+		ConfigGeneration           int64  `json:"config_generation"`
+		CommandGeneration          int64  `json:"command_generation"`
+		RunningRunID               *int64 `json:"running_run_id"`
+		LastError                  string `json:"last_error"`
+		CompactChunkCheckResponse  bool   `json:"compact_chunk_check_response"`
+		CompactChunkUploadResponse bool   `json:"compact_chunk_upload_response"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -899,14 +902,21 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			"invalidation_available_from": repositoryState.InvalidationAvailableFrom,
 		},
 		"agent": map[string]any{
-			"config_generation":            repositoryState.ConfigGeneration,
-			"command_generation":           repositoryState.CommandGeneration,
-			"poll_interval_seconds":        int64(pollInterval / time.Second),
-			"default_poll_interval":        s.cfg.Agent.DefaultPollInterval,
-			"max_chunk_check_batch":        s.cfg.Agent.MaxChunkCheckBatch,
-			"max_chunk_upload_batch_bytes": s.agentMaxChunkUploadBatchBytes(),
-			"chunk_batch_upload":           true,
-			"max_manifest_repair_attempts": 3,
+			"config_generation":             repositoryState.ConfigGeneration,
+			"command_generation":            repositoryState.CommandGeneration,
+			"poll_interval_seconds":         int64(pollInterval / time.Second),
+			"default_poll_interval":         s.cfg.Agent.DefaultPollInterval,
+			"max_chunk_check_batch":         s.cfg.Agent.MaxChunkCheckBatch,
+			"max_chunk_upload_batch_bytes":  s.agentMaxChunkUploadBatchBytes(),
+			"max_chunk_response_bytes":      s.agentMaxChunkResponseBytes(),
+			"chunk_batch_upload":            true,
+			"compact_chunk_check_response":  true,
+			"compact_chunk_upload_response": true,
+			"small_file_pack":               true,
+			"small_file_pack_enabled":       s.cfg.Agent.SmallFilePackEnabled,
+			"small_file_pack_max_file_size": s.agentSmallFilePackMaxFileSize(),
+			"small_file_pack_target_size":   s.agentSmallFilePackTargetSize(),
+			"max_manifest_repair_attempts":  3,
 		},
 		"maintenance": map[string]any{
 			"write_available": true,
@@ -1191,7 +1201,9 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 	for i, chunk := range chunks {
 		chunkData[i] = chunk.data
 	}
+	putStarted := time.Now()
 	results, err := s.repo.PutChunks(r.Context(), chunkData)
+	putDuration := time.Since(putStarted)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1200,6 +1212,7 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("chunk batch wrote %d results for %d chunks", len(results), len(chunks)))
 		return
 	}
+	compactResponse := requestBool(r, "compact_response")
 	responses := make([]map[string]any, 0, len(chunks))
 	for i, chunk := range chunks {
 		result := results[i]
@@ -1207,19 +1220,38 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("chunk batch ref hash mismatch: request=%s ref=%s", chunk.hash, result.Ref.Hash))
 			return
 		}
-		responses = append(responses, map[string]any{
-			"hash":     chunk.hash,
-			"exists":   true,
-			"uploaded": !result.Existed,
-			"ref":      result.Ref,
-		})
+		if compactResponse {
+			responses = append(responses, map[string]any{
+				"hash":          chunk.hash,
+				"uploaded":      !result.Existed,
+				"original_size": result.Ref.OriginalSize,
+			})
+		} else {
+			responses = append(responses, map[string]any{
+				"hash":     chunk.hash,
+				"exists":   true,
+				"uploaded": !result.Existed,
+				"ref":      result.Ref,
+			})
+		}
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
+	response := map[string]any{
 		"status":           "accepted",
 		"repository_id":    repositoryState.RepositoryID,
 		"chunk_generation": repositoryState.ChunkGeneration,
 		"chunks":           responses,
-	})
+	}
+	responseBytes := int64(0)
+	if data, err := json.Marshal(response); err == nil {
+		responseBytes = int64(len(data))
+	}
+	s.logger.Info("agent batch chunk upload",
+		"chunks", len(chunks),
+		"request_bytes", r.ContentLength,
+		"response_bytes", responseBytes,
+		"repo_put_duration", putDuration.String(),
+	)
+	writeJSON(w, http.StatusAccepted, response)
 }
 
 func (s *Server) handleAgentChunkInvalidations(w http.ResponseWriter, r *http.Request) {
@@ -1261,6 +1293,7 @@ func (s *Server) handleAgentCheckChunks(w http.ResponseWriter, r *http.Request) 
 		RepositoryID        string   `json:"repository_id"`
 		BaseChunkGeneration int64    `json:"base_chunk_generation"`
 		Hashes              []string `json:"hashes"`
+		CompactResponse     bool     `json:"compact_response"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -1303,12 +1336,15 @@ func (s *Server) handleAgentCheckChunks(w http.ResponseWriter, r *http.Request) 
 			missing = append(missing, hash)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"repository_id":    repositoryState.RepositoryID,
 		"chunk_generation": repositoryState.ChunkGeneration,
-		"exists":           exists,
 		"missing":          missing,
-	})
+	}
+	if !req.CompactResponse {
+		resp["exists"] = exists
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAgentCommandAck(w http.ResponseWriter, r *http.Request) {
@@ -1404,6 +1440,7 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	canonicalizeStarted := time.Now()
 	if err := s.canonicalizeManifestChunks(r.Context(), &manifest); err != nil {
 		var missingErr *missingManifestChunksError
 		if errors.As(err, &missingErr) {
@@ -1427,6 +1464,11 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 		_ = s.store.FinishAgentCommandForRun(r.Context(), agent.HostID, run.ID, "failed", err.Error(), time.Now().UTC())
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	canonicalizeDuration := time.Since(canonicalizeStarted)
+	manifestBytes := int64(0)
+	if data, err := json.Marshal(manifest); err == nil {
+		manifestBytes = int64(len(data))
 	}
 	if err := s.repo.WriteManifest(&manifest); err != nil {
 		_ = s.store.AppendRunLog(r.Context(), run.ID, "error", err.Error())
@@ -1452,6 +1494,13 @@ func (s *Server) handleAgentPostManifest(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.logger.Info("agent manifest accepted",
+		"run", run.ID,
+		"entries", len(manifest.Entries),
+		"packs", len(manifest.Packs),
+		"manifest_bytes", manifestBytes,
+		"canonicalize_duration", canonicalizeDuration.String(),
+	)
 	_ = s.store.AppendRunLog(r.Context(), run.ID, "info", fmt.Sprintf("agent snapshot %s published", manifest.ID))
 	existingProgress, _, _ := s.store.GetRunProgress(r.Context(), run.ID)
 	_, _ = s.store.UpdateRunProgress(r.Context(), state.UpdateRunProgressInput{
@@ -1768,6 +1817,67 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 		return errors.New("manifest entries are required")
 	}
 	missingByHash := make(map[string]map[string]struct{})
+	addMissing := func(hash, path string) {
+		paths := missingByHash[hash]
+		if paths == nil {
+			paths = make(map[string]struct{})
+			missingByHash[hash] = paths
+		}
+		paths[path] = struct{}{}
+	}
+	packIndexes := make(map[string]map[string]repository.PackFileIndex, len(manifest.Packs))
+	seenPacks := make(map[string]struct{}, len(manifest.Packs))
+	for packIndex := range manifest.Packs {
+		pack := &manifest.Packs[packIndex]
+		if strings.TrimSpace(pack.ID) == "" {
+			return fmt.Errorf("manifest pack %d has empty id", packIndex)
+		}
+		if _, ok := seenPacks[pack.ID]; ok {
+			return fmt.Errorf("manifest pack %q is duplicated", pack.ID)
+		}
+		seenPacks[pack.ID] = struct{}{}
+		if pack.Format != repository.PackFormatTBKPack1 {
+			return fmt.Errorf("manifest pack %q has unsupported format %q", pack.ID, pack.Format)
+		}
+		if len(pack.Chunks) == 0 {
+			return fmt.Errorf("manifest pack %q has no chunks", pack.ID)
+		}
+		for chunkIndex := range pack.Chunks {
+			hash := pack.Chunks[chunkIndex].Hash
+			if err := validateChunkHash(hash); err != nil {
+				return fmt.Errorf("pack %q chunk %d: %w", pack.ID, chunkIndex, err)
+			}
+			ref, exists, err := s.repo.GetChunkRef(ctx, hash)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				addMissing(hash, "pack:"+pack.ID)
+				continue
+			}
+			pack.Chunks[chunkIndex] = ref
+		}
+	}
+	if len(missingByHash) == 0 {
+		for _, pack := range manifest.Packs {
+			data, err := s.repo.ReadPackData(ctx, pack)
+			if err != nil {
+				return fmt.Errorf("read pack %q: %w", pack.ID, err)
+			}
+			indexes, err := repository.DecodePackIndex(data)
+			if err != nil {
+				return fmt.Errorf("decode pack %q: %w", pack.ID, err)
+			}
+			byPath := make(map[string]repository.PackFileIndex, len(indexes))
+			for _, index := range indexes {
+				if _, ok := byPath[index.Path]; ok {
+					return fmt.Errorf("pack %q contains duplicate file %q", pack.ID, index.Path)
+				}
+				byPath[index.Path] = index
+			}
+			packIndexes[pack.ID] = byPath
+		}
+	}
 	for entryIndex := range manifest.Entries {
 		entry := &manifest.Entries[entryIndex]
 		switch entry.Type {
@@ -1789,12 +1899,7 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 					return err
 				}
 				if !exists {
-					paths := missingByHash[hash]
-					if paths == nil {
-						paths = make(map[string]struct{})
-						missingByHash[hash] = paths
-					}
-					paths[entry.Path] = struct{}{}
+					addMissing(hash, entry.Path)
 					entryMissing = true
 					continue
 				}
@@ -1806,6 +1911,32 @@ func (s *Server) canonicalizeManifestChunks(ctx context.Context, manifest *repos
 			}
 			if chunkTotal != entry.Size {
 				return fmt.Errorf("file %q size %d does not match chunk bytes %d", entry.Path, entry.Size, chunkTotal)
+			}
+		case repository.EntryTypePackedFile:
+			if entry.Size <= 0 {
+				return fmt.Errorf("packed file %q must be non-empty", entry.Path)
+			}
+			if len(entry.Chunks) != 0 {
+				return fmt.Errorf("packed file %q must not contain direct chunks", entry.Path)
+			}
+			if entry.Pack == nil {
+				return fmt.Errorf("packed file %q has no pack reference", entry.Path)
+			}
+			if _, ok := manifest.FindPack(entry.Pack.ID); !ok {
+				return fmt.Errorf("packed file %q references missing pack %q", entry.Path, entry.Pack.ID)
+			}
+			if len(missingByHash) > 0 {
+				continue
+			}
+			index, ok := packIndexes[entry.Pack.ID][entry.Path]
+			if !ok {
+				return fmt.Errorf("packed file %q not found in pack %q", entry.Path, entry.Pack.ID)
+			}
+			if index.Offset != entry.Pack.Offset || index.Length != entry.Pack.Length {
+				return fmt.Errorf("packed file %q range does not match pack %q index", entry.Path, entry.Pack.ID)
+			}
+			if index.OriginalSize != entry.Size || entry.Pack.Length != entry.Size {
+				return fmt.Errorf("packed file %q size %d does not match pack bytes %d", entry.Path, entry.Size, index.OriginalSize)
 			}
 		default:
 			return fmt.Errorf("manifest entry %q has unsupported type %q", entry.Path, entry.Type)
@@ -2289,7 +2420,7 @@ func agentCommandResponse(command state.AgentCommand) map[string]any {
 
 func manifestTotals(manifest *repository.SnapshotManifest) (fileCount int64, totalSize int64) {
 	for _, entry := range manifest.Entries {
-		if entry.Type != repository.EntryTypeFile {
+		if entry.Type != repository.EntryTypeFile && entry.Type != repository.EntryTypePackedFile {
 			continue
 		}
 		fileCount++
@@ -2399,6 +2530,43 @@ func (s *Server) agentMaxChunkUploadBatchBytes() int64 {
 	return maxBytes
 }
 
+func (s *Server) agentMaxChunkResponseBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkResponseBytes)
+	if err != nil || maxBytes <= 0 {
+		return 64 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentSmallFilePackMaxFileSize() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.SmallFilePackMaxFileSize)
+	if err != nil || maxBytes <= 0 {
+		return 64 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentSmallFilePackTargetSize() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.SmallFilePackTargetSize)
+	if err != nil || maxBytes <= 0 {
+		return 8 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func requestBool(r *http.Request, name string) bool {
+	value := strings.TrimSpace(r.URL.Query().Get(name))
+	if value == "" {
+		value = strings.TrimSpace(r.Header.Get("X-Turbk-" + strings.ReplaceAll(name, "_", "-")))
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func readAgentChunkBatch(w http.ResponseWriter, r *http.Request, maxBodyBytes int64, maxChunks int) ([]agentUploadChunk, error) {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = 64 * 1024 * 1024
@@ -2496,6 +2664,55 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gzip   *gzip.Writer
+	status int
+	wrote  bool
+}
+
+func (w *gzipResponseWriter) WriteHeader(status int) {
+	if w.wrote {
+		return
+	}
+	w.status = status
+	w.wrote = true
+	contentType := w.Header().Get("Content-Type")
+	if status >= 200 && status < 300 && strings.HasPrefix(contentType, "application/json") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.Header().Del("Content-Length")
+		w.gzip = gzip.NewWriter(w.ResponseWriter)
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *gzipResponseWriter) Write(data []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.gzip != nil {
+		return w.gzip.Write(data)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func gzipJSONResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(strings.ToLower(r.Header.Get("Accept-Encoding")), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gz := &gzipResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			if gz.gzip != nil {
+				_ = gz.gzip.Close()
+			}
+		}()
+		next.ServeHTTP(gz, r)
+	})
 }
 
 func withAccessLog(logger *slog.Logger, next http.Handler) http.Handler {

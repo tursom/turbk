@@ -363,18 +363,13 @@ func (s *Server) compactRepository(ctx context.Context, snapshots []state.Snapsh
 			return compactReport{}, fmt.Errorf("read active snapshot %d manifest %q before compact: %w", snapshot.ID, snapshot.ManifestRef, err)
 		}
 		manifests = append(manifests, compactManifest{snapshot: snapshot, manifest: manifest})
-		for _, entry := range manifest.Entries {
-			if entry.Type != repository.EntryTypeFile {
+		for _, ref := range manifestChunkRefs(manifest) {
+			if ref.Hash == "" {
 				continue
 			}
-			for _, ref := range entry.Chunks {
-				if ref.Hash == "" {
-					continue
-				}
-				keepHashes[ref.Hash] = struct{}{}
-				if _, exists := refsByHash[ref.Hash]; !exists {
-					refsByHash[ref.Hash] = ref
-				}
+			keepHashes[ref.Hash] = struct{}{}
+			if _, exists := refsByHash[ref.Hash]; !exists {
+				refsByHash[ref.Hash] = ref
 			}
 		}
 	}
@@ -414,6 +409,20 @@ func (s *Server) compactRepository(ctx context.Context, snapshots []state.Snapsh
 				}
 				if !sameChunkRefLocation(oldRef, newRef) {
 					entry.Chunks[chunkIndex] = newRef
+					changed = true
+				}
+			}
+		}
+		for packIndex := range item.manifest.Packs {
+			pack := &item.manifest.Packs[packIndex]
+			for chunkIndex := range pack.Chunks {
+				oldRef := pack.Chunks[chunkIndex]
+				newRef, ok := newRefs[oldRef.Hash]
+				if !ok {
+					continue
+				}
+				if !sameChunkRefLocation(oldRef, newRef) {
+					pack.Chunks[chunkIndex] = newRef
 					changed = true
 				}
 			}
@@ -479,55 +488,88 @@ func (s *Server) verifyReferencedChunks(ctx context.Context, snapshots []state.S
 			_ = s.store.UpdateSnapshotHealth(ctx, snapshot.ID, "corrupt", strings.Join(snapshotErrors, "; "), time.Now().UTC())
 			continue
 		}
+		verifyRef := func(label string, manifestRef repository.ChunkRef) bool {
+			if manifestRef.Hash == "" {
+				report.CorruptChunks++
+				addSnapshotError("snapshot %d %s references an empty chunk hash", snapshot.ID, label)
+				return false
+			}
+			if _, ok := seen[manifestRef.Hash]; ok {
+				if message := hashErrors[manifestRef.Hash]; message != "" {
+					addSnapshotError("snapshot %d %s references corrupt chunk %s: %s", snapshot.ID, label, manifestRef.Hash, message)
+					return false
+				}
+				return true
+			}
+			seen[manifestRef.Hash] = struct{}{}
+			indexRef, exists, err := s.repo.GetChunkRef(ctx, manifestRef.Hash)
+			if err != nil {
+				report.CorruptChunks++
+				message := fmt.Sprintf("chunk %s index read failed: %v", manifestRef.Hash, err)
+				hashErrors[manifestRef.Hash] = message
+				addSnapshotError("%s", message)
+				return false
+			}
+			if !exists {
+				report.MissingIndex++
+				message := fmt.Sprintf("chunk %s missing from index", manifestRef.Hash)
+				hashErrors[manifestRef.Hash] = message
+				addSnapshotError("%s", message)
+				return false
+			}
+			if !sameChunkRefLocation(manifestRef, indexRef) {
+				report.CorruptChunks++
+				message := fmt.Sprintf("chunk %s manifest ref does not match index ref", manifestRef.Hash)
+				hashErrors[manifestRef.Hash] = message
+				addSnapshotError("%s", message)
+				return false
+			}
+			if _, err := s.repo.ReadChunkRef(ctx, indexRef); err != nil {
+				report.CorruptChunks++
+				message := fmt.Sprintf("chunk %s read failed: %v", manifestRef.Hash, err)
+				hashErrors[manifestRef.Hash] = message
+				addSnapshotError("%s", message)
+				return false
+			}
+			report.VerifiedChunks++
+			return true
+		}
+		for _, pack := range manifest.Packs {
+			for _, manifestRef := range pack.Chunks {
+				verifyRef(fmt.Sprintf("pack %q", pack.ID), manifestRef)
+			}
+			data, err := s.repo.ReadPackData(ctx, pack)
+			if err != nil {
+				report.CorruptChunks++
+				addSnapshotError("snapshot %d pack %q read failed: %v", snapshot.ID, pack.ID, err)
+				continue
+			}
+			if _, err := repository.DecodePackIndex(data); err != nil {
+				report.CorruptChunks++
+				addSnapshotError("snapshot %d pack %q decode failed: %v", snapshot.ID, pack.ID, err)
+			}
+		}
 		for _, entry := range manifest.Entries {
+			if entry.Type == repository.EntryTypePackedFile {
+				data, err := s.repo.ReadPackedFile(ctx, manifest, entry)
+				if err != nil {
+					report.CorruptChunks++
+					addSnapshotError("snapshot %d packed file %q read failed: %v", snapshot.ID, entry.Path, err)
+					continue
+				}
+				if int64(len(data)) != entry.Size {
+					report.CorruptChunks++
+					addSnapshotError("snapshot %d packed file %q size %d does not match bytes %d", snapshot.ID, entry.Path, entry.Size, len(data))
+				}
+				continue
+			}
 			if entry.Type != repository.EntryTypeFile {
 				continue
 			}
 			var chunkBytes int64
 			for _, manifestRef := range entry.Chunks {
-				if manifestRef.Hash == "" {
-					report.CorruptChunks++
-					addSnapshotError("snapshot %d file %q references an empty chunk hash", snapshot.ID, entry.Path)
-					continue
-				}
 				chunkBytes += manifestRef.OriginalSize
-				if _, ok := seen[manifestRef.Hash]; ok {
-					if message := hashErrors[manifestRef.Hash]; message != "" {
-						addSnapshotError("snapshot %d file %q references corrupt chunk %s: %s", snapshot.ID, entry.Path, manifestRef.Hash, message)
-					}
-					continue
-				}
-				seen[manifestRef.Hash] = struct{}{}
-				indexRef, exists, err := s.repo.GetChunkRef(ctx, manifestRef.Hash)
-				if err != nil {
-					report.CorruptChunks++
-					message := fmt.Sprintf("chunk %s index read failed: %v", manifestRef.Hash, err)
-					hashErrors[manifestRef.Hash] = message
-					addSnapshotError("%s", message)
-					continue
-				}
-				if !exists {
-					report.MissingIndex++
-					message := fmt.Sprintf("chunk %s missing from index", manifestRef.Hash)
-					hashErrors[manifestRef.Hash] = message
-					addSnapshotError("%s", message)
-					continue
-				}
-				if !sameChunkRefLocation(manifestRef, indexRef) {
-					report.CorruptChunks++
-					message := fmt.Sprintf("chunk %s manifest ref does not match index ref", manifestRef.Hash)
-					hashErrors[manifestRef.Hash] = message
-					addSnapshotError("%s", message)
-					continue
-				}
-				if _, err := s.repo.ReadChunkRef(ctx, indexRef); err != nil {
-					report.CorruptChunks++
-					message := fmt.Sprintf("chunk %s read failed: %v", manifestRef.Hash, err)
-					hashErrors[manifestRef.Hash] = message
-					addSnapshotError("%s", message)
-					continue
-				}
-				report.VerifiedChunks++
+				verifyRef(fmt.Sprintf("file %q", entry.Path), manifestRef)
 			}
 			if chunkBytes != entry.Size {
 				report.CorruptChunks++
@@ -557,6 +599,23 @@ func sameChunkRefLocation(a, b repository.ChunkRef) bool {
 		a.CompressedSize == b.CompressedSize
 }
 
+func manifestChunkRefs(manifest *repository.SnapshotManifest) []repository.ChunkRef {
+	if manifest == nil {
+		return nil
+	}
+	var refs []repository.ChunkRef
+	for _, entry := range manifest.Entries {
+		if entry.Type != repository.EntryTypeFile {
+			continue
+		}
+		refs = append(refs, entry.Chunks...)
+	}
+	for _, pack := range manifest.Packs {
+		refs = append(refs, pack.Chunks...)
+	}
+	return refs
+}
+
 func (s *Server) referencedChunkStats(snapshots []state.Snapshot) (int64, int64, []string) {
 	_, _, stats, errors := s.snapshotLiveSets(snapshots)
 	return stats.Count, stats.CompressedBytes, errors
@@ -574,13 +633,11 @@ func (s *Server) snapshotLiveSets(snapshots []state.Snapshot) (map[string]struct
 			continue
 		}
 		manifestIDs[snapshot.ManifestRef] = struct{}{}
-		for _, entry := range manifest.Entries {
-			for _, chunk := range entry.Chunks {
-				if chunk.Hash != "" {
-					hashes[chunk.Hash] = struct{}{}
-					if _, ok := refs[chunk.Hash]; !ok {
-						refs[chunk.Hash] = chunk
-					}
+		for _, chunk := range manifestChunkRefs(manifest) {
+			if chunk.Hash != "" {
+				hashes[chunk.Hash] = struct{}{}
+				if _, ok := refs[chunk.Hash]; !ok {
+					refs[chunk.Hash] = chunk
 				}
 			}
 		}

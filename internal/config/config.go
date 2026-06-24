@@ -77,6 +77,10 @@ type AgentConfig struct {
 	DefaultPollInterval           string `json:"default_poll_interval" yaml:"default_poll_interval"`
 	MaxChunkCheckBatch            int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
 	MaxChunkUploadBatchBytes      string `json:"max_chunk_upload_batch_bytes" yaml:"max_chunk_upload_batch_bytes"`
+	MaxChunkResponseBytes         string `json:"max_chunk_response_bytes" yaml:"max_chunk_response_bytes"`
+	SmallFilePackEnabled          bool   `json:"small_file_pack_enabled" yaml:"small_file_pack_enabled"`
+	SmallFilePackMaxFileSize      string `json:"small_file_pack_max_file_size" yaml:"small_file_pack_max_file_size"`
+	SmallFilePackTargetSize       string `json:"small_file_pack_target_size" yaml:"small_file_pack_target_size"`
 	MaxInvalidationResponseHashes int    `json:"max_invalidation_response_hashes" yaml:"max_invalidation_response_hashes"`
 	InvalidationRetentionDays     int    `json:"invalidation_retention_days" yaml:"invalidation_retention_days"`
 }
@@ -130,6 +134,10 @@ func Default() Config {
 			DefaultPollInterval:           "10m",
 			MaxChunkCheckBatch:            10000,
 			MaxChunkUploadBatchBytes:      "64MiB",
+			MaxChunkResponseBytes:         "64MiB",
+			SmallFilePackEnabled:          false,
+			SmallFilePackMaxFileSize:      "64KiB",
+			SmallFilePackTargetSize:       "8MiB",
 			MaxInvalidationResponseHashes: 100000,
 			InvalidationRetentionDays:     30,
 		},
@@ -255,6 +263,30 @@ func (c *Config) Normalize() error {
 	} else if bytes <= 0 {
 		return errors.New("agent.max_chunk_upload_batch_bytes must be positive")
 	}
+	if strings.TrimSpace(c.Agent.MaxChunkResponseBytes) == "" {
+		c.Agent.MaxChunkResponseBytes = "64MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.MaxChunkResponseBytes); err != nil {
+		return fmt.Errorf("agent.max_chunk_response_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.max_chunk_response_bytes must be positive")
+	}
+	if strings.TrimSpace(c.Agent.SmallFilePackMaxFileSize) == "" {
+		c.Agent.SmallFilePackMaxFileSize = "64KiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.SmallFilePackMaxFileSize); err != nil {
+		return fmt.Errorf("agent.small_file_pack_max_file_size must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.small_file_pack_max_file_size must be positive")
+	}
+	if strings.TrimSpace(c.Agent.SmallFilePackTargetSize) == "" {
+		c.Agent.SmallFilePackTargetSize = "8MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.SmallFilePackTargetSize); err != nil {
+		return fmt.Errorf("agent.small_file_pack_target_size must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.small_file_pack_target_size must be positive")
+	}
 	if c.Agent.MaxInvalidationResponseHashes <= 0 {
 		c.Agent.MaxInvalidationResponseHashes = 100000
 	}
@@ -326,6 +358,10 @@ func applyEnv(c *Config) {
 	applyString("TURBK_AGENT_DEFAULT_POLL_INTERVAL", &c.Agent.DefaultPollInterval)
 	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_BATCH", &c.Agent.MaxChunkCheckBatch)
 	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", &c.Agent.MaxChunkUploadBatchBytes)
+	applyString("TURBK_AGENT_MAX_CHUNK_RESPONSE_BYTES", &c.Agent.MaxChunkResponseBytes)
+	applyBool("TURBK_AGENT_SMALL_FILE_PACK_ENABLED", &c.Agent.SmallFilePackEnabled)
+	applyString("TURBK_AGENT_SMALL_FILE_PACK_MAX_FILE_SIZE", &c.Agent.SmallFilePackMaxFileSize)
+	applyString("TURBK_AGENT_SMALL_FILE_PACK_TARGET_SIZE", &c.Agent.SmallFilePackTargetSize)
 	applyInt("TURBK_AGENT_MAX_INVALIDATION_RESPONSE_HASHES", &c.Agent.MaxInvalidationResponseHashes)
 	applyInt("TURBK_AGENT_INVALIDATION_RETENTION_DAYS", &c.Agent.InvalidationRetentionDays)
 }

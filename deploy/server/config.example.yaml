@@ -56,5 +56,9 @@ agent:
   default_poll_interval: "10m"
   max_chunk_check_batch: 10000
   max_chunk_upload_batch_bytes: "64MiB"
+  max_chunk_response_bytes: "64MiB"
+  small_file_pack_enabled: false
+  small_file_pack_max_file_size: "64KiB"
+  small_file_pack_target_size: "8MiB"
   max_invalidation_response_hashes: 100000
   invalidation_retention_days: 30
