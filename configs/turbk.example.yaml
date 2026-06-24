@@ -47,10 +47,27 @@ agent:
   max_chunk_check_batch: 10000
   max_chunk_upload_batch_bytes: "64MiB"
   max_chunk_response_bytes: "64MiB"
+  chunk_batch_max_retries: 5
+  chunk_batch_retry_initial_backoff: "500ms"
+  chunk_batch_retry_max_backoff: "30s"
+  chunk_batch_split_on_413: true
   chunk_pipeline_enabled: false
   max_chunk_check_inflight: 1
   max_chunk_upload_inflight: 1
   max_chunk_pipeline_bytes: "128MiB"
+  max_chunk_upload_inflight_per_agent: 2
+  max_chunk_upload_inflight_bytes_per_agent: "256MiB"
+  max_chunk_upload_inflight_bytes_global: "1GiB"
+  chunk_upload_retry_after: "2s"
+  repo_write_queue_enabled: false
+  repo_write_queue_max_requests: 64
+  repo_write_queue_max_bytes: "512MiB"
+  repo_write_coalesce_window: "5ms"
+  repo_write_coalesce_max_bytes: "128MiB"
+  repo_write_sub_batch_bytes: "64MiB"
+  scan_parallel_enabled: false
+  file_read_workers: 2
+  file_read_pipeline_bytes: "512MiB"
   small_file_pack_enabled: false
   small_file_pack_max_file_size: "64KiB"
   small_file_pack_target_size: "8MiB"

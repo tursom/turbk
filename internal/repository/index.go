@@ -47,6 +47,28 @@ func (i *chunkIndex) Get(hash string) (ChunkRef, bool, error) {
 	return ref, true, nil
 }
 
+func (i *chunkIndex) GetBatch(hashes []string) (map[string]ChunkRef, error) {
+	refs := make(map[string]ChunkRef, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if hash == "" {
+			continue
+		}
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		ref, ok, err := i.Get(hash)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			refs[hash] = ref
+		}
+	}
+	return refs, nil
+}
+
 func (i *chunkIndex) Put(ref ChunkRef) error {
 	return i.PutBatch([]ChunkRef{ref})
 }

@@ -12,8 +12,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -118,6 +121,209 @@ func TestScanAndUploadMultiRootManifestPaths(t *testing.T) {
 	}
 	if entry, ok := manifest.Find(secondFile); !ok || entry.Type != repository.EntryTypeFile {
 		t.Fatalf("second file entry missing or wrong: %+v ok=%v", entry, ok)
+	}
+}
+
+func TestScanAndUploadSkipsPathRemovedBeforeStat(t *testing.T) {
+	root := t.TempDir()
+	vanishedPath := filepath.Join(root, "vanished.txt")
+	if err := os.WriteFile(vanishedPath, []byte("removed during scan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalLstat := agentLstat
+	t.Cleanup(func() {
+		agentLstat = originalLstat
+	})
+	agentLstat = func(path string) (os.FileInfo, error) {
+		if path == vanishedPath {
+			return nil, &os.PathError{Op: "lstat", Path: path, Err: os.ErrNotExist}
+		}
+		return originalLstat(path)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if _, ok := manifest.Find("vanished.txt"); ok {
+		t.Fatal("vanished file was included in manifest")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadParallelSkipsPathRemovedBeforeRead(t *testing.T) {
+	root := t.TempDir()
+	vanishedPath := filepath.Join(root, "vanished.txt")
+	if err := os.WriteFile(vanishedPath, []byte("removed before read"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	agentOpen = func(path string) (*os.File, error) {
+		if path == vanishedPath {
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrNotExist}
+		}
+		return originalOpen(path)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{
+		ScanParallelEnabled: true,
+		FileReadWorkers:     1,
+	})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if _, ok := manifest.Find("vanished.txt"); ok {
+		t.Fatal("vanished file was included in manifest")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadSkipsPathDeniedBeforeRead(t *testing.T) {
+	root := t.TempDir()
+	deniedPath := filepath.Join(root, "denied.txt")
+	if err := os.WriteFile(deniedPath, []byte("permission denied during scan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	agentOpen = func(path string) (*os.File, error) {
+		if path == deniedPath {
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return originalOpen(path)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if _, ok := manifest.Find("denied.txt"); ok {
+		t.Fatal("permission-denied file was included in manifest")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadSkipsPathIOErrorBeforeStat(t *testing.T) {
+	root := t.TempDir()
+	brokenPath := filepath.Join(root, "broken.txt")
+	if err := os.WriteFile(brokenPath, []byte("io error during scan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalLstat := agentLstat
+	t.Cleanup(func() {
+		agentLstat = originalLstat
+	})
+	agentLstat = func(path string) (os.FileInfo, error) {
+		if path == brokenPath {
+			return nil, &os.PathError{Op: "lstat", Path: path, Err: syscall.EIO}
+		}
+		return originalLstat(path)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if _, ok := manifest.Find("broken.txt"); ok {
+		t.Fatal("IO-error file was included in manifest")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestAgentPathErrorSkipEventRootPolicy(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "source")
+	if _, skip := agentPathErrorSkipEvent(root, root, os.ErrNotExist); skip {
+		t.Fatal("missing root should not be skipped")
+	}
+	if event, skip := agentPathErrorSkipEvent(root, root, os.ErrPermission); !skip || event.Reason != "permission denied during scan" {
+		t.Fatalf("root permission error skip = %v event=%+v, want permission skip", skip, event)
+	}
+	if event, skip := agentPathErrorSkipEvent(root, root, syscall.EIO); !skip || event.Reason != "filesystem IO error during scan" {
+		t.Fatalf("root IO error skip = %v event=%+v, want IO skip", skip, event)
+	}
+}
+
+func TestScanAndUploadReturnsErrorWhenRootMissing(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{}); !os.IsNotExist(err) {
+		t.Fatalf("scanAndUpload() error = %v, want not-exist error", err)
 	}
 }
 
@@ -298,6 +504,306 @@ func TestScanAndUploadBatchesChunkCheckAndUpload(t *testing.T) {
 		entry, ok := manifest.Find(name)
 		if !ok || len(entry.Chunks) != 1 || entry.Chunks[0].Hash == "" {
 			t.Fatalf("rebuild manifest file %s missing chunk: %+v ok=%v", name, entry, ok)
+		}
+	}
+}
+
+func TestScanAndUploadRetriesBatchUpload500(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "retry.txt"), []byte("retry batch upload payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/runs/1/progress":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/check":
+			var req struct {
+				Hashes []string `json:"hashes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode check request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"missing":          req.Hashes,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/upload":
+			uploadCalls++
+			if uploadCalls <= 2 {
+				http.Error(w, "temporary upload failure", http.StatusInternalServerError)
+				return
+			}
+			chunks := decodeAgentChunkBatchRequest(t, r.Body)
+			respChunks := make([]map[string]any, 0, len(chunks))
+			for _, chunk := range chunks {
+				respChunks = append(respChunks, map[string]any{
+					"hash":          chunk.hash,
+					"uploaded":      true,
+					"original_size": len(chunk.data),
+				})
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "accepted",
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"chunks":           respChunks,
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{
+		RepositoryID:                  "repo-test",
+		ChunkGeneration:               7,
+		MaxChunkCheckBatch:            10000,
+		MaxChunkUploadBatchBytes:      defaultAgentChunkUploadBatchBytes,
+		MaxChunkResponseBytes:         defaultAgentMaxChunkResponseBytes,
+		ChunkBatchUpload:              true,
+		CompactChunkCheckResponse:     true,
+		CompactChunkUploadResponse:    true,
+		ChunkBatchMaxRetries:          2,
+		ChunkBatchRetryInitialBackoff: time.Millisecond,
+		ChunkBatchRetryMaxBackoff:     time.Millisecond,
+		ChunkBatchSplitOn413:          true,
+	})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if uploadCalls != 3 {
+		t.Fatalf("upload calls = %d, want 3", uploadCalls)
+	}
+	entry, ok := manifest.Find("retry.txt")
+	if !ok || len(entry.Chunks) != 1 || entry.Chunks[0].Hash == "" {
+		t.Fatalf("retry.txt manifest entry = %+v ok=%v", entry, ok)
+	}
+}
+
+func TestCheckChunksRetriesAfterHeader(t *testing.T) {
+	hash := testChunkHash("retry-after check")
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/chunks/check" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "busy", http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"repository_id":    "repo-test",
+			"chunk_generation": 7,
+			"exists":           []string{hash},
+			"missing":          []string{},
+		})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	checked, err := client.checkChunks([]string{hash}, "repo-test", 7, false, chunkBatchRetryOptions{
+		MaxRetries:     1,
+		InitialBackoff: time.Hour,
+		MaxBackoff:     time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("checkChunks() error = %v", err)
+	}
+	if calls != 2 || checked.RetryCount != 1 {
+		t.Fatalf("calls=%d retry_count=%d, want 2/1", calls, checked.RetryCount)
+	}
+}
+
+func TestUploadChunksBatchSplitsOn413(t *testing.T) {
+	first := pendingChunkForTest([]byte("first split upload"))
+	second := pendingChunkForTest([]byte("second split upload"))
+	var uploadCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/chunks/upload" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		uploadCalls++
+		chunks := decodeAgentChunkBatchRequest(t, r.Body)
+		if len(chunks) > 1 {
+			http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":           "accepted",
+			"repository_id":    "repo-test",
+			"chunk_generation": 7,
+			"chunks": []map[string]any{{
+				"hash":          chunks[0].hash,
+				"uploaded":      true,
+				"original_size": len(chunks[0].data),
+			}},
+		})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	uploaded, err := client.uploadChunksBatch([]*pendingBatchChunk{first, second}, true, chunkBatchRetryOptions{
+		MaxRetries:     1,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		SplitOn413:     true,
+	})
+	if err != nil {
+		t.Fatalf("uploadChunksBatch() error = %v", err)
+	}
+	if uploadCalls != 3 {
+		t.Fatalf("upload calls = %d, want initial plus two split requests", uploadCalls)
+	}
+	if uploaded.SplitCount != 1 || len(uploaded.Chunks) != 2 {
+		t.Fatalf("uploaded split_count=%d chunks=%d, want 1/2", uploaded.SplitCount, len(uploaded.Chunks))
+	}
+}
+
+func TestScanAndUploadParallelManifestMatchesSerial(t *testing.T) {
+	root := t.TempDir()
+	firstRoot := filepath.Join(root, "first")
+	secondRoot := filepath.Join(root, "second")
+	for _, dir := range []string{filepath.Join(firstRoot, "sub"), filepath.Join(secondRoot, "nested")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string][]byte{
+		filepath.Join(firstRoot, "a.txt"):            []byte("parallel alpha payload"),
+		filepath.Join(firstRoot, "sub", "b.txt"):     []byte("parallel beta payload"),
+		filepath.Join(secondRoot, "nested", "c.txt"): []byte("parallel gamma payload"),
+		filepath.Join(secondRoot, "nested", "empty"): nil,
+	}
+	for name, data := range files {
+		if err := os.WriteFile(name, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots := []string{firstRoot, secondRoot}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/runs/1/progress":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/check":
+			var req struct {
+				Hashes []string `json:"hashes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode check request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"missing":          req.Hashes,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/chunks/upload":
+			chunks := decodeAgentChunkBatchRequest(t, r.Body)
+			respChunks := make([]map[string]any, 0, len(chunks))
+			for _, chunk := range chunks {
+				respChunks = append(respChunks, map[string]any{
+					"hash":          chunk.hash,
+					"uploaded":      true,
+					"original_size": len(chunk.data),
+				})
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "accepted",
+				"repository_id":    "repo-test",
+				"chunk_generation": 7,
+				"chunks":           respChunks,
+			})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	baseOpts := backupRunOptions{
+		RepositoryID:               "repo-test",
+		ChunkGeneration:            7,
+		MaxChunkCheckBatch:         2,
+		MaxChunkUploadBatchBytes:   defaultAgentChunkUploadBatchBytes,
+		MaxChunkResponseBytes:      defaultAgentMaxChunkResponseBytes,
+		ChunkBatchUpload:           true,
+		CompactChunkCheckResponse:  true,
+		CompactChunkUploadResponse: true,
+	}
+	serial, err := client.scanAndUpload(1, roots, logger, fsfilter.Options{}, baseOpts)
+	if err != nil {
+		t.Fatalf("serial scanAndUpload() error = %v", err)
+	}
+	parallelOpts := baseOpts
+	parallelOpts.ScanParallelEnabled = true
+	parallelOpts.FileReadWorkers = 2
+	parallelOpts.FileReadPipelineBytes = 32
+	parallel, err := client.scanAndUpload(1, roots, logger, fsfilter.Options{}, parallelOpts)
+	if err != nil {
+		t.Fatalf("parallel scanAndUpload() error = %v", err)
+	}
+	if !reflect.DeepEqual(serial.SourceRoots, roots) || !reflect.DeepEqual(parallel.SourceRoots, roots) {
+		t.Fatalf("source roots differ serial=%#v parallel=%#v want=%#v", serial.SourceRoots, parallel.SourceRoots, roots)
+	}
+	if !reflect.DeepEqual(comparableManifestEntries(serial), comparableManifestEntries(parallel)) {
+		t.Fatalf("parallel manifest entries differ\nserial=%#v\nparallel=%#v", comparableManifestEntries(serial), comparableManifestEntries(parallel))
+	}
+}
+
+func TestRunAgentThroughputBenchmarkOutputsComparableMetrics(t *testing.T) {
+	var output bytes.Buffer
+	opts := agentThroughputBenchmarkOptions{
+		Files:              2,
+		FileSize:           1024,
+		Modes:              []string{"serial", "parallel"},
+		MaxChunkCheckBatch: 2,
+	}
+	if err := runAgentThroughputBenchmark(opts, &output); err != nil {
+		t.Fatalf("runAgentThroughputBenchmark() error = %v", err)
+	}
+	var results []agentThroughputBenchmarkResult
+	if err := json.Unmarshal(output.Bytes(), &results); err != nil {
+		t.Fatalf("decode benchmark output: %v\n%s", err, output.String())
+	}
+	if len(results) != 2 {
+		t.Fatalf("benchmark results = %d, want 2: %s", len(results), output.String())
+	}
+	for _, result := range results {
+		if result.Files != opts.Files || result.FileSize != opts.FileSize || result.Bytes != int64(opts.Files)*opts.FileSize {
+			t.Fatalf("benchmark size fields = %+v", result)
+		}
+		if result.CheckRequests == 0 || result.UploadRequests == 0 {
+			t.Fatalf("benchmark request counters not populated: %+v", result)
+		}
+		if !result.ManifestEquivalent {
+			t.Fatalf("benchmark manifest equivalence is false for mode %s", result.Mode)
+		}
+		if result.AllocBytes == 0 || result.PeakHeapAllocBytes == 0 {
+			t.Fatalf("benchmark memory metrics not populated: %+v", result)
 		}
 	}
 }
@@ -938,7 +1444,7 @@ func TestUploadChunksBatchAcceptsLargeJSONResponse(t *testing.T) {
 	}
 
 	client := newAgentClient(server.URL, "", "")
-	uploaded, err := client.uploadChunksBatch(chunks, false)
+	uploaded, err := client.uploadChunksBatch(chunks, false, chunkBatchRetryOptions{})
 	if err != nil {
 		t.Fatalf("uploadChunksBatch() error = %v", err)
 	}
@@ -982,7 +1488,7 @@ func TestUploadChunksBatchRequestsCompactResponse(t *testing.T) {
 		data:         data,
 		originalSize: int64(len(data)),
 	}}
-	uploaded, err := client.uploadChunksBatch(requested, true)
+	uploaded, err := client.uploadChunksBatch(requested, true, chunkBatchRetryOptions{})
 	if err != nil {
 		t.Fatalf("uploadChunksBatch() error = %v", err)
 	}
@@ -1564,6 +2070,48 @@ type decodedAgentChunkBatch struct {
 func testChunkHash(value string) string {
 	sum := blake3.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func pendingChunkForTest(data []byte) *pendingBatchChunk {
+	sum := blake3.Sum256(data)
+	return &pendingBatchChunk{
+		hash:         hex.EncodeToString(sum[:]),
+		data:         append([]byte(nil), data...),
+		originalSize: int64(len(data)),
+	}
+}
+
+type comparableManifestEntry struct {
+	Path       string
+	Type       repository.EntryType
+	Size       int64
+	Mode       uint32
+	LinkTarget string
+	Chunks     []repository.ChunkRef
+	Pack       *repository.PackFileRef
+}
+
+func comparableManifestEntries(manifest *repository.SnapshotManifest) []comparableManifestEntry {
+	entries := make([]comparableManifestEntry, 0, len(manifest.Entries))
+	for _, entry := range manifest.Entries {
+		chunks := make([]repository.ChunkRef, 0, len(entry.Chunks))
+		for _, chunk := range entry.Chunks {
+			chunks = append(chunks, repository.ChunkRef{Hash: chunk.Hash, OriginalSize: chunk.OriginalSize})
+		}
+		entries = append(entries, comparableManifestEntry{
+			Path:       entry.Path,
+			Type:       entry.Type,
+			Size:       entry.Size,
+			Mode:       entry.Mode,
+			LinkTarget: entry.LinkTarget,
+			Chunks:     chunks,
+			Pack:       entry.Pack,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Path < entries[j].Path
+	})
+	return entries
 }
 
 func decodeAgentChunkBatchRequest(t *testing.T, body io.Reader) []decodedAgentChunkBatch {

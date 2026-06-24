@@ -166,6 +166,44 @@ func TestPutChunksDeduplicatesWithinBatchAndReadsBack(t *testing.T) {
 	}
 }
 
+func TestHasChunksUsesBatchLookupAndDeduplicatesInput(t *testing.T) {
+	repo := testRepository(t, 256, 4096)
+	ctx := context.Background()
+	first := []byte("batch lookup first")
+	second := []byte("batch lookup second")
+	firstHash, err := HashBytes(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHash, err := HashBytes(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingHash, err := HashBytes([]byte("batch lookup missing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.PutChunks(ctx, [][]byte{first, second}); err != nil {
+		t.Fatalf("PutChunks() error = %v", err)
+	}
+	exists, err := repo.HasChunks(ctx, []string{firstHash, "", firstHash, missingHash, secondHash})
+	if err != nil {
+		t.Fatalf("HasChunks() error = %v", err)
+	}
+	if _, ok := exists[firstHash]; !ok {
+		t.Fatalf("HasChunks missing first hash: %v", exists)
+	}
+	if _, ok := exists[secondHash]; !ok {
+		t.Fatalf("HasChunks missing second hash: %v", exists)
+	}
+	if _, ok := exists[missingHash]; ok {
+		t.Fatalf("HasChunks returned missing hash: %v", exists)
+	}
+	if len(exists) != 2 {
+		t.Fatalf("HasChunks returned %d hashes, want 2: %v", len(exists), exists)
+	}
+}
+
 func TestReadChunkDetectsCorruptRecord(t *testing.T) {
 	repo := testRepository(t, 256, 4096)
 	ctx := context.Background()

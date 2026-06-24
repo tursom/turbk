@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +19,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2124,7 +2127,7 @@ func TestAgentBatchChunkUploadRejectsLimits(t *testing.T) {
 	cfg.Paths.RepoDir = filepath.Join(root, "repo")
 	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
 	cfg.Agent.MaxChunkCheckBatch = 1
-	cfg.Agent.MaxChunkUploadBatchBytes = "64B"
+	cfg.Agent.MaxChunkUploadBatchBytes = "128B"
 	store, err := state.Open(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("state.Open() error = %v", err)
@@ -2170,6 +2173,365 @@ func TestAgentBatchChunkUploadRejectsLimits(t *testing.T) {
 	status, body = postRawAgent(t, server.URL+"/agent/v1/chunks/upload", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, agentChunkBatchContentType, encodeAgentChunkBatch(t, bytes.Repeat([]byte("x"), 100)))
 	if status != http.StatusRequestEntityTooLarge && status != http.StatusBadRequest {
 		t.Fatalf("oversized byte batch status = %d body=%s", status, string(body))
+	}
+}
+
+func TestAgentBatchChunkUploadAdmissionLimitsPerAgent(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.StateDir = filepath.Join(root, "state")
+	cfg.Paths.RepoDir = filepath.Join(root, "repo")
+	cfg.Paths.RestoreRoots = []string{filepath.Join(root, "restore")}
+	cfg.Agent.MaxChunkUploadInflightPerAgent = 1
+	cfg.Agent.MaxChunkUploadInflightBytesPerAgent = "1MiB"
+	cfg.Agent.MaxChunkUploadInflightBytesGlobal = "1MiB"
+	cfg.Agent.ChunkUploadRetryAfter = "0s"
+	store, err := state.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	defer store.Close()
+	repo, err := repository.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("repository.Open() error = %v", err)
+	}
+	defer repo.Close()
+
+	api := New(cfg, store, repo, nil)
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+	cookie := login(t, server.URL)
+	status, body := postJSONAuthed(t, server.URL+"/api/v1/hosts", cookie, map[string]any{
+		"name":        "admission-agent",
+		"source_type": "agent",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent host status = %d body=%s", status, string(body))
+	}
+	var createdAgent struct {
+		Agent struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(body, &createdAgent); err != nil {
+		t.Fatal(err)
+	}
+	status, body = requestJSONAgent(t, http.MethodPost, server.URL+"/agent/v1/runs", createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret, map[string]any{
+		"hostname": "admission-agent",
+		"root":     "/batch/admission/source",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create agent run status = %d body=%s", status, string(body))
+	}
+
+	uploadBody := encodeAgentChunkBatch(t, []byte("blocking admission upload"))
+	pipeReader, pipeWriter := io.Pipe()
+	firstReq, err := http.NewRequest(http.MethodPost, server.URL+"/agent/v1/chunks/upload", pipeReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReq.ContentLength = int64(len(uploadBody))
+	firstReq.Header.Set("Accept", "application/json")
+	firstReq.Header.Set("Content-Type", agentChunkBatchContentType)
+	firstReq.SetBasicAuth(createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret)
+	type rawResult struct {
+		status int
+		body   []byte
+		err    error
+	}
+	firstDone := make(chan rawResult, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(firstReq)
+		if err != nil {
+			firstDone <- rawResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		respBody, err := io.ReadAll(resp.Body)
+		firstDone <- rawResult{status: resp.StatusCode, body: respBody, err: err}
+	}()
+	waitForUploadAdmissionBytes(t, api, int64(len(uploadBody)))
+
+	secondReq, err := http.NewRequest(http.MethodPost, server.URL+"/agent/v1/chunks/upload", bytes.NewReader(uploadBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReq.Header.Set("Accept", "application/json")
+	secondReq.Header.Set("Content-Type", agentChunkBatchContentType)
+	secondReq.SetBasicAuth(createdAgent.Agent.ClientID, createdAgent.Agent.ClientSecret)
+	secondResp, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, err := io.ReadAll(secondResp.Body)
+	secondResp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second upload status = %d body=%s", secondResp.StatusCode, string(secondBody))
+	}
+	if secondResp.Header.Get("Retry-After") != "0" {
+		t.Fatalf("Retry-After = %q, want 0", secondResp.Header.Get("Retry-After"))
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := pipeWriter.Write(uploadBody)
+		closeErr := pipeWriter.Close()
+		if writeErr != nil {
+			writeDone <- writeErr
+			return
+		}
+		writeDone <- closeErr
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write first upload body: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out writing first upload body")
+	}
+	select {
+	case result := <-firstDone:
+		if result.err != nil {
+			t.Fatalf("first upload error: %v", result.err)
+		}
+		if result.status != http.StatusAccepted {
+			t.Fatalf("first upload status = %d body=%s", result.status, string(result.body))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first upload")
+	}
+	waitForUploadAdmissionBytes(t, api, 0)
+}
+
+func TestAgentUploadAdmissionLimitsGlobalBytes(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.MaxChunkUploadInflightPerAgent = 2
+	cfg.Agent.MaxChunkUploadInflightBytesPerAgent = "1MiB"
+	cfg.Agent.MaxChunkUploadInflightBytesGlobal = "20B"
+	admission := newAgentUploadAdmission(cfg)
+
+	release, status, err := admission.acquire(1, 12)
+	if err != nil {
+		t.Fatalf("first acquire status=%d error=%v", status, err)
+	}
+	defer release()
+
+	_, status, err = admission.acquire(2, 12)
+	if err == nil {
+		t.Fatal("second acquire succeeded, want global byte limit error")
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("second acquire status=%d error=%v, want 429", status, err)
+	}
+	requests, bytes, globalBytes := admission.snapshot()
+	if requests != 1 || bytes != 12 || globalBytes != 12 {
+		t.Fatalf("admission snapshot requests=%d bytes=%d global=%d, want 1/12/12", requests, bytes, globalBytes)
+	}
+	release()
+	requests, bytes, globalBytes = admission.snapshot()
+	if requests != 0 || bytes != 0 || globalBytes != 0 {
+		t.Fatalf("admission snapshot after release requests=%d bytes=%d global=%d, want zero", requests, bytes, globalBytes)
+	}
+}
+
+func TestAgentRepoWriteQueueCoalescesRequests(t *testing.T) {
+	agentCfg := config.Default().Agent
+	agentCfg.RepoWriteQueueEnabled = true
+	agentCfg.RepoWriteQueueMaxRequests = 8
+	agentCfg.RepoWriteQueueMaxBytes = "1MiB"
+	agentCfg.RepoWriteCoalesceWindow = "100ms"
+	agentCfg.RepoWriteCoalesceMaxBytes = "1MiB"
+
+	var mu sync.Mutex
+	var batchSizes []int
+	putChunks := func(ctx context.Context, chunks [][]byte) ([]repository.PutChunkResult, error) {
+		mu.Lock()
+		batchSizes = append(batchSizes, len(chunks))
+		mu.Unlock()
+		return putChunkResultsForTest(t, chunks), nil
+	}
+	q := newAgentRepoWriteQueue(agentCfg, nil, putChunks, func() (func(), bool) {
+		return func() {}, true
+	})
+	defer q.close()
+
+	errs := make(chan error, 2)
+	for _, chunk := range [][]byte{[]byte("queue-one"), []byte("queue-two")} {
+		chunk := chunk
+		go func() {
+			results, err := q.submit(context.Background(), [][]byte{chunk})
+			if err == nil && len(results) != 1 {
+				err = fmt.Errorf("results = %d, want 1", len(results))
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(batchSizes) != 1 || batchSizes[0] != 2 {
+		t.Fatalf("repo write batches = %v, want one coalesced batch of 2 chunks", batchSizes)
+	}
+}
+
+func TestAgentRepoWriteQueuePreservesDuplicateChunkResults(t *testing.T) {
+	agentCfg := config.Default().Agent
+	agentCfg.RepoWriteQueueEnabled = true
+	agentCfg.RepoWriteQueueMaxRequests = 8
+	agentCfg.RepoWriteQueueMaxBytes = "1MiB"
+	agentCfg.RepoWriteCoalesceWindow = "100ms"
+	agentCfg.RepoWriteCoalesceMaxBytes = "1MiB"
+
+	putChunks := func(ctx context.Context, chunks [][]byte) ([]repository.PutChunkResult, error) {
+		results := make([]repository.PutChunkResult, len(chunks))
+		seen := make(map[string]repository.ChunkRef)
+		for i, chunk := range chunks {
+			hash, err := repository.HashBytes(chunk)
+			if err != nil {
+				return nil, err
+			}
+			ref, existed := seen[hash]
+			if !existed {
+				ref = repository.ChunkRef{Hash: hash, OriginalSize: int64(len(chunk))}
+				seen[hash] = ref
+			}
+			results[i] = repository.PutChunkResult{Ref: ref, Existed: existed}
+		}
+		return results, nil
+	}
+	q := newAgentRepoWriteQueue(agentCfg, nil, putChunks, func() (func(), bool) {
+		return func() {}, true
+	})
+	defer q.close()
+
+	chunk := []byte("duplicate queued chunk")
+	resultsCh := make(chan []repository.PutChunkResult, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			results, err := q.submit(context.Background(), [][]byte{chunk})
+			if err != nil {
+				errs <- err
+				return
+			}
+			resultsCh <- results
+			errs <- nil
+		}()
+	}
+	var existed []bool
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		results := <-resultsCh
+		if len(results) != 1 {
+			t.Fatalf("results = %d, want 1", len(results))
+		}
+		existed = append(existed, results[0].Existed)
+	}
+	existedCount := 0
+	for _, value := range existed {
+		if value {
+			existedCount++
+		}
+	}
+	if existedCount != 1 {
+		t.Fatalf("duplicate existed flags = %v, want one false and one true", existed)
+	}
+}
+
+func TestAgentRepoWriteQueueCloseFailsWaitingRequest(t *testing.T) {
+	agentCfg := config.Default().Agent
+	agentCfg.RepoWriteQueueEnabled = true
+	agentCfg.RepoWriteQueueMaxRequests = 2
+	agentCfg.RepoWriteQueueMaxBytes = "1MiB"
+	agentCfg.RepoWriteCoalesceWindow = "1s"
+	agentCfg.RepoWriteCoalesceMaxBytes = "1MiB"
+
+	putCalled := make(chan struct{}, 1)
+	q := newAgentRepoWriteQueue(agentCfg, nil, func(ctx context.Context, chunks [][]byte) ([]repository.PutChunkResult, error) {
+		putCalled <- struct{}{}
+		return putChunkResultsForTest(t, chunks), nil
+	}, func() (func(), bool) {
+		return func() {}, true
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.submit(context.Background(), [][]byte{[]byte("closing queued chunk")})
+		done <- err
+	}()
+	waitForRepoWriteQueueRequests(t, q, 1)
+	q.close()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errAgentRepoWriteQueueClosed) {
+			t.Fatalf("submit error = %v, want queue closed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queued request close error")
+	}
+	select {
+	case <-putCalled:
+		t.Fatal("putChunks was called for a request waiting in a closed queue")
+	default:
+	}
+	if _, err := q.submit(context.Background(), [][]byte{[]byte("after close")}); !errors.Is(err, errAgentRepoWriteQueueClosed) {
+		t.Fatalf("submit after close error = %v, want queue closed", err)
+	}
+}
+
+func TestAgentUploadChunkWritesSubBatches(t *testing.T) {
+	agentCfg := config.Default().Agent
+	agentCfg.RepoWriteQueueEnabled = true
+	agentCfg.RepoWriteQueueMaxRequests = 8
+	agentCfg.RepoWriteQueueMaxBytes = "1MiB"
+	agentCfg.RepoWriteCoalesceWindow = "0s"
+	agentCfg.RepoWriteCoalesceMaxBytes = "1MiB"
+
+	var mu sync.Mutex
+	var batchSizes []int
+	putChunks := func(ctx context.Context, chunks [][]byte) ([]repository.PutChunkResult, error) {
+		mu.Lock()
+		batchSizes = append(batchSizes, len(chunks))
+		mu.Unlock()
+		return putChunkResultsForTest(t, chunks), nil
+	}
+	q := newAgentRepoWriteQueue(agentCfg, nil, putChunks, func() (func(), bool) {
+		return func() {}, true
+	})
+	defer q.close()
+	api := &Server{
+		cfg: config.Config{Agent: config.AgentConfig{
+			RepoWriteSubBatchBytes: "10B",
+		}},
+		repoWriteQueue: q,
+	}
+	results, err := api.putAgentUploadChunks(context.Background(), [][]byte{
+		[]byte("123456"),
+		[]byte("abcdef"),
+		[]byte("xyz"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results = %d, want 3", len(results))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(batchSizes, []int{1, 2}) {
+		t.Fatalf("sub-batch sizes = %v, want [1 2]", batchSizes)
 	}
 }
 
@@ -2582,21 +2944,38 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 			ChunkGeneration int64  `json:"chunk_generation"`
 		} `json:"repository"`
 		Agent struct {
-			PollIntervalSeconds        int64 `json:"poll_interval_seconds"`
-			CommandGeneration          int64 `json:"command_generation"`
-			MaxChunkUploadBatchBytes   int64 `json:"max_chunk_upload_batch_bytes"`
-			MaxChunkResponseBytes      int64 `json:"max_chunk_response_bytes"`
-			ChunkPipelineEnabled       bool  `json:"chunk_pipeline_enabled"`
-			MaxChunkCheckInflight      int   `json:"max_chunk_check_inflight"`
-			MaxChunkUploadInflight     int   `json:"max_chunk_upload_inflight"`
-			MaxChunkPipelineBytes      int64 `json:"max_chunk_pipeline_bytes"`
-			ChunkBatchUpload           bool  `json:"chunk_batch_upload"`
-			CompactChunkCheckResponse  bool  `json:"compact_chunk_check_response"`
-			CompactChunkUploadResponse bool  `json:"compact_chunk_upload_response"`
-			SmallFilePack              bool  `json:"small_file_pack"`
-			SmallFilePackEnabled       bool  `json:"small_file_pack_enabled"`
-			SmallFilePackMaxFileSize   int64 `json:"small_file_pack_max_file_size"`
-			SmallFilePackTargetSize    int64 `json:"small_file_pack_target_size"`
+			PollIntervalSeconds                 int64  `json:"poll_interval_seconds"`
+			CommandGeneration                   int64  `json:"command_generation"`
+			MaxChunkUploadBatchBytes            int64  `json:"max_chunk_upload_batch_bytes"`
+			MaxChunkResponseBytes               int64  `json:"max_chunk_response_bytes"`
+			ChunkBatchMaxRetries                int    `json:"chunk_batch_max_retries"`
+			ChunkBatchRetryInitialBackoff       string `json:"chunk_batch_retry_initial_backoff"`
+			ChunkBatchRetryMaxBackoff           string `json:"chunk_batch_retry_max_backoff"`
+			ChunkBatchSplitOn413                bool   `json:"chunk_batch_split_on_413"`
+			ChunkPipelineEnabled                bool   `json:"chunk_pipeline_enabled"`
+			MaxChunkCheckInflight               int    `json:"max_chunk_check_inflight"`
+			MaxChunkUploadInflight              int    `json:"max_chunk_upload_inflight"`
+			MaxChunkPipelineBytes               int64  `json:"max_chunk_pipeline_bytes"`
+			MaxChunkUploadInflightPerAgent      int    `json:"max_chunk_upload_inflight_per_agent"`
+			MaxChunkUploadInflightBytesPerAgent int64  `json:"max_chunk_upload_inflight_bytes_per_agent"`
+			MaxChunkUploadInflightBytesGlobal   int64  `json:"max_chunk_upload_inflight_bytes_global"`
+			ChunkUploadRetryAfter               string `json:"chunk_upload_retry_after"`
+			RepoWriteQueueEnabled               bool   `json:"repo_write_queue_enabled"`
+			RepoWriteQueueMaxRequests           int    `json:"repo_write_queue_max_requests"`
+			RepoWriteQueueMaxBytes              int64  `json:"repo_write_queue_max_bytes"`
+			RepoWriteCoalesceWindow             string `json:"repo_write_coalesce_window"`
+			RepoWriteCoalesceMaxBytes           int64  `json:"repo_write_coalesce_max_bytes"`
+			RepoWriteSubBatchBytes              int64  `json:"repo_write_sub_batch_bytes"`
+			ScanParallelEnabled                 bool   `json:"scan_parallel_enabled"`
+			FileReadWorkers                     int    `json:"file_read_workers"`
+			FileReadPipelineBytes               int64  `json:"file_read_pipeline_bytes"`
+			ChunkBatchUpload                    bool   `json:"chunk_batch_upload"`
+			CompactChunkCheckResponse           bool   `json:"compact_chunk_check_response"`
+			CompactChunkUploadResponse          bool   `json:"compact_chunk_upload_response"`
+			SmallFilePack                       bool   `json:"small_file_pack"`
+			SmallFilePackEnabled                bool   `json:"small_file_pack_enabled"`
+			SmallFilePackMaxFileSize            int64  `json:"small_file_pack_max_file_size"`
+			SmallFilePackTargetSize             int64  `json:"small_file_pack_target_size"`
 		} `json:"agent"`
 		Commands []struct {
 			ID     int64  `json:"id"`
@@ -2614,8 +2993,20 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	if !heartbeat.Agent.ChunkBatchUpload || heartbeat.Agent.MaxChunkUploadBatchBytes != 64*1024*1024 || heartbeat.Agent.MaxChunkResponseBytes != 64*1024*1024 {
 		t.Fatalf("heartbeat missing chunk batch upload capability: %+v", heartbeat.Agent)
 	}
+	if heartbeat.Agent.ChunkBatchMaxRetries != 5 || heartbeat.Agent.ChunkBatchRetryInitialBackoff != "500ms" || heartbeat.Agent.ChunkBatchRetryMaxBackoff != "30s" || !heartbeat.Agent.ChunkBatchSplitOn413 {
+		t.Fatalf("heartbeat missing chunk batch retry defaults: %+v", heartbeat.Agent)
+	}
 	if heartbeat.Agent.ChunkPipelineEnabled || heartbeat.Agent.MaxChunkCheckInflight != 1 || heartbeat.Agent.MaxChunkUploadInflight != 1 || heartbeat.Agent.MaxChunkPipelineBytes != 128*1024*1024 {
 		t.Fatalf("heartbeat missing chunk pipeline defaults: %+v", heartbeat.Agent)
+	}
+	if heartbeat.Agent.MaxChunkUploadInflightPerAgent != 2 || heartbeat.Agent.MaxChunkUploadInflightBytesPerAgent != 256*1024*1024 || heartbeat.Agent.MaxChunkUploadInflightBytesGlobal != 1024*1024*1024 || heartbeat.Agent.ChunkUploadRetryAfter != "2s" {
+		t.Fatalf("heartbeat missing upload admission defaults: %+v", heartbeat.Agent)
+	}
+	if heartbeat.Agent.RepoWriteQueueEnabled || heartbeat.Agent.RepoWriteQueueMaxRequests != 64 || heartbeat.Agent.RepoWriteQueueMaxBytes != 512*1024*1024 || heartbeat.Agent.RepoWriteCoalesceWindow != "5ms" || heartbeat.Agent.RepoWriteCoalesceMaxBytes != 128*1024*1024 || heartbeat.Agent.RepoWriteSubBatchBytes != 64*1024*1024 {
+		t.Fatalf("heartbeat missing repository write defaults: %+v", heartbeat.Agent)
+	}
+	if heartbeat.Agent.ScanParallelEnabled || heartbeat.Agent.FileReadWorkers != 2 || heartbeat.Agent.FileReadPipelineBytes != 512*1024*1024 {
+		t.Fatalf("heartbeat missing parallel scan defaults: %+v", heartbeat.Agent)
 	}
 	if !heartbeat.Agent.CompactChunkCheckResponse || !heartbeat.Agent.CompactChunkUploadResponse {
 		t.Fatalf("heartbeat missing compact chunk response capabilities: %+v", heartbeat.Agent)
@@ -3079,6 +3470,56 @@ func postRawAgent(t *testing.T, url, clientID, clientSecret, contentType string,
 		t.Fatal(err)
 	}
 	return resp.StatusCode, respBody
+}
+
+func waitForUploadAdmissionBytes(t *testing.T, api *Server, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		api.uploadAdmission.mu.Lock()
+		got := api.uploadAdmission.globalBytes
+		api.uploadAdmission.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("upload admission global bytes = %d, want %d", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForRepoWriteQueueRequests(t *testing.T, q *agentRepoWriteQueue, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, _ := q.snapshot()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("repo write queue requests = %d, want %d", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func putChunkResultsForTest(t *testing.T, chunks [][]byte) []repository.PutChunkResult {
+	t.Helper()
+	results := make([]repository.PutChunkResult, len(chunks))
+	for i, chunk := range chunks {
+		hash, err := repository.HashBytes(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results[i] = repository.PutChunkResult{
+			Ref: repository.ChunkRef{
+				Hash:         hash,
+				OriginalSize: int64(len(chunk)),
+			},
+		}
+	}
+	return results
 }
 
 func encodeAgentChunkBatch(t *testing.T, chunks ...[]byte) []byte {

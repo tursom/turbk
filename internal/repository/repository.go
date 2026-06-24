@@ -307,23 +307,13 @@ func (r *Repository) HasChunks(ctx context.Context, hashes []string) (map[string
 			return nil, err
 		}
 	}
-	exists := make(map[string]struct{}, len(hashes))
-	seen := make(map[string]struct{}, len(hashes))
-	for _, hash := range hashes {
-		if hash == "" {
-			continue
-		}
-		if _, ok := seen[hash]; ok {
-			continue
-		}
-		seen[hash] = struct{}{}
-		_, ok, err := r.index.Get(hash)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			exists[hash] = struct{}{}
-		}
+	refs, err := r.index.GetBatch(hashes)
+	if err != nil {
+		return nil, err
+	}
+	exists := make(map[string]struct{}, len(refs))
+	for hash := range refs {
+		exists[hash] = struct{}{}
 	}
 	return exists, nil
 }

@@ -40,6 +40,8 @@ type Server struct {
 	mux             *http.ServeMux
 	schedulerSem    chan struct{}
 	runGate         sync.RWMutex
+	uploadAdmission *agentUploadAdmission
+	repoWriteQueue  *agentRepoWriteQueue
 	maintenanceMu   sync.Mutex
 	lastMaintenance map[string]time.Time
 	settingsMu      sync.RWMutex
@@ -61,9 +63,11 @@ func New(cfg config.Config, store *state.Store, repo *repository.Repository, log
 		logger:          logger,
 		mux:             http.NewServeMux(),
 		schedulerSem:    make(chan struct{}, maxScheduledRuns),
+		uploadAdmission: newAgentUploadAdmission(cfg),
 		lastMaintenance: make(map[string]time.Time),
 		settings:        loadRuntimeSettings(context.Background(), cfg, store, logger),
 	}
+	s.repoWriteQueue = newAgentRepoWriteQueue(cfg.Agent, logger, s.repo.PutChunks, s.tryEnterBackupWrite)
 	s.routes()
 	return s
 }
@@ -903,25 +907,42 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			"invalidation_available_from": repositoryState.InvalidationAvailableFrom,
 		},
 		"agent": map[string]any{
-			"config_generation":             repositoryState.ConfigGeneration,
-			"command_generation":            repositoryState.CommandGeneration,
-			"poll_interval_seconds":         int64(pollInterval / time.Second),
-			"default_poll_interval":         s.cfg.Agent.DefaultPollInterval,
-			"max_chunk_check_batch":         s.cfg.Agent.MaxChunkCheckBatch,
-			"max_chunk_upload_batch_bytes":  s.agentMaxChunkUploadBatchBytes(),
-			"max_chunk_response_bytes":      s.agentMaxChunkResponseBytes(),
-			"chunk_pipeline_enabled":        s.cfg.Agent.ChunkPipelineEnabled,
-			"max_chunk_check_inflight":      s.cfg.Agent.MaxChunkCheckInflight,
-			"max_chunk_upload_inflight":     s.cfg.Agent.MaxChunkUploadInflight,
-			"max_chunk_pipeline_bytes":      s.agentMaxChunkPipelineBytes(),
-			"chunk_batch_upload":            true,
-			"compact_chunk_check_response":  true,
-			"compact_chunk_upload_response": true,
-			"small_file_pack":               true,
-			"small_file_pack_enabled":       s.cfg.Agent.SmallFilePackEnabled,
-			"small_file_pack_max_file_size": s.agentSmallFilePackMaxFileSize(),
-			"small_file_pack_target_size":   s.agentSmallFilePackTargetSize(),
-			"max_manifest_repair_attempts":  3,
+			"config_generation":                         repositoryState.ConfigGeneration,
+			"command_generation":                        repositoryState.CommandGeneration,
+			"poll_interval_seconds":                     int64(pollInterval / time.Second),
+			"default_poll_interval":                     s.cfg.Agent.DefaultPollInterval,
+			"max_chunk_check_batch":                     s.cfg.Agent.MaxChunkCheckBatch,
+			"max_chunk_upload_batch_bytes":              s.agentMaxChunkUploadBatchBytes(),
+			"max_chunk_response_bytes":                  s.agentMaxChunkResponseBytes(),
+			"chunk_batch_max_retries":                   s.cfg.Agent.ChunkBatchMaxRetries,
+			"chunk_batch_retry_initial_backoff":         s.cfg.Agent.ChunkBatchRetryInitialBackoff,
+			"chunk_batch_retry_max_backoff":             s.cfg.Agent.ChunkBatchRetryMaxBackoff,
+			"chunk_batch_split_on_413":                  s.cfg.Agent.ChunkBatchSplitOn413,
+			"chunk_pipeline_enabled":                    s.cfg.Agent.ChunkPipelineEnabled,
+			"max_chunk_check_inflight":                  s.cfg.Agent.MaxChunkCheckInflight,
+			"max_chunk_upload_inflight":                 s.cfg.Agent.MaxChunkUploadInflight,
+			"max_chunk_pipeline_bytes":                  s.agentMaxChunkPipelineBytes(),
+			"max_chunk_upload_inflight_per_agent":       s.cfg.Agent.MaxChunkUploadInflightPerAgent,
+			"max_chunk_upload_inflight_bytes_per_agent": s.agentMaxChunkUploadInflightBytesPerAgent(),
+			"max_chunk_upload_inflight_bytes_global":    s.agentMaxChunkUploadInflightBytesGlobal(),
+			"chunk_upload_retry_after":                  s.cfg.Agent.ChunkUploadRetryAfter,
+			"repo_write_queue_enabled":                  s.cfg.Agent.RepoWriteQueueEnabled,
+			"repo_write_queue_max_requests":             s.cfg.Agent.RepoWriteQueueMaxRequests,
+			"repo_write_queue_max_bytes":                s.agentRepoWriteQueueMaxBytes(),
+			"repo_write_coalesce_window":                s.cfg.Agent.RepoWriteCoalesceWindow,
+			"repo_write_coalesce_max_bytes":             s.agentRepoWriteCoalesceMaxBytes(),
+			"repo_write_sub_batch_bytes":                s.agentRepoWriteSubBatchBytes(),
+			"scan_parallel_enabled":                     s.cfg.Agent.ScanParallelEnabled,
+			"file_read_workers":                         s.cfg.Agent.FileReadWorkers,
+			"file_read_pipeline_bytes":                  s.agentFileReadPipelineBytes(),
+			"chunk_batch_upload":                        true,
+			"compact_chunk_check_response":              true,
+			"compact_chunk_upload_response":             true,
+			"small_file_pack":                           true,
+			"small_file_pack_enabled":                   s.cfg.Agent.SmallFilePackEnabled,
+			"small_file_pack_max_file_size":             s.agentSmallFilePackMaxFileSize(),
+			"small_file_pack_target_size":               s.agentSmallFilePackTargetSize(),
+			"max_manifest_repair_attempts":              3,
 		},
 		"maintenance": map[string]any{
 			"write_available": true,
@@ -1164,6 +1185,416 @@ type agentUploadChunk struct {
 	data []byte
 }
 
+type agentUploadAdmission struct {
+	mu                  sync.Mutex
+	perAgent            map[int64]*agentUploadAdmissionState
+	globalBytes         int64
+	maxRequestsPerAgent int
+	maxBytesPerAgent    int64
+	maxBytesGlobal      int64
+}
+
+type agentUploadAdmissionState struct {
+	requests int
+	bytes    int64
+}
+
+func newAgentUploadAdmission(cfg config.Config) *agentUploadAdmission {
+	maxBytesPerAgent, err := parseByteSize(cfg.Agent.MaxChunkUploadInflightBytesPerAgent)
+	if err != nil || maxBytesPerAgent <= 0 {
+		maxBytesPerAgent = 256 * 1024 * 1024
+	}
+	maxBytesGlobal, err := parseByteSize(cfg.Agent.MaxChunkUploadInflightBytesGlobal)
+	if err != nil || maxBytesGlobal <= 0 {
+		maxBytesGlobal = 1024 * 1024 * 1024
+	}
+	maxRequestsPerAgent := cfg.Agent.MaxChunkUploadInflightPerAgent
+	if maxRequestsPerAgent <= 0 {
+		maxRequestsPerAgent = 2
+	}
+	return &agentUploadAdmission{
+		perAgent:            make(map[int64]*agentUploadAdmissionState),
+		maxRequestsPerAgent: maxRequestsPerAgent,
+		maxBytesPerAgent:    maxBytesPerAgent,
+		maxBytesGlobal:      maxBytesGlobal,
+	}
+}
+
+func (a *agentUploadAdmission) acquire(agentID int64, requestBytes int64) (func(), int, error) {
+	if a == nil {
+		return func() {}, 0, nil
+	}
+	if requestBytes < 0 {
+		return nil, http.StatusLengthRequired, errors.New("chunk upload requires Content-Length")
+	}
+	if requestBytes > a.maxBytesPerAgent {
+		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("chunk upload request bytes %d exceeds per-agent in-flight byte limit %d", requestBytes, a.maxBytesPerAgent)
+	}
+	if requestBytes > a.maxBytesGlobal {
+		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("chunk upload request bytes %d exceeds global in-flight byte limit %d", requestBytes, a.maxBytesGlobal)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	state := a.perAgent[agentID]
+	if state == nil {
+		state = &agentUploadAdmissionState{}
+		a.perAgent[agentID] = state
+	}
+	if state.requests >= a.maxRequestsPerAgent {
+		return nil, http.StatusTooManyRequests, fmt.Errorf("agent has %d chunk uploads in flight, limit %d", state.requests, a.maxRequestsPerAgent)
+	}
+	if state.bytes+requestBytes > a.maxBytesPerAgent {
+		return nil, http.StatusTooManyRequests, fmt.Errorf("agent chunk upload in-flight bytes would be %d, limit %d", state.bytes+requestBytes, a.maxBytesPerAgent)
+	}
+	if a.globalBytes+requestBytes > a.maxBytesGlobal {
+		return nil, http.StatusTooManyRequests, fmt.Errorf("global chunk upload in-flight bytes would be %d, limit %d", a.globalBytes+requestBytes, a.maxBytesGlobal)
+	}
+	state.requests++
+	state.bytes += requestBytes
+	a.globalBytes += requestBytes
+	released := false
+	return func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		state := a.perAgent[agentID]
+		if state != nil {
+			state.requests--
+			state.bytes -= requestBytes
+			if state.requests <= 0 && state.bytes <= 0 {
+				delete(a.perAgent, agentID)
+			}
+		}
+		a.globalBytes -= requestBytes
+		if a.globalBytes < 0 {
+			a.globalBytes = 0
+		}
+	}, 0, nil
+}
+
+func (a *agentUploadAdmission) snapshot() (requests int, bytes int64, globalBytes int64) {
+	if a == nil {
+		return 0, 0, 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, state := range a.perAgent {
+		requests += state.requests
+		bytes += state.bytes
+	}
+	return requests, bytes, a.globalBytes
+}
+
+var (
+	errAgentRepoWriteQueueFull   = errors.New("repository write queue is full")
+	errAgentRepoWriteQueueClosed = errors.New("repository write queue is closed")
+)
+
+type agentRepoWriteQueue struct {
+	logger           *slog.Logger
+	putChunks        func(context.Context, [][]byte) ([]repository.PutChunkResult, error)
+	enterWrite       func() (func(), bool)
+	requests         chan *agentRepoWriteRequest
+	done             chan struct{}
+	closeOnce        sync.Once
+	mu               sync.Mutex
+	queuedRequests   int
+	queuedBytes      int64
+	closed           bool
+	maxRequests      int
+	maxBytes         int64
+	coalesceWindow   time.Duration
+	coalesceMaxBytes int64
+}
+
+type agentRepoWriteRequest struct {
+	ctx    context.Context
+	chunks [][]byte
+	bytes  int64
+	result chan agentRepoWriteResult
+}
+
+type agentRepoWriteResult struct {
+	results []repository.PutChunkResult
+	err     error
+}
+
+func newAgentRepoWriteQueue(cfg config.AgentConfig, logger *slog.Logger, putChunks func(context.Context, [][]byte) ([]repository.PutChunkResult, error), enterWrite func() (func(), bool)) *agentRepoWriteQueue {
+	if !cfg.RepoWriteQueueEnabled {
+		return nil
+	}
+	maxBytes, err := parseByteSize(cfg.RepoWriteQueueMaxBytes)
+	if err != nil || maxBytes <= 0 {
+		maxBytes = 512 * 1024 * 1024
+	}
+	coalesceMaxBytes, err := parseByteSize(cfg.RepoWriteCoalesceMaxBytes)
+	if err != nil || coalesceMaxBytes <= 0 {
+		coalesceMaxBytes = 128 * 1024 * 1024
+	}
+	coalesceWindow, err := time.ParseDuration(cfg.RepoWriteCoalesceWindow)
+	if err != nil || coalesceWindow < 0 {
+		coalesceWindow = 5 * time.Millisecond
+	}
+	maxRequests := cfg.RepoWriteQueueMaxRequests
+	if maxRequests <= 0 {
+		maxRequests = 64
+	}
+	q := &agentRepoWriteQueue{
+		logger:           logger,
+		putChunks:        putChunks,
+		enterWrite:       enterWrite,
+		requests:         make(chan *agentRepoWriteRequest, maxRequests),
+		done:             make(chan struct{}),
+		maxRequests:      maxRequests,
+		maxBytes:         maxBytes,
+		coalesceWindow:   coalesceWindow,
+		coalesceMaxBytes: coalesceMaxBytes,
+	}
+	go q.run()
+	return q
+}
+
+func (q *agentRepoWriteQueue) submit(ctx context.Context, chunks [][]byte) ([]repository.PutChunkResult, error) {
+	if q == nil {
+		return nil, errors.New("repository write queue is disabled")
+	}
+	req := &agentRepoWriteRequest{
+		ctx:    ctx,
+		chunks: chunks,
+		bytes:  chunkDataBytes(chunks),
+		result: make(chan agentRepoWriteResult, 1),
+	}
+	if err := q.enqueue(ctx, req); err != nil {
+		return nil, err
+	}
+	select {
+	case result := <-req.result:
+		return result.results, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (q *agentRepoWriteQueue) enqueue(ctx context.Context, req *agentRepoWriteRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return errAgentRepoWriteQueueClosed
+	}
+	bytes := req.bytes
+	if q.queuedRequests >= q.maxRequests {
+		return fmt.Errorf("%w: requests %d >= %d", errAgentRepoWriteQueueFull, q.queuedRequests, q.maxRequests)
+	}
+	if bytes > q.maxBytes {
+		return fmt.Errorf("%w: request bytes %d exceeds queue byte limit %d", errAgentRepoWriteQueueFull, bytes, q.maxBytes)
+	}
+	if q.queuedBytes+bytes > q.maxBytes {
+		return fmt.Errorf("%w: queued bytes would be %d, limit %d", errAgentRepoWriteQueueFull, q.queuedBytes+bytes, q.maxBytes)
+	}
+	q.queuedRequests++
+	q.queuedBytes += bytes
+	select {
+	case q.requests <- req:
+	default:
+		q.queuedRequests--
+		q.queuedBytes -= bytes
+		return fmt.Errorf("%w: channel is full", errAgentRepoWriteQueueFull)
+	}
+	return nil
+}
+
+func (q *agentRepoWriteQueue) release(bytes int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.queuedRequests--
+	q.queuedBytes -= bytes
+	if q.queuedRequests < 0 {
+		q.queuedRequests = 0
+	}
+	if q.queuedBytes < 0 {
+		q.queuedBytes = 0
+	}
+}
+
+func (q *agentRepoWriteQueue) snapshot() (requests int, bytes int64) {
+	if q == nil {
+		return 0, 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.queuedRequests, q.queuedBytes
+}
+
+func (q *agentRepoWriteQueue) isClosed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed
+}
+
+func (q *agentRepoWriteQueue) run() {
+	for {
+		select {
+		case <-q.done:
+			q.failQueued(errAgentRepoWriteQueueClosed)
+			return
+		case req := <-q.requests:
+			if req == nil {
+				continue
+			}
+			q.write(q.collect(req))
+		}
+	}
+}
+
+func (q *agentRepoWriteQueue) failQueued(err error) {
+	for {
+		select {
+		case req := <-q.requests:
+			if req != nil {
+				q.finish(req, nil, err)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (q *agentRepoWriteQueue) collect(first *agentRepoWriteRequest) []*agentRepoWriteRequest {
+	batch := []*agentRepoWriteRequest{first}
+	totalBytes := first.bytes
+	if q.coalesceWindow == 0 {
+		return q.collectReady(batch, totalBytes)
+	}
+	timer := time.NewTimer(q.coalesceWindow)
+	defer timer.Stop()
+	for totalBytes < q.coalesceMaxBytes {
+		select {
+		case req := <-q.requests:
+			if req == nil {
+				continue
+			}
+			batch = append(batch, req)
+			totalBytes += req.bytes
+		case <-timer.C:
+			return batch
+		case <-q.done:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (q *agentRepoWriteQueue) collectReady(batch []*agentRepoWriteRequest, totalBytes int64) []*agentRepoWriteRequest {
+	for totalBytes < q.coalesceMaxBytes {
+		select {
+		case req := <-q.requests:
+			if req == nil {
+				continue
+			}
+			batch = append(batch, req)
+			totalBytes += req.bytes
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (q *agentRepoWriteQueue) write(batch []*agentRepoWriteRequest) {
+	active := make([]*agentRepoWriteRequest, 0, len(batch))
+	for _, req := range batch {
+		if err := req.ctx.Err(); err != nil {
+			q.finish(req, nil, err)
+			continue
+		}
+		active = append(active, req)
+	}
+	if len(active) == 0 {
+		return
+	}
+	if q.isClosed() {
+		for _, req := range active {
+			q.finish(req, nil, errAgentRepoWriteQueueClosed)
+		}
+		return
+	}
+	gateStarted := time.Now()
+	releaseRunGate, ok := q.enterWrite()
+	gateWait := time.Since(gateStarted)
+	if !ok {
+		for _, req := range active {
+			q.finish(req, nil, errStorageMaintenanceRunning)
+		}
+		return
+	}
+	defer releaseRunGate()
+
+	offsets := make([]int, len(active))
+	combined := make([][]byte, 0)
+	for i, req := range active {
+		offsets[i] = len(combined)
+		combined = append(combined, req.chunks...)
+	}
+	started := time.Now()
+	results, err := q.putChunks(context.Background(), combined)
+	duration := time.Since(started)
+	if q.logger != nil {
+		queueRequests, queueBytes := q.snapshot()
+		q.logger.Info("agent repository write queue batch",
+			"requests", len(active),
+			"chunks", len(combined),
+			"bytes", chunkDataBytes(combined),
+			"duration", duration.String(),
+			"write_gate_wait", gateWait.String(),
+			"queue_requests", queueRequests,
+			"queue_bytes", queueBytes,
+		)
+	}
+	if err != nil {
+		for _, req := range active {
+			q.finish(req, nil, err)
+		}
+		return
+	}
+	if len(results) != len(combined) {
+		err := fmt.Errorf("repository write queue wrote %d results for %d chunks", len(results), len(combined))
+		for _, req := range active {
+			q.finish(req, nil, err)
+		}
+		return
+	}
+	for i, req := range active {
+		start := offsets[i]
+		end := start + len(req.chunks)
+		q.finish(req, results[start:end], nil)
+	}
+}
+
+func (q *agentRepoWriteQueue) finish(req *agentRepoWriteRequest, results []repository.PutChunkResult, err error) {
+	q.release(req.bytes)
+	req.result <- agentRepoWriteResult{results: results, err: err}
+}
+
+func (q *agentRepoWriteQueue) close() {
+	if q == nil {
+		return
+	}
+	q.closeOnce.Do(func() {
+		q.mu.Lock()
+		q.closed = true
+		q.mu.Unlock()
+		close(q.done)
+		q.failQueued(errAgentRepoWriteQueueClosed)
+	})
+}
+
 func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request) {
 	agent, ok := s.authenticateAgent(w, r)
 	if !ok {
@@ -1180,6 +1611,16 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	maxBodyBytes := s.agentMaxChunkUploadBatchBytes()
+	if r.ContentLength > maxBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("chunk batch exceeds max size %d", maxBodyBytes))
+		return
+	}
+	releaseUpload, status, err := s.uploadAdmission.acquire(agent.Credential.ID, r.ContentLength)
+	if err != nil {
+		s.writeAgentUploadAdmissionError(w, status, err)
+		return
+	}
+	defer releaseUpload()
 	chunks, err := readAgentChunkBatch(w, r, maxBodyBytes, s.cfg.Agent.MaxChunkCheckBatch)
 	if err != nil {
 		var maxErr *http.MaxBytesError
@@ -1190,13 +1631,6 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	releaseRunGate, ok := s.tryEnterBackupWrite()
-	if !ok {
-		writeError(w, http.StatusConflict, errStorageMaintenanceRunning)
-		return
-	}
-	defer releaseRunGate()
-
 	repositoryState, err := s.store.RepositoryState(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1207,9 +1641,17 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 		chunkData[i] = chunk.data
 	}
 	putStarted := time.Now()
-	results, err := s.repo.PutChunks(r.Context(), chunkData)
+	results, err := s.putAgentUploadChunks(r.Context(), chunkData)
 	putDuration := time.Since(putStarted)
 	if err != nil {
+		if errors.Is(err, errStorageMaintenanceRunning) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		if errors.Is(err, errAgentRepoWriteQueueFull) {
+			s.writeAgentUploadAdmissionError(w, http.StatusTooManyRequests, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1250,13 +1692,81 @@ func (s *Server) handleAgentUploadChunks(w http.ResponseWriter, r *http.Request)
 	if data, err := json.Marshal(response); err == nil {
 		responseBytes = int64(len(data))
 	}
+	uploadInflightRequests, uploadInflightBytes, uploadInflightGlobalBytes := s.uploadAdmission.snapshot()
+	writeQueueRequests, writeQueueBytes := s.repoWriteQueue.snapshot()
 	s.logger.Info("agent batch chunk upload",
 		"chunks", len(chunks),
 		"request_bytes", r.ContentLength,
 		"response_bytes", responseBytes,
 		"repo_put_duration", putDuration.String(),
+		"upload_inflight_requests", uploadInflightRequests,
+		"upload_inflight_bytes", uploadInflightBytes,
+		"upload_inflight_global_bytes", uploadInflightGlobalBytes,
+		"repo_write_queue_requests", writeQueueRequests,
+		"repo_write_queue_bytes", writeQueueBytes,
 	)
 	writeJSON(w, http.StatusAccepted, response)
+}
+
+func (s *Server) putAgentUploadChunks(ctx context.Context, chunkData [][]byte) ([]repository.PutChunkResult, error) {
+	if len(chunkData) == 0 {
+		return nil, nil
+	}
+	subBatchBytes := s.agentRepoWriteSubBatchBytes()
+	results := make([]repository.PutChunkResult, 0, len(chunkData))
+	for start := 0; start < len(chunkData); {
+		end := nextChunkSubBatchEnd(chunkData, start, subBatchBytes)
+		written, err := s.putAgentUploadChunkBatch(ctx, chunkData[start:end])
+		if err != nil {
+			return nil, err
+		}
+		if len(written) != end-start {
+			return nil, fmt.Errorf("chunk sub-batch wrote %d results for %d chunks", len(written), end-start)
+		}
+		results = append(results, written...)
+		start = end
+	}
+	return results, nil
+}
+
+func (s *Server) putAgentUploadChunkBatch(ctx context.Context, chunkData [][]byte) ([]repository.PutChunkResult, error) {
+	if s.repoWriteQueue != nil {
+		return s.repoWriteQueue.submit(ctx, chunkData)
+	}
+	releaseRunGate, ok := s.tryEnterBackupWrite()
+	if !ok {
+		return nil, errStorageMaintenanceRunning
+	}
+	defer releaseRunGate()
+	return s.repo.PutChunks(ctx, chunkData)
+}
+
+func nextChunkSubBatchEnd(chunks [][]byte, start int, maxBytes int64) int {
+	if start >= len(chunks) {
+		return len(chunks)
+	}
+	if maxBytes <= 0 {
+		return len(chunks)
+	}
+	end := start
+	var total int64
+	for end < len(chunks) {
+		nextBytes := int64(len(chunks[end]))
+		if end > start && total+nextBytes > maxBytes {
+			break
+		}
+		total += nextBytes
+		end++
+	}
+	return end
+}
+
+func chunkDataBytes(chunks [][]byte) int64 {
+	var total int64
+	for _, chunk := range chunks {
+		total += int64(len(chunk))
+	}
+	return total
 }
 
 func (s *Server) handleAgentChunkInvalidations(w http.ResponseWriter, r *http.Request) {
@@ -2555,6 +3065,62 @@ func (s *Server) agentMaxChunkPipelineBytes() int64 {
 	return maxBytes
 }
 
+func (s *Server) agentMaxChunkUploadInflightBytesPerAgent() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkUploadInflightBytesPerAgent)
+	if err != nil || maxBytes <= 0 {
+		return 256 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentMaxChunkUploadInflightBytesGlobal() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkUploadInflightBytesGlobal)
+	if err != nil || maxBytes <= 0 {
+		return 1024 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentChunkUploadRetryAfter() time.Duration {
+	duration, err := time.ParseDuration(s.cfg.Agent.ChunkUploadRetryAfter)
+	if err != nil || duration < 0 {
+		return 2 * time.Second
+	}
+	return duration
+}
+
+func (s *Server) agentRepoWriteQueueMaxBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.RepoWriteQueueMaxBytes)
+	if err != nil || maxBytes <= 0 {
+		return 512 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentRepoWriteCoalesceMaxBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.RepoWriteCoalesceMaxBytes)
+	if err != nil || maxBytes <= 0 {
+		return 128 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentRepoWriteSubBatchBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.RepoWriteSubBatchBytes)
+	if err != nil || maxBytes <= 0 {
+		return 64 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentFileReadPipelineBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.FileReadPipelineBytes)
+	if err != nil || maxBytes <= 0 {
+		return 512 * 1024 * 1024
+	}
+	return maxBytes
+}
+
 func (s *Server) agentSmallFilePackMaxFileSize() int64 {
 	maxBytes, err := parseByteSize(s.cfg.Agent.SmallFilePackMaxFileSize)
 	if err != nil || maxBytes <= 0 {
@@ -2662,6 +3228,24 @@ func writeError(w http.ResponseWriter, status int, err error) {
 		"status": "error",
 		"error":  err.Error(),
 	})
+}
+
+func (s *Server) writeAgentUploadAdmissionError(w http.ResponseWriter, status int, err error) {
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", retryAfterHeaderValue(s.agentChunkUploadRetryAfter()))
+	}
+	writeError(w, status, err)
+}
+
+func retryAfterHeaderValue(duration time.Duration) string {
+	if duration <= 0 {
+		return "0"
+	}
+	seconds := int64((duration + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.FormatInt(seconds, 10)
 }
 
 func parsePathID(r *http.Request, name string) (int64, error) {

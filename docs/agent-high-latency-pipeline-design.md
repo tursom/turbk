@@ -11,6 +11,7 @@
 - [Agent Chunk 批量接口设计](agent-batch-chunk-api-design.md)
 - [Agent 常驻与本地索引设计](agent-daemon-design.md)
 - [Agent 小文件备份优化设计](agent-small-file-optimization-design.md)
+- [Agent 备份吞吐后续代码改造计划](agent-throughput-code-change-plan.md)
 
 ## 1. 背景
 

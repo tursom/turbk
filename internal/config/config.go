@@ -73,20 +73,37 @@ type MaintenanceConfig struct {
 }
 
 type AgentConfig struct {
-	CommandTTL                    string `json:"command_ttl" yaml:"command_ttl"`
-	DefaultPollInterval           string `json:"default_poll_interval" yaml:"default_poll_interval"`
-	MaxChunkCheckBatch            int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
-	MaxChunkUploadBatchBytes      string `json:"max_chunk_upload_batch_bytes" yaml:"max_chunk_upload_batch_bytes"`
-	MaxChunkResponseBytes         string `json:"max_chunk_response_bytes" yaml:"max_chunk_response_bytes"`
-	ChunkPipelineEnabled          bool   `json:"chunk_pipeline_enabled" yaml:"chunk_pipeline_enabled"`
-	MaxChunkCheckInflight         int    `json:"max_chunk_check_inflight" yaml:"max_chunk_check_inflight"`
-	MaxChunkUploadInflight        int    `json:"max_chunk_upload_inflight" yaml:"max_chunk_upload_inflight"`
-	MaxChunkPipelineBytes         string `json:"max_chunk_pipeline_bytes" yaml:"max_chunk_pipeline_bytes"`
-	SmallFilePackEnabled          bool   `json:"small_file_pack_enabled" yaml:"small_file_pack_enabled"`
-	SmallFilePackMaxFileSize      string `json:"small_file_pack_max_file_size" yaml:"small_file_pack_max_file_size"`
-	SmallFilePackTargetSize       string `json:"small_file_pack_target_size" yaml:"small_file_pack_target_size"`
-	MaxInvalidationResponseHashes int    `json:"max_invalidation_response_hashes" yaml:"max_invalidation_response_hashes"`
-	InvalidationRetentionDays     int    `json:"invalidation_retention_days" yaml:"invalidation_retention_days"`
+	CommandTTL                          string `json:"command_ttl" yaml:"command_ttl"`
+	DefaultPollInterval                 string `json:"default_poll_interval" yaml:"default_poll_interval"`
+	MaxChunkCheckBatch                  int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
+	MaxChunkUploadBatchBytes            string `json:"max_chunk_upload_batch_bytes" yaml:"max_chunk_upload_batch_bytes"`
+	MaxChunkResponseBytes               string `json:"max_chunk_response_bytes" yaml:"max_chunk_response_bytes"`
+	ChunkBatchMaxRetries                int    `json:"chunk_batch_max_retries" yaml:"chunk_batch_max_retries"`
+	ChunkBatchRetryInitialBackoff       string `json:"chunk_batch_retry_initial_backoff" yaml:"chunk_batch_retry_initial_backoff"`
+	ChunkBatchRetryMaxBackoff           string `json:"chunk_batch_retry_max_backoff" yaml:"chunk_batch_retry_max_backoff"`
+	ChunkBatchSplitOn413                bool   `json:"chunk_batch_split_on_413" yaml:"chunk_batch_split_on_413"`
+	ChunkPipelineEnabled                bool   `json:"chunk_pipeline_enabled" yaml:"chunk_pipeline_enabled"`
+	MaxChunkCheckInflight               int    `json:"max_chunk_check_inflight" yaml:"max_chunk_check_inflight"`
+	MaxChunkUploadInflight              int    `json:"max_chunk_upload_inflight" yaml:"max_chunk_upload_inflight"`
+	MaxChunkPipelineBytes               string `json:"max_chunk_pipeline_bytes" yaml:"max_chunk_pipeline_bytes"`
+	MaxChunkUploadInflightPerAgent      int    `json:"max_chunk_upload_inflight_per_agent" yaml:"max_chunk_upload_inflight_per_agent"`
+	MaxChunkUploadInflightBytesPerAgent string `json:"max_chunk_upload_inflight_bytes_per_agent" yaml:"max_chunk_upload_inflight_bytes_per_agent"`
+	MaxChunkUploadInflightBytesGlobal   string `json:"max_chunk_upload_inflight_bytes_global" yaml:"max_chunk_upload_inflight_bytes_global"`
+	ChunkUploadRetryAfter               string `json:"chunk_upload_retry_after" yaml:"chunk_upload_retry_after"`
+	RepoWriteQueueEnabled               bool   `json:"repo_write_queue_enabled" yaml:"repo_write_queue_enabled"`
+	RepoWriteQueueMaxRequests           int    `json:"repo_write_queue_max_requests" yaml:"repo_write_queue_max_requests"`
+	RepoWriteQueueMaxBytes              string `json:"repo_write_queue_max_bytes" yaml:"repo_write_queue_max_bytes"`
+	RepoWriteCoalesceWindow             string `json:"repo_write_coalesce_window" yaml:"repo_write_coalesce_window"`
+	RepoWriteCoalesceMaxBytes           string `json:"repo_write_coalesce_max_bytes" yaml:"repo_write_coalesce_max_bytes"`
+	RepoWriteSubBatchBytes              string `json:"repo_write_sub_batch_bytes" yaml:"repo_write_sub_batch_bytes"`
+	ScanParallelEnabled                 bool   `json:"scan_parallel_enabled" yaml:"scan_parallel_enabled"`
+	FileReadWorkers                     int    `json:"file_read_workers" yaml:"file_read_workers"`
+	FileReadPipelineBytes               string `json:"file_read_pipeline_bytes" yaml:"file_read_pipeline_bytes"`
+	SmallFilePackEnabled                bool   `json:"small_file_pack_enabled" yaml:"small_file_pack_enabled"`
+	SmallFilePackMaxFileSize            string `json:"small_file_pack_max_file_size" yaml:"small_file_pack_max_file_size"`
+	SmallFilePackTargetSize             string `json:"small_file_pack_target_size" yaml:"small_file_pack_target_size"`
+	MaxInvalidationResponseHashes       int    `json:"max_invalidation_response_hashes" yaml:"max_invalidation_response_hashes"`
+	InvalidationRetentionDays           int    `json:"invalidation_retention_days" yaml:"invalidation_retention_days"`
 }
 
 func Default() Config {
@@ -134,20 +151,37 @@ func Default() Config {
 			CompactMinReclaimBytes:  "1GiB",
 		},
 		Agent: AgentConfig{
-			CommandTTL:                    "30m",
-			DefaultPollInterval:           "10m",
-			MaxChunkCheckBatch:            10000,
-			MaxChunkUploadBatchBytes:      "64MiB",
-			MaxChunkResponseBytes:         "64MiB",
-			ChunkPipelineEnabled:          false,
-			MaxChunkCheckInflight:         1,
-			MaxChunkUploadInflight:        1,
-			MaxChunkPipelineBytes:         "128MiB",
-			SmallFilePackEnabled:          false,
-			SmallFilePackMaxFileSize:      "64KiB",
-			SmallFilePackTargetSize:       "8MiB",
-			MaxInvalidationResponseHashes: 100000,
-			InvalidationRetentionDays:     30,
+			CommandTTL:                          "30m",
+			DefaultPollInterval:                 "10m",
+			MaxChunkCheckBatch:                  10000,
+			MaxChunkUploadBatchBytes:            "64MiB",
+			MaxChunkResponseBytes:               "64MiB",
+			ChunkBatchMaxRetries:                5,
+			ChunkBatchRetryInitialBackoff:       "500ms",
+			ChunkBatchRetryMaxBackoff:           "30s",
+			ChunkBatchSplitOn413:                true,
+			ChunkPipelineEnabled:                false,
+			MaxChunkCheckInflight:               1,
+			MaxChunkUploadInflight:              1,
+			MaxChunkPipelineBytes:               "128MiB",
+			MaxChunkUploadInflightPerAgent:      2,
+			MaxChunkUploadInflightBytesPerAgent: "256MiB",
+			MaxChunkUploadInflightBytesGlobal:   "1GiB",
+			ChunkUploadRetryAfter:               "2s",
+			RepoWriteQueueEnabled:               false,
+			RepoWriteQueueMaxRequests:           64,
+			RepoWriteQueueMaxBytes:              "512MiB",
+			RepoWriteCoalesceWindow:             "5ms",
+			RepoWriteCoalesceMaxBytes:           "128MiB",
+			RepoWriteSubBatchBytes:              "64MiB",
+			ScanParallelEnabled:                 false,
+			FileReadWorkers:                     2,
+			FileReadPipelineBytes:               "512MiB",
+			SmallFilePackEnabled:                false,
+			SmallFilePackMaxFileSize:            "64KiB",
+			SmallFilePackTargetSize:             "8MiB",
+			MaxInvalidationResponseHashes:       100000,
+			InvalidationRetentionDays:           30,
 		},
 	}
 }
@@ -279,6 +313,32 @@ func (c *Config) Normalize() error {
 	} else if bytes <= 0 {
 		return errors.New("agent.max_chunk_response_bytes must be positive")
 	}
+	if c.Agent.ChunkBatchMaxRetries <= 0 {
+		c.Agent.ChunkBatchMaxRetries = 5
+	}
+	if strings.TrimSpace(c.Agent.ChunkBatchRetryInitialBackoff) == "" {
+		c.Agent.ChunkBatchRetryInitialBackoff = "500ms"
+	}
+	initialBackoff, err := time.ParseDuration(c.Agent.ChunkBatchRetryInitialBackoff)
+	if err != nil {
+		return fmt.Errorf("agent.chunk_batch_retry_initial_backoff must be a duration: %w", err)
+	}
+	if initialBackoff <= 0 {
+		return errors.New("agent.chunk_batch_retry_initial_backoff must be positive")
+	}
+	if strings.TrimSpace(c.Agent.ChunkBatchRetryMaxBackoff) == "" {
+		c.Agent.ChunkBatchRetryMaxBackoff = "30s"
+	}
+	maxBackoff, err := time.ParseDuration(c.Agent.ChunkBatchRetryMaxBackoff)
+	if err != nil {
+		return fmt.Errorf("agent.chunk_batch_retry_max_backoff must be a duration: %w", err)
+	}
+	if maxBackoff <= 0 {
+		return errors.New("agent.chunk_batch_retry_max_backoff must be positive")
+	}
+	if maxBackoff < initialBackoff {
+		return errors.New("agent.chunk_batch_retry_max_backoff must be greater than or equal to agent.chunk_batch_retry_initial_backoff")
+	}
 	if c.Agent.MaxChunkCheckInflight <= 0 {
 		c.Agent.MaxChunkCheckInflight = 1
 	}
@@ -292,6 +352,79 @@ func (c *Config) Normalize() error {
 		return fmt.Errorf("agent.max_chunk_pipeline_bytes must be a byte size: %w", err)
 	} else if bytes <= 0 {
 		return errors.New("agent.max_chunk_pipeline_bytes must be positive")
+	}
+	if c.Agent.MaxChunkUploadInflightPerAgent <= 0 {
+		c.Agent.MaxChunkUploadInflightPerAgent = 2
+	}
+	if strings.TrimSpace(c.Agent.MaxChunkUploadInflightBytesPerAgent) == "" {
+		c.Agent.MaxChunkUploadInflightBytesPerAgent = "256MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.MaxChunkUploadInflightBytesPerAgent); err != nil {
+		return fmt.Errorf("agent.max_chunk_upload_inflight_bytes_per_agent must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.max_chunk_upload_inflight_bytes_per_agent must be positive")
+	}
+	if strings.TrimSpace(c.Agent.MaxChunkUploadInflightBytesGlobal) == "" {
+		c.Agent.MaxChunkUploadInflightBytesGlobal = "1GiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.MaxChunkUploadInflightBytesGlobal); err != nil {
+		return fmt.Errorf("agent.max_chunk_upload_inflight_bytes_global must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.max_chunk_upload_inflight_bytes_global must be positive")
+	}
+	if strings.TrimSpace(c.Agent.ChunkUploadRetryAfter) == "" {
+		c.Agent.ChunkUploadRetryAfter = "2s"
+	}
+	if duration, err := time.ParseDuration(c.Agent.ChunkUploadRetryAfter); err != nil {
+		return fmt.Errorf("agent.chunk_upload_retry_after must be a duration: %w", err)
+	} else if duration < 0 {
+		return errors.New("agent.chunk_upload_retry_after must be non-negative")
+	}
+	if c.Agent.RepoWriteQueueMaxRequests <= 0 {
+		c.Agent.RepoWriteQueueMaxRequests = 64
+	}
+	if strings.TrimSpace(c.Agent.RepoWriteQueueMaxBytes) == "" {
+		c.Agent.RepoWriteQueueMaxBytes = "512MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.RepoWriteQueueMaxBytes); err != nil {
+		return fmt.Errorf("agent.repo_write_queue_max_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.repo_write_queue_max_bytes must be positive")
+	}
+	if strings.TrimSpace(c.Agent.RepoWriteCoalesceWindow) == "" {
+		c.Agent.RepoWriteCoalesceWindow = "5ms"
+	}
+	if duration, err := time.ParseDuration(c.Agent.RepoWriteCoalesceWindow); err != nil {
+		return fmt.Errorf("agent.repo_write_coalesce_window must be a duration: %w", err)
+	} else if duration < 0 {
+		return errors.New("agent.repo_write_coalesce_window must be non-negative")
+	}
+	if strings.TrimSpace(c.Agent.RepoWriteCoalesceMaxBytes) == "" {
+		c.Agent.RepoWriteCoalesceMaxBytes = "128MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.RepoWriteCoalesceMaxBytes); err != nil {
+		return fmt.Errorf("agent.repo_write_coalesce_max_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.repo_write_coalesce_max_bytes must be positive")
+	}
+	if strings.TrimSpace(c.Agent.RepoWriteSubBatchBytes) == "" {
+		c.Agent.RepoWriteSubBatchBytes = "64MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.RepoWriteSubBatchBytes); err != nil {
+		return fmt.Errorf("agent.repo_write_sub_batch_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.repo_write_sub_batch_bytes must be positive")
+	}
+	if c.Agent.FileReadWorkers <= 0 {
+		c.Agent.FileReadWorkers = 2
+	}
+	if strings.TrimSpace(c.Agent.FileReadPipelineBytes) == "" {
+		c.Agent.FileReadPipelineBytes = "512MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.FileReadPipelineBytes); err != nil {
+		return fmt.Errorf("agent.file_read_pipeline_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.file_read_pipeline_bytes must be positive")
 	}
 	if strings.TrimSpace(c.Agent.SmallFilePackMaxFileSize) == "" {
 		c.Agent.SmallFilePackMaxFileSize = "64KiB"
@@ -381,10 +514,27 @@ func applyEnv(c *Config) {
 	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_BATCH", &c.Agent.MaxChunkCheckBatch)
 	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", &c.Agent.MaxChunkUploadBatchBytes)
 	applyString("TURBK_AGENT_MAX_CHUNK_RESPONSE_BYTES", &c.Agent.MaxChunkResponseBytes)
+	applyInt("TURBK_AGENT_CHUNK_BATCH_MAX_RETRIES", &c.Agent.ChunkBatchMaxRetries)
+	applyString("TURBK_AGENT_CHUNK_BATCH_RETRY_INITIAL_BACKOFF", &c.Agent.ChunkBatchRetryInitialBackoff)
+	applyString("TURBK_AGENT_CHUNK_BATCH_RETRY_MAX_BACKOFF", &c.Agent.ChunkBatchRetryMaxBackoff)
+	applyBool("TURBK_AGENT_CHUNK_BATCH_SPLIT_ON_413", &c.Agent.ChunkBatchSplitOn413)
 	applyBool("TURBK_AGENT_CHUNK_PIPELINE_ENABLED", &c.Agent.ChunkPipelineEnabled)
 	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_INFLIGHT", &c.Agent.MaxChunkCheckInflight)
 	applyInt("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT", &c.Agent.MaxChunkUploadInflight)
 	applyString("TURBK_AGENT_MAX_CHUNK_PIPELINE_BYTES", &c.Agent.MaxChunkPipelineBytes)
+	applyInt("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT_PER_AGENT", &c.Agent.MaxChunkUploadInflightPerAgent)
+	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT_BYTES_PER_AGENT", &c.Agent.MaxChunkUploadInflightBytesPerAgent)
+	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT_BYTES_GLOBAL", &c.Agent.MaxChunkUploadInflightBytesGlobal)
+	applyString("TURBK_AGENT_CHUNK_UPLOAD_RETRY_AFTER", &c.Agent.ChunkUploadRetryAfter)
+	applyBool("TURBK_AGENT_REPO_WRITE_QUEUE_ENABLED", &c.Agent.RepoWriteQueueEnabled)
+	applyInt("TURBK_AGENT_REPO_WRITE_QUEUE_MAX_REQUESTS", &c.Agent.RepoWriteQueueMaxRequests)
+	applyString("TURBK_AGENT_REPO_WRITE_QUEUE_MAX_BYTES", &c.Agent.RepoWriteQueueMaxBytes)
+	applyString("TURBK_AGENT_REPO_WRITE_COALESCE_WINDOW", &c.Agent.RepoWriteCoalesceWindow)
+	applyString("TURBK_AGENT_REPO_WRITE_COALESCE_MAX_BYTES", &c.Agent.RepoWriteCoalesceMaxBytes)
+	applyString("TURBK_AGENT_REPO_WRITE_SUB_BATCH_BYTES", &c.Agent.RepoWriteSubBatchBytes)
+	applyBool("TURBK_AGENT_SCAN_PARALLEL_ENABLED", &c.Agent.ScanParallelEnabled)
+	applyInt("TURBK_AGENT_FILE_READ_WORKERS", &c.Agent.FileReadWorkers)
+	applyString("TURBK_AGENT_FILE_READ_PIPELINE_BYTES", &c.Agent.FileReadPipelineBytes)
 	applyBool("TURBK_AGENT_SMALL_FILE_PACK_ENABLED", &c.Agent.SmallFilePackEnabled)
 	applyString("TURBK_AGENT_SMALL_FILE_PACK_MAX_FILE_SIZE", &c.Agent.SmallFilePackMaxFileSize)
 	applyString("TURBK_AGENT_SMALL_FILE_PACK_TARGET_SIZE", &c.Agent.SmallFilePackTargetSize)
