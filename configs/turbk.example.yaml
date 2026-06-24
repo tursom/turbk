@@ -47,6 +47,10 @@ agent:
   max_chunk_check_batch: 10000
   max_chunk_upload_batch_bytes: "64MiB"
   max_chunk_response_bytes: "64MiB"
+  chunk_pipeline_enabled: false
+  max_chunk_check_inflight: 1
+  max_chunk_upload_inflight: 1
+  max_chunk_pipeline_bytes: "128MiB"
   small_file_pack_enabled: false
   small_file_pack_max_file_size: "64KiB"
   small_file_pack_target_size: "8MiB"

@@ -78,6 +78,10 @@ type AgentConfig struct {
 	MaxChunkCheckBatch            int    `json:"max_chunk_check_batch" yaml:"max_chunk_check_batch"`
 	MaxChunkUploadBatchBytes      string `json:"max_chunk_upload_batch_bytes" yaml:"max_chunk_upload_batch_bytes"`
 	MaxChunkResponseBytes         string `json:"max_chunk_response_bytes" yaml:"max_chunk_response_bytes"`
+	ChunkPipelineEnabled          bool   `json:"chunk_pipeline_enabled" yaml:"chunk_pipeline_enabled"`
+	MaxChunkCheckInflight         int    `json:"max_chunk_check_inflight" yaml:"max_chunk_check_inflight"`
+	MaxChunkUploadInflight        int    `json:"max_chunk_upload_inflight" yaml:"max_chunk_upload_inflight"`
+	MaxChunkPipelineBytes         string `json:"max_chunk_pipeline_bytes" yaml:"max_chunk_pipeline_bytes"`
 	SmallFilePackEnabled          bool   `json:"small_file_pack_enabled" yaml:"small_file_pack_enabled"`
 	SmallFilePackMaxFileSize      string `json:"small_file_pack_max_file_size" yaml:"small_file_pack_max_file_size"`
 	SmallFilePackTargetSize       string `json:"small_file_pack_target_size" yaml:"small_file_pack_target_size"`
@@ -135,6 +139,10 @@ func Default() Config {
 			MaxChunkCheckBatch:            10000,
 			MaxChunkUploadBatchBytes:      "64MiB",
 			MaxChunkResponseBytes:         "64MiB",
+			ChunkPipelineEnabled:          false,
+			MaxChunkCheckInflight:         1,
+			MaxChunkUploadInflight:        1,
+			MaxChunkPipelineBytes:         "128MiB",
 			SmallFilePackEnabled:          false,
 			SmallFilePackMaxFileSize:      "64KiB",
 			SmallFilePackTargetSize:       "8MiB",
@@ -271,6 +279,20 @@ func (c *Config) Normalize() error {
 	} else if bytes <= 0 {
 		return errors.New("agent.max_chunk_response_bytes must be positive")
 	}
+	if c.Agent.MaxChunkCheckInflight <= 0 {
+		c.Agent.MaxChunkCheckInflight = 1
+	}
+	if c.Agent.MaxChunkUploadInflight <= 0 {
+		c.Agent.MaxChunkUploadInflight = 1
+	}
+	if strings.TrimSpace(c.Agent.MaxChunkPipelineBytes) == "" {
+		c.Agent.MaxChunkPipelineBytes = "128MiB"
+	}
+	if bytes, err := parseConfigByteSize(c.Agent.MaxChunkPipelineBytes); err != nil {
+		return fmt.Errorf("agent.max_chunk_pipeline_bytes must be a byte size: %w", err)
+	} else if bytes <= 0 {
+		return errors.New("agent.max_chunk_pipeline_bytes must be positive")
+	}
 	if strings.TrimSpace(c.Agent.SmallFilePackMaxFileSize) == "" {
 		c.Agent.SmallFilePackMaxFileSize = "64KiB"
 	}
@@ -359,6 +381,10 @@ func applyEnv(c *Config) {
 	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_BATCH", &c.Agent.MaxChunkCheckBatch)
 	applyString("TURBK_AGENT_MAX_CHUNK_UPLOAD_BATCH_BYTES", &c.Agent.MaxChunkUploadBatchBytes)
 	applyString("TURBK_AGENT_MAX_CHUNK_RESPONSE_BYTES", &c.Agent.MaxChunkResponseBytes)
+	applyBool("TURBK_AGENT_CHUNK_PIPELINE_ENABLED", &c.Agent.ChunkPipelineEnabled)
+	applyInt("TURBK_AGENT_MAX_CHUNK_CHECK_INFLIGHT", &c.Agent.MaxChunkCheckInflight)
+	applyInt("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT", &c.Agent.MaxChunkUploadInflight)
+	applyString("TURBK_AGENT_MAX_CHUNK_PIPELINE_BYTES", &c.Agent.MaxChunkPipelineBytes)
 	applyBool("TURBK_AGENT_SMALL_FILE_PACK_ENABLED", &c.Agent.SmallFilePackEnabled)
 	applyString("TURBK_AGENT_SMALL_FILE_PACK_MAX_FILE_SIZE", &c.Agent.SmallFilePackMaxFileSize)
 	applyString("TURBK_AGENT_SMALL_FILE_PACK_TARGET_SIZE", &c.Agent.SmallFilePackTargetSize)

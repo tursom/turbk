@@ -909,6 +909,10 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			"max_chunk_check_batch":         s.cfg.Agent.MaxChunkCheckBatch,
 			"max_chunk_upload_batch_bytes":  s.agentMaxChunkUploadBatchBytes(),
 			"max_chunk_response_bytes":      s.agentMaxChunkResponseBytes(),
+			"chunk_pipeline_enabled":        s.cfg.Agent.ChunkPipelineEnabled,
+			"max_chunk_check_inflight":      s.cfg.Agent.MaxChunkCheckInflight,
+			"max_chunk_upload_inflight":     s.cfg.Agent.MaxChunkUploadInflight,
+			"max_chunk_pipeline_bytes":      s.agentMaxChunkPipelineBytes(),
 			"chunk_batch_upload":            true,
 			"compact_chunk_check_response":  true,
 			"compact_chunk_upload_response": true,
@@ -1312,8 +1316,7 @@ func (s *Server) handleAgentCheckChunks(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusConflict, fmt.Errorf("repository_id changed: current=%s", repositoryState.RepositoryID))
 		return
 	}
-	exists := make([]string, 0, len(req.Hashes))
-	missing := make([]string, 0)
+	uniqueHashes := make([]string, 0, len(req.Hashes))
 	seen := make(map[string]struct{}, len(req.Hashes))
 	for _, hash := range req.Hashes {
 		hash = strings.TrimSpace(hash)
@@ -1325,12 +1328,17 @@ func (s *Server) handleAgentCheckChunks(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		ok, err := s.repo.HasChunk(r.Context(), hash)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if ok {
+		uniqueHashes = append(uniqueHashes, hash)
+	}
+	existing, err := s.repo.HasChunks(r.Context(), uniqueHashes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	exists := make([]string, 0, len(existing))
+	missing := make([]string, 0, len(uniqueHashes)-len(existing))
+	for _, hash := range uniqueHashes {
+		if _, ok := existing[hash]; ok {
 			exists = append(exists, hash)
 		} else {
 			missing = append(missing, hash)
@@ -2534,6 +2542,14 @@ func (s *Server) agentMaxChunkResponseBytes() int64 {
 	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkResponseBytes)
 	if err != nil || maxBytes <= 0 {
 		return 64 * 1024 * 1024
+	}
+	return maxBytes
+}
+
+func (s *Server) agentMaxChunkPipelineBytes() int64 {
+	maxBytes, err := parseByteSize(s.cfg.Agent.MaxChunkPipelineBytes)
+	if err != nil || maxBytes <= 0 {
+		return 128 * 1024 * 1024
 	}
 	return maxBytes
 }

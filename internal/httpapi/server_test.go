@@ -2586,6 +2586,10 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 			CommandGeneration          int64 `json:"command_generation"`
 			MaxChunkUploadBatchBytes   int64 `json:"max_chunk_upload_batch_bytes"`
 			MaxChunkResponseBytes      int64 `json:"max_chunk_response_bytes"`
+			ChunkPipelineEnabled       bool  `json:"chunk_pipeline_enabled"`
+			MaxChunkCheckInflight      int   `json:"max_chunk_check_inflight"`
+			MaxChunkUploadInflight     int   `json:"max_chunk_upload_inflight"`
+			MaxChunkPipelineBytes      int64 `json:"max_chunk_pipeline_bytes"`
 			ChunkBatchUpload           bool  `json:"chunk_batch_upload"`
 			CompactChunkCheckResponse  bool  `json:"compact_chunk_check_response"`
 			CompactChunkUploadResponse bool  `json:"compact_chunk_upload_response"`
@@ -2609,6 +2613,9 @@ func TestAgentHeartbeatReturnsRepositoryStateAndCommands(t *testing.T) {
 	}
 	if !heartbeat.Agent.ChunkBatchUpload || heartbeat.Agent.MaxChunkUploadBatchBytes != 64*1024*1024 || heartbeat.Agent.MaxChunkResponseBytes != 64*1024*1024 {
 		t.Fatalf("heartbeat missing chunk batch upload capability: %+v", heartbeat.Agent)
+	}
+	if heartbeat.Agent.ChunkPipelineEnabled || heartbeat.Agent.MaxChunkCheckInflight != 1 || heartbeat.Agent.MaxChunkUploadInflight != 1 || heartbeat.Agent.MaxChunkPipelineBytes != 128*1024*1024 {
+		t.Fatalf("heartbeat missing chunk pipeline defaults: %+v", heartbeat.Agent)
 	}
 	if !heartbeat.Agent.CompactChunkCheckResponse || !heartbeat.Agent.CompactChunkUploadResponse {
 		t.Fatalf("heartbeat missing compact chunk response capabilities: %+v", heartbeat.Agent)

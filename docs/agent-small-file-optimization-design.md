@@ -11,6 +11,7 @@
 - [Agent Chunk 批量接口设计](agent-batch-chunk-api-design.md)
 - [Agent Pebble Catalog 写入优化设计](agent-pebble-catalog-design.md)
 - [Agent 常驻与本地索引设计](agent-daemon-design.md)
+- [Agent 高延迟网络吞吐优化设计](agent-high-latency-pipeline-design.md)
 
 ## 1. 背景
 

@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +37,7 @@ const defaultAgentFileCatalogBatchFiles = 1000
 const defaultAgentFileCatalogBatchBytes = int64(16 * 1024 * 1024)
 const defaultAgentResponseBodyLimit = int64(64 * 1024 * 1024)
 const defaultAgentMaxChunkResponseBytes = int64(64 * 1024 * 1024)
+const defaultAgentMaxChunkPipelineBytes = int64(128 * 1024 * 1024)
 const agentChunkBatchContentType = "application/vnd.turbk.chunk-batch.v1"
 
 const estimatedChunkCheckResponseBytesPerHash = int64(80)
@@ -80,6 +82,7 @@ type heartbeatRequest struct {
 	CompactChunkCheckResponse  bool   `json:"compact_chunk_check_response,omitempty"`
 	CompactChunkUploadResponse bool   `json:"compact_chunk_upload_response,omitempty"`
 	SmallFilePack              bool   `json:"small_file_pack,omitempty"`
+	ChunkPipeline              bool   `json:"chunk_pipeline,omitempty"`
 }
 
 type heartbeatResponse struct {
@@ -106,6 +109,10 @@ type agentInfo struct {
 	MaxChunkCheckBatch         int    `json:"max_chunk_check_batch"`
 	MaxChunkUploadBatchBytes   int64  `json:"max_chunk_upload_batch_bytes"`
 	MaxChunkResponseBytes      int64  `json:"max_chunk_response_bytes"`
+	ChunkPipelineEnabled       bool   `json:"chunk_pipeline_enabled"`
+	MaxChunkCheckInflight      int    `json:"max_chunk_check_inflight"`
+	MaxChunkUploadInflight     int    `json:"max_chunk_upload_inflight"`
+	MaxChunkPipelineBytes      int64  `json:"max_chunk_pipeline_bytes"`
 	ChunkBatchUpload           bool   `json:"chunk_batch_upload"`
 	CompactChunkCheckResponse  bool   `json:"compact_chunk_check_response"`
 	CompactChunkUploadResponse bool   `json:"compact_chunk_upload_response"`
@@ -320,6 +327,10 @@ func main() {
 			MaxChunkCheckBatch:         heartbeat.Agent.MaxChunkCheckBatch,
 			MaxChunkUploadBatchBytes:   heartbeat.Agent.MaxChunkUploadBatchBytes,
 			MaxChunkResponseBytes:      heartbeat.Agent.MaxChunkResponseBytes,
+			ChunkPipelineEnabled:       heartbeat.Agent.ChunkPipelineEnabled,
+			MaxChunkCheckInflight:      heartbeat.Agent.MaxChunkCheckInflight,
+			MaxChunkUploadInflight:     heartbeat.Agent.MaxChunkUploadInflight,
+			MaxChunkPipelineBytes:      heartbeat.Agent.MaxChunkPipelineBytes,
 			ChunkBatchUpload:           heartbeat.Agent.ChunkBatchUpload,
 			CompactChunkCheckResponse:  heartbeat.Agent.CompactChunkCheckResponse,
 			CompactChunkUploadResponse: heartbeat.Agent.CompactChunkUploadResponse,
@@ -367,7 +378,23 @@ func newAgentClient(serverURL, clientID, clientSecret string) *agentClient {
 		serverURL:    strings.TrimRight(serverURL, "/"),
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		http:         &http.Client{Timeout: 60 * time.Second},
+		http:         newAgentHTTPClient(),
+	}
+}
+
+func newAgentHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = true
+	transport.MaxIdleConns = envInt("TURBK_AGENT_HTTP_MAX_IDLE_CONNS", 100)
+	transport.MaxIdleConnsPerHost = envInt("TURBK_AGENT_HTTP_MAX_IDLE_CONNS_PER_HOST", 16)
+	transport.MaxConnsPerHost = envInt("TURBK_AGENT_HTTP_MAX_CONNS_PER_HOST", 0)
+	transport.IdleConnTimeout = parseDurationOrDefault(envString("TURBK_AGENT_HTTP_IDLE_CONN_TIMEOUT", "90s"), 90*time.Second)
+	transport.TLSHandshakeTimeout = parseDurationOrDefault(envString("TURBK_AGENT_HTTP_TLS_HANDSHAKE_TIMEOUT", "10s"), 10*time.Second)
+	transport.ResponseHeaderTimeout = parseDurationOrDefault(os.Getenv("TURBK_AGENT_HTTP_RESPONSE_HEADER_TIMEOUT"), 0)
+	transport.ExpectContinueTimeout = parseDurationOrDefault(envString("TURBK_AGENT_HTTP_EXPECT_CONTINUE_TIMEOUT", "1s"), time.Second)
+	return &http.Client{
+		Timeout:   parseDurationOrDefault(envString("TURBK_AGENT_HTTP_TIMEOUT", "60s"), 60*time.Second),
+		Transport: transport,
 	}
 }
 
@@ -388,6 +415,7 @@ func (c *agentClient) sendHeartbeatWithState(catalog *agentCatalog, stateDir, mo
 		CompactChunkCheckResponse:  true,
 		CompactChunkUploadResponse: true,
 		SmallFilePack:              true,
+		ChunkPipeline:              true,
 	}
 	if catalog != nil {
 		req.CatalogStatus = "ok"
@@ -450,6 +478,42 @@ func parseDurationOrDefault(value string, fallback time.Duration) time.Duration 
 		return fallback
 	}
 	return duration
+}
+
+func parseAgentByteSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("size is required")
+	}
+	units := []struct {
+		suffix string
+		mult   float64
+	}{
+		{"tib", 1024 * 1024 * 1024 * 1024},
+		{"tb", 1000 * 1000 * 1000 * 1000},
+		{"gib", 1024 * 1024 * 1024},
+		{"gb", 1000 * 1000 * 1000},
+		{"mib", 1024 * 1024},
+		{"mb", 1000 * 1000},
+		{"kib", 1024},
+		{"kb", 1000},
+		{"b", 1},
+	}
+	lower := strings.ToLower(value)
+	multiplier := float64(1)
+	number := lower
+	for _, unit := range units {
+		if strings.HasSuffix(lower, unit.suffix) {
+			multiplier = unit.mult
+			number = strings.TrimSpace(strings.TrimSuffix(lower, unit.suffix))
+			break
+		}
+	}
+	parsed, err := strconv.ParseFloat(number, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+	return int64(parsed * multiplier), nil
 }
 
 func parseBackupScheduleOrDefault(value, fallback string) string {
@@ -557,6 +621,10 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				MaxChunkCheckBatch:         heartbeat.Agent.MaxChunkCheckBatch,
 				MaxChunkUploadBatchBytes:   heartbeat.Agent.MaxChunkUploadBatchBytes,
 				MaxChunkResponseBytes:      heartbeat.Agent.MaxChunkResponseBytes,
+				ChunkPipelineEnabled:       heartbeat.Agent.ChunkPipelineEnabled,
+				MaxChunkCheckInflight:      heartbeat.Agent.MaxChunkCheckInflight,
+				MaxChunkUploadInflight:     heartbeat.Agent.MaxChunkUploadInflight,
+				MaxChunkPipelineBytes:      heartbeat.Agent.MaxChunkPipelineBytes,
 				ChunkBatchUpload:           heartbeat.Agent.ChunkBatchUpload,
 				CompactChunkCheckResponse:  heartbeat.Agent.CompactChunkCheckResponse,
 				CompactChunkUploadResponse: heartbeat.Agent.CompactChunkUploadResponse,
@@ -590,6 +658,10 @@ func runDaemon(client *agentClient, logger *slog.Logger, opts daemonOptions) err
 				MaxChunkCheckBatch:         heartbeat.Agent.MaxChunkCheckBatch,
 				MaxChunkUploadBatchBytes:   heartbeat.Agent.MaxChunkUploadBatchBytes,
 				MaxChunkResponseBytes:      heartbeat.Agent.MaxChunkResponseBytes,
+				ChunkPipelineEnabled:       heartbeat.Agent.ChunkPipelineEnabled,
+				MaxChunkCheckInflight:      heartbeat.Agent.MaxChunkCheckInflight,
+				MaxChunkUploadInflight:     heartbeat.Agent.MaxChunkUploadInflight,
+				MaxChunkPipelineBytes:      heartbeat.Agent.MaxChunkPipelineBytes,
 				ChunkBatchUpload:           heartbeat.Agent.ChunkBatchUpload,
 				CompactChunkCheckResponse:  heartbeat.Agent.CompactChunkCheckResponse,
 				CompactChunkUploadResponse: heartbeat.Agent.CompactChunkUploadResponse,
@@ -708,6 +780,10 @@ type backupRunOptions struct {
 	MaxChunkCheckBatch         int
 	MaxChunkUploadBatchBytes   int64
 	MaxChunkResponseBytes      int64
+	ChunkPipelineEnabled       bool
+	MaxChunkCheckInflight      int
+	MaxChunkUploadInflight     int
+	MaxChunkPipelineBytes      int64
 	ChunkBatchUpload           bool
 	CompactChunkCheckResponse  bool
 	CompactChunkUploadResponse bool
@@ -724,6 +800,7 @@ func runBackup(client *agentClient, root string, logger *slog.Logger, scanOption
 }
 
 func runBackupWithOptions(client *agentClient, roots []string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) error {
+	applyAgentRuntimeEnvOverrides(&opts)
 	roots, err := rootset.Normalize(roots)
 	if err != nil {
 		return err
@@ -852,6 +929,59 @@ func runBackupWithOptions(client *agentClient, roots []string, logger *slog.Logg
 	return nil
 }
 
+func applyAgentRuntimeEnvOverrides(opts *backupRunOptions) {
+	if opts == nil {
+		return
+	}
+	if raw := strings.TrimSpace(os.Getenv("TURBK_AGENT_CHUNK_PIPELINE_ENABLED")); raw != "" {
+		if parsed, ok := parseAgentBool(raw); ok && !parsed {
+			opts.ChunkPipelineEnabled = false
+		}
+	}
+	if value := envInt("TURBK_AGENT_MAX_CHUNK_CHECK_INFLIGHT", 0); value > 0 {
+		opts.MaxChunkCheckInflight = minPositiveInt(opts.MaxChunkCheckInflight, value)
+	}
+	if value := envInt("TURBK_AGENT_MAX_CHUNK_UPLOAD_INFLIGHT", 0); value > 0 {
+		opts.MaxChunkUploadInflight = minPositiveInt(opts.MaxChunkUploadInflight, value)
+	}
+	if raw := strings.TrimSpace(os.Getenv("TURBK_AGENT_MAX_CHUNK_PIPELINE_BYTES")); raw != "" {
+		if value, err := parseAgentByteSize(raw); err == nil && value > 0 {
+			opts.MaxChunkPipelineBytes = minPositiveInt64(opts.MaxChunkPipelineBytes, value)
+		}
+	}
+}
+
+func parseAgentBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true, true
+	case "0", "false", "no", "n", "off":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func minPositiveInt(serverValue, localValue int) int {
+	if serverValue <= 0 {
+		return localValue
+	}
+	if localValue <= 0 || localValue > serverValue {
+		return serverValue
+	}
+	return localValue
+}
+
+func minPositiveInt64(serverValue, localValue int64) int64 {
+	if serverValue <= 0 {
+		return localValue
+	}
+	if localValue <= 0 || localValue > serverValue {
+		return serverValue
+	}
+	return localValue
+}
+
 type agentSkipReporter struct {
 	logger *slog.Logger
 	total  int64
@@ -875,6 +1005,10 @@ type chunkBatchStats struct {
 	UploadRequestBytes  int64
 	CheckResponseBytes  int64
 	UploadResponseBytes int64
+	CheckDuration       time.Duration
+	UploadDuration      time.Duration
+	PipelineWait        time.Duration
+	MaxPipelineBytes    int64
 	PackedFiles         int64
 	PackedBytes         int64
 	PackCount           int64
@@ -888,6 +1022,12 @@ func (s *chunkBatchStats) Add(other chunkBatchStats) {
 	s.UploadRequestBytes += other.UploadRequestBytes
 	s.CheckResponseBytes += other.CheckResponseBytes
 	s.UploadResponseBytes += other.UploadResponseBytes
+	s.CheckDuration += other.CheckDuration
+	s.UploadDuration += other.UploadDuration
+	s.PipelineWait += other.PipelineWait
+	if other.MaxPipelineBytes > s.MaxPipelineBytes {
+		s.MaxPipelineBytes = other.MaxPipelineBytes
+	}
 	s.PackedFiles += other.PackedFiles
 	s.PackedBytes += other.PackedBytes
 	s.PackCount += other.PackCount
@@ -939,6 +1079,20 @@ type agentChunkBatcher struct {
 	requestBytes     int64
 }
 
+type agentChunkUploader interface {
+	Add(chunk []byte, entry *repository.FileEntry) (chunkBatchStats, error)
+	Flush() (chunkBatchStats, error)
+	EntryPending(entry *repository.FileEntry) bool
+	Stop()
+}
+
+func newAgentChunkUploader(client *agentClient, opts backupRunOptions, logger *slog.Logger) agentChunkUploader {
+	if opts.ChunkPipelineEnabled && opts.ChunkBatchUpload {
+		return newAgentChunkPipelineBatcher(client, opts, logger)
+	}
+	return newAgentChunkBatcher(client, opts)
+}
+
 func newAgentChunkBatcher(client *agentClient, opts backupRunOptions) *agentChunkBatcher {
 	maxChunks := normalizedAgentChunkCheckBatchLimit(opts.MaxChunkCheckBatch)
 	maxRequestBytes := opts.MaxChunkUploadBatchBytes
@@ -959,6 +1113,8 @@ func newAgentChunkBatcher(client *agentClient, opts backupRunOptions) *agentChun
 		pendingByEntry:   make(map[*repository.FileEntry]int),
 	}
 }
+
+func (b *agentChunkBatcher) Stop() {}
 
 func normalizedAgentChunkCheckBatchLimit(maxChunks int) int {
 	if maxChunks <= 0 {
@@ -1164,6 +1320,7 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 		hashes = append(hashes, chunk.hash)
 		byHash[chunk.hash] = chunk
 	}
+	checkStarted := time.Now()
 	checked, err := b.client.checkChunks(hashes, b.opts.RepositoryID, b.opts.ChunkGeneration, b.opts.CompactChunkCheckResponse)
 	if err != nil {
 		return chunkBatchStats{}, err
@@ -1173,6 +1330,7 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 	}
 	stats := chunkBatchStats{}
 	stats.CheckRequests++
+	stats.CheckDuration += time.Since(checkStarted)
 	stats.CheckResponseBytes += checked.ResponseBytes
 	catalogUpdates := make([]agentChunkStatusUpdate, 0, len(pending))
 	seen := make(map[string]struct{}, len(pending))
@@ -1209,11 +1367,13 @@ func (b *agentChunkBatcher) Flush() (chunkBatchStats, error) {
 		}
 	}
 	if len(missingChunks) > 0 {
+		uploadStarted := time.Now()
 		uploaded, err := b.client.uploadChunksBatch(missingChunks, b.opts.CompactChunkUploadResponse)
 		if err != nil {
 			return chunkBatchStats{}, err
 		}
 		stats.UploadRequests++
+		stats.UploadDuration += time.Since(uploadStarted)
 		stats.UploadRequestBytes += uploaded.RequestBytes
 		stats.UploadResponseBytes += uploaded.ResponseBytes
 		uploadedByHash, err := validateChunkUploadResponse(missingChunks, b.opts.RepositoryID, uploaded, b.opts.CompactChunkUploadResponse)
@@ -1270,6 +1430,580 @@ func (b *agentChunkBatcher) fillPendingChunk(chunk *pendingBatchChunk, ref repos
 	}
 }
 
+type chunkPipelineByteWindow struct {
+	limit   int64
+	used    int64
+	maxUsed int64
+	mu      sync.Mutex
+}
+
+func newChunkPipelineByteWindow(limit int64) *chunkPipelineByteWindow {
+	if limit <= 0 {
+		limit = defaultAgentMaxChunkPipelineBytes
+	}
+	return &chunkPipelineByteWindow{limit: limit}
+}
+
+func (w *chunkPipelineByteWindow) tryAcquire(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.used+n > w.limit {
+		return false
+	}
+	w.used += n
+	if w.used > w.maxUsed {
+		w.maxUsed = w.used
+	}
+	return true
+}
+
+func (w *chunkPipelineByteWindow) release(n int64) {
+	if n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.used -= n
+	if w.used < 0 {
+		w.used = 0
+	}
+}
+
+func (w *chunkPipelineByteWindow) max() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.maxUsed
+}
+
+type pipelineBatch struct {
+	id           int64
+	chunks       []*pendingBatchChunk
+	requestBytes int64
+	createdAt    time.Time
+}
+
+type pipelineResult struct {
+	batch          *pipelineBatch
+	checked        checkChunksResponse
+	uploaded       uploadChunksResponse
+	uploadedByHash map[string]uploadChunkResponse
+	checkDuration  time.Duration
+	uploadDuration time.Duration
+	err            error
+}
+
+type agentChunkPipelineBatcher struct {
+	client           *agentClient
+	opts             backupRunOptions
+	logger           *slog.Logger
+	maxChunks        int
+	maxRequestBytes  int64
+	maxResponseBytes int64
+	checkQueue       chan *pipelineBatch
+	results          chan pipelineResult
+	uploadSlots      chan struct{}
+	done             chan struct{}
+	stopOnce         sync.Once
+	wg               sync.WaitGroup
+	bytesWindow      *chunkPipelineByteWindow
+	pending          []*pendingBatchChunk
+	pendingByHash    map[string]*pendingBatchChunk
+	pendingByEntry   map[*repository.FileEntry]int
+	requestBytes     int64
+	nextBatchID      int64
+	err              error
+}
+
+func newAgentChunkPipelineBatcher(client *agentClient, opts backupRunOptions, logger *slog.Logger) *agentChunkPipelineBatcher {
+	maxChunks := normalizedAgentChunkCheckBatchLimit(opts.MaxChunkCheckBatch)
+	maxRequestBytes := opts.MaxChunkUploadBatchBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = defaultAgentChunkUploadBatchBytes
+	}
+	maxResponseBytes := opts.MaxChunkResponseBytes
+	if maxResponseBytes <= 0 {
+		maxResponseBytes = defaultAgentMaxChunkResponseBytes
+	}
+	checkInflight := opts.MaxChunkCheckInflight
+	if checkInflight <= 0 {
+		checkInflight = 1
+	}
+	uploadInflight := opts.MaxChunkUploadInflight
+	if uploadInflight <= 0 {
+		uploadInflight = 1
+	}
+	queueSize := checkInflight*2 + uploadInflight + 4
+	b := &agentChunkPipelineBatcher{
+		client:           client,
+		opts:             opts,
+		logger:           logger,
+		maxChunks:        maxChunks,
+		maxRequestBytes:  maxRequestBytes,
+		maxResponseBytes: maxResponseBytes,
+		checkQueue:       make(chan *pipelineBatch, queueSize),
+		results:          make(chan pipelineResult, queueSize),
+		uploadSlots:      make(chan struct{}, uploadInflight),
+		done:             make(chan struct{}),
+		bytesWindow:      newChunkPipelineByteWindow(opts.MaxChunkPipelineBytes),
+		pendingByHash:    make(map[string]*pendingBatchChunk),
+		pendingByEntry:   make(map[*repository.FileEntry]int),
+	}
+	for i := 0; i < checkInflight; i++ {
+		b.wg.Add(1)
+		go b.worker()
+	}
+	return b
+}
+
+func (b *agentChunkPipelineBatcher) Add(chunk []byte, entry *repository.FileEntry) (chunkBatchStats, error) {
+	stats, err := b.drainResults()
+	if err != nil {
+		return stats, err
+	}
+	if b.err != nil {
+		return stats, b.err
+	}
+	sum := blake3.Sum256(chunk)
+	hash := hex.EncodeToString(sum[:])
+	if b.opts.Catalog != nil {
+		status, confirmedGeneration, ok, err := b.opts.Catalog.chunkStatus(hash)
+		if err != nil {
+			return stats, err
+		}
+		if ok && status == "confirmed" && confirmedGeneration >= b.opts.ChunkGeneration {
+			entry.Chunks = append(entry.Chunks, repository.ChunkRef{Hash: hash, OriginalSize: int64(len(chunk))})
+			stats.Reused++
+			return stats, nil
+		}
+	}
+
+	index := len(entry.Chunks)
+	entry.Chunks = append(entry.Chunks, repository.ChunkRef{})
+	waiter := chunkBatchWaiter{entry: entry, index: index}
+	if pending, ok := b.pendingByHash[hash]; ok {
+		pending.waiters = append(pending.waiters, waiter)
+		b.pendingByEntry[entry]++
+		return stats, nil
+	}
+
+	chunkRequestBytes := int64(32 + 8 + len(chunk))
+	if 12+chunkRequestBytes > b.maxRequestBytes {
+		return stats, fmt.Errorf("chunk %s size %d exceeds max batch request size %d", hash, len(chunk), b.maxRequestBytes)
+	}
+	if int64(len(chunk)) > b.bytesWindow.limit {
+		return stats, fmt.Errorf("chunk %s size %d exceeds max pipeline bytes %d", hash, len(chunk), b.bytesWindow.limit)
+	}
+	if len(b.pending) > 0 && b.shouldFlushBeforeAdding(chunkRequestBytes) {
+		flushed, err := b.submitPending()
+		stats.Add(flushed)
+		if err != nil {
+			return stats, err
+		}
+	}
+	waitStarted := time.Now()
+	for !b.bytesWindow.tryAcquire(int64(len(chunk))) {
+		if len(b.pending) > 0 {
+			flushed, err := b.submitPending()
+			stats.Add(flushed)
+			if err != nil {
+				return stats, err
+			}
+			continue
+		}
+		waited, err := b.waitApplyResult()
+		stats.Add(waited)
+		if err != nil {
+			return stats, err
+		}
+	}
+	if waited := time.Since(waitStarted); waited > 0 {
+		stats.PipelineWait += waited
+	}
+
+	data := append([]byte(nil), chunk...)
+	if b.requestBytes == 0 {
+		b.requestBytes = 12
+	}
+	pending := &pendingBatchChunk{
+		hash:         hash,
+		data:         data,
+		originalSize: int64(len(data)),
+		waiters:      []chunkBatchWaiter{waiter},
+	}
+	b.pending = append(b.pending, pending)
+	b.pendingByHash[hash] = pending
+	b.pendingByEntry[entry]++
+	b.requestBytes += chunkRequestBytes
+	if len(b.pending) >= b.maxChunks ||
+		b.requestBytes >= b.maxRequestBytes ||
+		b.estimatedCheckResponseBytes(len(b.pending)) >= b.maxResponseBytes ||
+		b.estimatedUploadResponseBytes(len(b.pending)) >= b.maxResponseBytes {
+		flushed, err := b.submitPending()
+		stats.Add(flushed)
+		if err != nil {
+			return stats, err
+		}
+	}
+	stats.MaxPipelineBytes = b.bytesWindow.max()
+	return stats, nil
+}
+
+func (b *agentChunkPipelineBatcher) Flush() (chunkBatchStats, error) {
+	stats, err := b.submitPending()
+	if err != nil {
+		return stats, err
+	}
+	for {
+		drained, err := b.drainResults()
+		stats.Add(drained)
+		if err != nil {
+			return stats, err
+		}
+		if b.err != nil {
+			return stats, b.err
+		}
+		if len(b.pending) == 0 && len(b.pendingByHash) == 0 {
+			stats.MaxPipelineBytes = b.bytesWindow.max()
+			return stats, nil
+		}
+		waited, err := b.waitApplyResult()
+		stats.Add(waited)
+		if err != nil {
+			return stats, err
+		}
+	}
+}
+
+func (b *agentChunkPipelineBatcher) EntryPending(entry *repository.FileEntry) bool {
+	_, _ = b.drainResults()
+	return b.pendingByEntry[entry] > 0
+}
+
+func (b *agentChunkPipelineBatcher) Stop() {
+	b.stopOnce.Do(func() {
+		close(b.done)
+	})
+	b.wg.Wait()
+}
+
+func (b *agentChunkPipelineBatcher) submitPending() (chunkBatchStats, error) {
+	var stats chunkBatchStats
+	if len(b.pending) == 0 {
+		stats.MaxPipelineBytes = b.bytesWindow.max()
+		return stats, b.err
+	}
+	b.nextBatchID++
+	batch := &pipelineBatch{
+		id:           b.nextBatchID,
+		chunks:       append([]*pendingBatchChunk(nil), b.pending...),
+		requestBytes: b.requestBytes,
+		createdAt:    time.Now(),
+	}
+	b.pending = b.pending[:0]
+	b.requestBytes = 0
+	for {
+		if b.err != nil {
+			return stats, b.err
+		}
+		select {
+		case b.checkQueue <- batch:
+			stats.MaxPipelineBytes = b.bytesWindow.max()
+			return stats, nil
+		case result := <-b.results:
+			applied, err := b.applyResult(result)
+			stats.Add(applied)
+			if err != nil {
+				return stats, err
+			}
+		case <-b.done:
+			if b.err != nil {
+				return stats, b.err
+			}
+			return stats, errors.New("chunk pipeline stopped")
+		}
+	}
+}
+
+func (b *agentChunkPipelineBatcher) drainResults() (chunkBatchStats, error) {
+	var stats chunkBatchStats
+	for {
+		select {
+		case result := <-b.results:
+			applied, err := b.applyResult(result)
+			stats.Add(applied)
+			if err != nil {
+				return stats, err
+			}
+		default:
+			stats.MaxPipelineBytes = b.bytesWindow.max()
+			return stats, b.err
+		}
+	}
+}
+
+func (b *agentChunkPipelineBatcher) waitApplyResult() (chunkBatchStats, error) {
+	select {
+	case result := <-b.results:
+		return b.applyResult(result)
+	case <-b.done:
+		if b.err != nil {
+			return chunkBatchStats{}, b.err
+		}
+		return chunkBatchStats{}, errors.New("chunk pipeline stopped")
+	}
+}
+
+func (b *agentChunkPipelineBatcher) applyResult(result pipelineResult) (chunkBatchStats, error) {
+	stats := chunkBatchStats{
+		CheckDuration:    result.checkDuration,
+		UploadDuration:   result.uploadDuration,
+		MaxPipelineBytes: b.bytesWindow.max(),
+	}
+	if result.err != nil {
+		b.err = result.err
+		return stats, result.err
+	}
+	if result.batch == nil {
+		return stats, nil
+	}
+	hashes := make([]string, 0, len(result.batch.chunks))
+	byHash := make(map[string]*pendingBatchChunk, len(result.batch.chunks))
+	for _, chunk := range result.batch.chunks {
+		hashes = append(hashes, chunk.hash)
+		byHash[chunk.hash] = chunk
+	}
+	stats.CheckRequests++
+	stats.CheckResponseBytes += result.checked.ResponseBytes
+	catalogUpdates := make([]agentChunkStatusUpdate, 0, len(result.batch.chunks))
+	checkGeneration := result.checked.ChunkGeneration
+	if checkGeneration == 0 {
+		checkGeneration = b.opts.ChunkGeneration
+	}
+	for _, hash := range existingChunkHashes(hashes, result.checked, b.opts.CompactChunkCheckResponse) {
+		chunk, ok := byHash[hash]
+		if !ok {
+			b.err = fmt.Errorf("server check returned unexpected chunk %s", hash)
+			return stats, b.err
+		}
+		ref := repository.ChunkRef{Hash: hash, OriginalSize: chunk.originalSize}
+		b.resolveChunk(chunk, ref)
+		stats.Reused += int64(len(chunk.waiters))
+		if b.opts.Catalog != nil {
+			catalogUpdates = append(catalogUpdates, agentChunkStatusUpdate{
+				Hash:         hash,
+				OriginalSize: chunk.originalSize,
+				Status:       "confirmed",
+				Generation:   checkGeneration,
+			})
+		}
+	}
+	if len(result.uploadedByHash) > 0 {
+		stats.UploadRequests++
+		stats.UploadRequestBytes += result.uploaded.RequestBytes
+		stats.UploadResponseBytes += result.uploaded.ResponseBytes
+		uploadGeneration := result.uploaded.ChunkGeneration
+		if uploadGeneration == 0 {
+			uploadGeneration = b.opts.ChunkGeneration
+		}
+		for _, hash := range result.checked.Missing {
+			chunk, ok := byHash[hash]
+			if !ok {
+				b.err = fmt.Errorf("server check returned unexpected missing chunk %s", hash)
+				return stats, b.err
+			}
+			resp := result.uploadedByHash[hash]
+			b.resolveChunk(chunk, resp.Ref)
+			if resp.Uploaded {
+				stats.Uploaded++
+				if len(chunk.waiters) > 1 {
+					stats.Reused += int64(len(chunk.waiters) - 1)
+				}
+			} else {
+				stats.Reused += int64(len(chunk.waiters))
+			}
+			if b.opts.Catalog != nil {
+				catalogUpdates = append(catalogUpdates, agentChunkStatusUpdate{
+					Hash:         chunk.hash,
+					OriginalSize: resp.Ref.OriginalSize,
+					Status:       "confirmed",
+					Generation:   uploadGeneration,
+					Uploaded:     resp.Uploaded,
+				})
+			}
+		}
+	}
+	if b.opts.Catalog != nil && len(catalogUpdates) > 0 {
+		if err := b.opts.Catalog.markChunks(catalogUpdates); err != nil {
+			b.err = err
+			return stats, err
+		}
+	}
+	stats.MaxPipelineBytes = b.bytesWindow.max()
+	return stats, nil
+}
+
+func (b *agentChunkPipelineBatcher) resolveChunk(chunk *pendingBatchChunk, ref repository.ChunkRef) {
+	if chunk == nil {
+		return
+	}
+	for _, waiter := range chunk.waiters {
+		waiter.entry.Chunks[waiter.index] = ref
+		if count := b.pendingByEntry[waiter.entry]; count <= 1 {
+			delete(b.pendingByEntry, waiter.entry)
+		} else {
+			b.pendingByEntry[waiter.entry] = count - 1
+		}
+	}
+	delete(b.pendingByHash, chunk.hash)
+	b.bytesWindow.release(chunk.originalSize)
+}
+
+func (b *agentChunkPipelineBatcher) worker() {
+	defer b.wg.Done()
+	for {
+		select {
+		case <-b.done:
+			return
+		case batch := <-b.checkQueue:
+			if batch == nil {
+				continue
+			}
+			b.publishResult(b.processBatch(batch))
+		}
+	}
+}
+
+func (b *agentChunkPipelineBatcher) processBatch(batch *pipelineBatch) pipelineResult {
+	result := pipelineResult{batch: batch}
+	hashes := make([]string, 0, len(batch.chunks))
+	byHash := make(map[string]*pendingBatchChunk, len(batch.chunks))
+	for _, chunk := range batch.chunks {
+		hashes = append(hashes, chunk.hash)
+		byHash[chunk.hash] = chunk
+	}
+	checkStarted := time.Now()
+	checked, err := b.client.checkChunks(hashes, b.opts.RepositoryID, b.opts.ChunkGeneration, b.opts.CompactChunkCheckResponse)
+	result.checkDuration = time.Since(checkStarted)
+	if err != nil {
+		result.err = err
+		return result
+	}
+	if err := validateChunkCheckResponse(hashes, b.opts.RepositoryID, checked, b.opts.CompactChunkCheckResponse); err != nil {
+		result.err = err
+		return result
+	}
+	result.checked = checked
+	if b.logger != nil {
+		b.logger.Debug("agent chunk pipeline check",
+			"batch_id", batch.id,
+			"hashes", len(hashes),
+			"request_bytes", estimateAgentChunkCheckRequestBytes(hashes),
+			"response_bytes", checked.ResponseBytes,
+			"duration", result.checkDuration.String(),
+			"compact_response", b.opts.CompactChunkCheckResponse,
+		)
+	}
+	missingChunks := make([]*pendingBatchChunk, 0, len(checked.Missing))
+	for _, hash := range checked.Missing {
+		chunk, ok := byHash[hash]
+		if !ok {
+			result.err = fmt.Errorf("server check returned unexpected missing chunk %s", hash)
+			return result
+		}
+		missingChunks = append(missingChunks, chunk)
+	}
+	if len(missingChunks) == 0 {
+		return result
+	}
+	if err := b.acquireUploadSlot(); err != nil {
+		result.err = err
+		return result
+	}
+	uploadStarted := time.Now()
+	uploaded, err := b.client.uploadChunksBatch(missingChunks, b.opts.CompactChunkUploadResponse)
+	result.uploadDuration = time.Since(uploadStarted)
+	b.releaseUploadSlot()
+	if err != nil {
+		result.err = err
+		return result
+	}
+	uploadedByHash, err := validateChunkUploadResponse(missingChunks, b.opts.RepositoryID, uploaded, b.opts.CompactChunkUploadResponse)
+	if err != nil {
+		result.err = err
+		return result
+	}
+	result.uploaded = uploaded
+	result.uploadedByHash = uploadedByHash
+	if b.logger != nil {
+		b.logger.Debug("agent chunk pipeline upload",
+			"batch_id", batch.id,
+			"chunks", len(missingChunks),
+			"request_bytes", uploaded.RequestBytes,
+			"response_bytes", uploaded.ResponseBytes,
+			"duration", result.uploadDuration.String(),
+			"compact_response", b.opts.CompactChunkUploadResponse,
+		)
+	}
+	return result
+}
+
+func (b *agentChunkPipelineBatcher) acquireUploadSlot() error {
+	select {
+	case b.uploadSlots <- struct{}{}:
+		return nil
+	case <-b.done:
+		if b.err != nil {
+			return b.err
+		}
+		return errors.New("chunk pipeline stopped")
+	}
+}
+
+func (b *agentChunkPipelineBatcher) releaseUploadSlot() {
+	select {
+	case <-b.uploadSlots:
+	default:
+	}
+}
+
+func (b *agentChunkPipelineBatcher) publishResult(result pipelineResult) {
+	select {
+	case b.results <- result:
+	case <-b.done:
+	}
+}
+
+func (b *agentChunkPipelineBatcher) shouldFlushBeforeAdding(nextRequestBytes int64) bool {
+	nextCount := len(b.pending) + 1
+	return nextCount > b.maxChunks ||
+		b.requestBytes+nextRequestBytes > b.maxRequestBytes ||
+		b.estimatedCheckResponseBytes(nextCount) > b.maxResponseBytes ||
+		b.estimatedUploadResponseBytes(nextCount) > b.maxResponseBytes
+}
+
+func (b *agentChunkPipelineBatcher) estimatedCheckResponseBytes(chunkCount int) int64 {
+	return estimatedChunkBatchResponseBaseBytes + int64(chunkCount)*estimatedChunkCheckResponseBytesPerHash
+}
+
+func (b *agentChunkPipelineBatcher) estimatedUploadResponseBytes(chunkCount int) int64 {
+	perChunk := estimatedFullChunkUploadResponseBytesPerChunk
+	if b.opts.CompactChunkUploadResponse {
+		perChunk = estimatedCompactChunkUploadResponseBytesPerChunk
+	}
+	return estimatedChunkBatchResponseBaseBytes + int64(chunkCount)*perChunk
+}
+
+func estimateAgentChunkCheckRequestBytes(hashes []string) int64 {
+	total := int64(128)
+	for _, hash := range hashes {
+		total += int64(len(hash) + 4)
+	}
+	return total
+}
+
 func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Logger, scanOptions fsfilter.Options, opts backupRunOptions) (*repository.SnapshotManifest, error) {
 	manifest := &repository.SnapshotManifest{
 		CreatedAt:  time.Now().UTC(),
@@ -1294,7 +2028,8 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 		return c.sendProgress(runID, progress)
 	}
 	skipReporter := &agentSkipReporter{logger: logger}
-	chunkBatcher := newAgentChunkBatcher(c, opts)
+	chunkBatcher := newAgentChunkUploader(c, opts, logger)
+	defer chunkBatcher.Stop()
 	packBatcher := newAgentSmallFilePackBatcher(opts)
 	fileCatalogBatcher := newAgentFileCatalogBatcher(opts.Catalog, logger)
 	var batchStats chunkBatchStats
@@ -1600,6 +2335,13 @@ func (c *agentClient) scanAndUpload(runID int64, roots []string, logger *slog.Lo
 		"chunk_upload_request_bytes", batchStats.UploadRequestBytes,
 		"chunk_check_response_bytes", batchStats.CheckResponseBytes,
 		"chunk_upload_response_bytes", batchStats.UploadResponseBytes,
+		"chunk_pipeline_enabled", opts.ChunkPipelineEnabled && opts.ChunkBatchUpload,
+		"chunk_check_inflight", opts.MaxChunkCheckInflight,
+		"chunk_upload_inflight", opts.MaxChunkUploadInflight,
+		"chunk_pipeline_wait", batchStats.PipelineWait.String(),
+		"chunk_check_duration", batchStats.CheckDuration.String(),
+		"chunk_upload_duration", batchStats.UploadDuration.String(),
+		"chunk_pipeline_max_bytes", batchStats.MaxPipelineBytes,
 		"manifest_bytes", estimateManifestBytes(manifest),
 		"packed_files", batchStats.PackedFiles,
 		"packed_bytes", batchStats.PackedBytes,

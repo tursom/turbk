@@ -8,6 +8,10 @@
 
 本文中的“所有 chunk 接口批量化”指：新 agent 的扫描、上传、manifest 缺失修复和 generation 失效校验路径都必须使用批量接口。旧单 chunk GET/PUT 只作为兼容旧 agent 的 legacy endpoint，不作为新 agent 的正常路径。
 
+相关后续设计：
+
+- [Agent 高延迟网络吞吐优化设计](agent-high-latency-pipeline-design.md)
+
 ## 1. 背景
 
 Agent 当前已经支持批量 chunk check：
