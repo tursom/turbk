@@ -542,10 +542,17 @@ func (s *Store) UpsertAgentHeartbeat(ctx context.Context, input AgentHeartbeatIn
 	if input.Now.IsZero() {
 		input.Now = time.Now().UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO agent_heartbeats (
-			token_subject, hostname, agent_version, mode, state_dir, catalog_status, repository_id,
-			chunk_generation, config_generation, command_generation, running_run_id, last_error, last_seen_at
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin agent heartbeat transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+			INSERT INTO agent_heartbeats (
+				token_subject, hostname, agent_version, mode, state_dir, catalog_status, repository_id,
+				chunk_generation, config_generation, command_generation, running_run_id, last_error, last_seen_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(token_subject) DO UPDATE SET
@@ -573,12 +580,35 @@ func (s *Store) UpsertAgentHeartbeat(ctx context.Context, input AgentHeartbeatIn
 		nonNegative(input.CommandGeneration),
 		input.RunningRunID,
 		nullString(input.LastError),
-		input.Now.UTC())
-	if err != nil {
+		input.Now.UTC()); err != nil {
 		return fmt.Errorf("upsert agent heartbeat: %w", err)
 	}
-	if _, err := s.UpdateHostStatus(ctx, input.HostID, input.Hostname, "online", input.Now); err != nil {
+	addressValue := sql.NullString{String: input.Hostname, Valid: input.Hostname != ""}
+	lastSeenValue := sql.NullTime{Time: input.Now.UTC(), Valid: true}
+	result, err := tx.ExecContext(ctx, `
+			UPDATE hosts
+			SET address = ?, status = 'online', last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?`, addressValue, lastSeenValue, input.HostID)
+	if err != nil {
 		return fmt.Errorf("update agent host: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get updated agent host rows affected: %w", err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("host %d not found", input.HostID)
+	}
+	if input.CredentialID > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE agent_credentials
+			SET last_used_at = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE credential_id = ? AND revoked_at IS NULL`, input.Now.UTC(), input.CredentialID); err != nil {
+			return fmt.Errorf("update agent credential usage: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit agent heartbeat transaction: %w", err)
 	}
 	return nil
 }

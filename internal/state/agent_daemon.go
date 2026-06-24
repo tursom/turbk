@@ -38,6 +38,7 @@ type ChunkInvalidations struct {
 }
 
 type AgentHeartbeatInput struct {
+	CredentialID      int64
 	HostID            int64
 	Subject           string
 	Hostname          string

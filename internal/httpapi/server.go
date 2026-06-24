@@ -854,6 +854,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		runningRunID = sql.NullInt64{Int64: *req.RunningRunID, Valid: true}
 	}
 	if err := s.store.UpsertAgentHeartbeat(r.Context(), state.AgentHeartbeatInput{
+		CredentialID:      agent.Credential.ID,
 		HostID:            agent.HostID,
 		Subject:           agent.Subject,
 		Hostname:          req.Hostname,

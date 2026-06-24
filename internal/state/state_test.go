@@ -261,6 +261,29 @@ func TestAgentCredentialIndexedLookup(t *testing.T) {
 	if auth.HostID != host.ID || auth.Credential.ID != credential.ID || auth.Subject != "agent-host" {
 		t.Fatalf("unexpected agent auth context: %+v", auth)
 	}
+	var lastUsed sql.NullTime
+	if err := store.db.QueryRowContext(ctx, `SELECT last_used_at FROM agent_credentials WHERE credential_id = ?`, credential.ID).Scan(&lastUsed); err != nil {
+		t.Fatalf("query last_used_at after auth lookup: %v", err)
+	}
+	if lastUsed.Valid {
+		t.Fatal("auth lookup should not synchronously update agent credential usage")
+	}
+	if err := store.UpsertAgentHeartbeat(ctx, AgentHeartbeatInput{
+		CredentialID: credential.ID,
+		HostID:       host.ID,
+		Subject:      "agent-host",
+		Hostname:     "agent-hostname",
+		Version:      "test",
+		Now:          time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertAgentHeartbeat() error = %v", err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT last_used_at FROM agent_credentials WHERE credential_id = ?`, credential.ID).Scan(&lastUsed); err != nil {
+		t.Fatalf("query last_used_at after heartbeat: %v", err)
+	}
+	if !lastUsed.Valid {
+		t.Fatal("agent heartbeat did not set last_used_at")
+	}
 	if _, err := store.FindAgentCredentialByClientSecret(ctx, clientID, "wrong"); !errors.Is(err, ErrAgentCredentialNotFound) {
 		t.Fatalf("wrong secret error = %v, want ErrAgentCredentialNotFound", err)
 	}

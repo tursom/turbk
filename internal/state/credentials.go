@@ -286,12 +286,6 @@ func (s *Store) FindAgentCredentialByClientSecret(ctx context.Context, clientID,
 		auth.Subject = auth.Credential.Name
 		auth.Credential.Subject = auth.Subject
 	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE agent_credentials
-		SET last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-		WHERE credential_id = ?`, auth.Credential.ID); err != nil {
-		return AgentCredentialAuth{}, fmt.Errorf("update agent credential usage: %w", err)
-	}
 	return auth, nil
 }
 
