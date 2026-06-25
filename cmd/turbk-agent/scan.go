@@ -27,6 +27,23 @@ type agentSkipReporter struct {
 	logged int64
 }
 
+var errAgentPathChanged = errors.New("path changed during scan")
+
+type changedPathError struct {
+	path string
+}
+
+func (e changedPathError) Error() string {
+	if e.path == "" {
+		return errAgentPathChanged.Error()
+	}
+	return fmt.Sprintf("%s: %s", e.path, errAgentPathChanged)
+}
+
+func (e changedPathError) Unwrap() error {
+	return errAgentPathChanged
+}
+
 func (r *agentSkipReporter) record(event fsfilter.SkipEvent) {
 	r.total++
 	if r.logger == nil || r.logged >= 20 {
@@ -50,6 +67,8 @@ func agentPathErrorSkipEvent(root, scanPath string, err error) (fsfilter.SkipEve
 		reason = "path disappeared during scan"
 	case errors.Is(err, fs.ErrPermission) || os.IsPermission(err):
 		reason = "permission denied during scan"
+	case errors.Is(err, errAgentPathChanged):
+		reason = "path changed during scan"
 	case isAgentPathIOError(err):
 		reason = "filesystem IO error during scan"
 	}
@@ -384,7 +403,7 @@ func (s *backupScanner) handlePackFile(root, catalogPath, path string, entry rep
 			return s.appendManifestEntry(entry)
 		}
 	}
-	packFile, err := readPackFilePayload(root, catalogPath, path, record, entry)
+	packFile, err := s.readPackFilePayloadWithRetry(root, catalogPath, path, record, entry)
 	if err != nil {
 		if event, skip := agentPathErrorSkipEvent(root, path, err); skip {
 			s.skipReporter.record(event)
@@ -415,17 +434,33 @@ func (s *backupScanner) queueParallelFile(root, catalogPath, path string, entry 
 }
 
 func (s *backupScanner) uploadRegularFile(root, path string, entry repository.FileEntry, record catalogFileRecord) error {
+	for attempt := 0; attempt <= defaultAgentChangedFileReadMaxRetries; attempt++ {
+		err := s.uploadRegularFileOnce(root, path, entry, record)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errAgentPathChanged) || attempt >= defaultAgentChangedFileReadMaxRetries {
+			return s.skipPathOrError(root, path, err)
+		}
+		s.logger.Warn("agent file changed while reading; retrying", "path", path, "attempt", attempt+1, "max_retries", defaultAgentChangedFileReadMaxRetries)
+		refreshedEntry, refreshedRecord, refreshErr := refreshedRegularFileReadState(root, record.Path, path, entry)
+		if refreshErr != nil {
+			return s.skipPathOrError(root, path, refreshErr)
+		}
+		entry = refreshedEntry
+		record = refreshedRecord
+	}
+	return changedPathError{path: path}
+}
+
+func (s *backupScanner) uploadRegularFileOnce(root, path string, entry repository.FileEntry, record catalogFileRecord) error {
 	file, err := agentOpen(path)
 	if err != nil {
-		if event, skip := agentPathErrorSkipEvent(root, path, err); skip {
-			s.skipReporter.record(event)
-			s.progress.Message = "skipped " + event.Rel
-			return s.sendProgress(false)
-		}
 		return fmt.Errorf("open file %q: %w", path, err)
 	}
 	entryPtr := &entry
-	if err := s.chunker.Split(file, func(chunk []byte) error {
+	reader := newRegularFileSnapshotReader(root, record.Path, path, file, record)
+	if err := s.chunker.Split(reader, func(chunk []byte) error {
 		stats, err := s.chunkUploader.Add(chunk, entryPtr)
 		if err != nil {
 			_ = file.Close()
@@ -435,20 +470,18 @@ func (s *backupScanner) uploadRegularFile(root, path string, entry repository.Fi
 		return s.sendProgress(false)
 	}); err != nil {
 		_ = file.Close()
-		if event, skip := agentPathErrorSkipEvent(root, path, err); skip {
-			s.skipReporter.record(event)
-			s.progress.Message = "skipped " + event.Rel
-			return s.sendProgress(false)
-		}
 		return fmt.Errorf("chunk file %q: %w", path, err)
 	}
+	stat, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("stat file %q after read: %w", path, err)
+	}
 	if err := file.Close(); err != nil {
-		if event, skip := agentPathErrorSkipEvent(root, path, err); skip {
-			s.skipReporter.record(event)
-			s.progress.Message = "skipped " + event.Rel
-			return s.sendProgress(false)
-		}
 		return fmt.Errorf("close file %q: %w", path, err)
+	}
+	if err := updateRegularFileReadMetadata(root, record.Path, path, reader.BytesRead(), stat, entryPtr, &record); err != nil {
+		return err
 	}
 	s.progress.ProcessedFiles++
 	s.progress.ProcessedBytes += entry.Size
@@ -457,6 +490,15 @@ func (s *backupScanner) uploadRegularFile(root, path string, entry repository.Fi
 		return err
 	}
 	return s.sendProgress(true)
+}
+
+func (s *backupScanner) skipPathOrError(root, path string, err error) error {
+	if event, skip := agentPathErrorSkipEvent(root, path, err); skip {
+		s.skipReporter.record(event)
+		s.progress.Message = "skipped " + event.Rel
+		return s.sendProgress(false)
+	}
+	return err
 }
 
 func (s *backupScanner) processParallelJobs() error {
@@ -718,13 +760,13 @@ func readPackFilePayload(root, catalogPath, filePath string, initial catalogFile
 		return repository.PackFilePayload{}, fmt.Errorf("close small file %q: %w", filePath, closeErr)
 	}
 	if int64(len(data)) != entry.Size {
-		return repository.PackFilePayload{}, fmt.Errorf("small file %q changed while reading", filePath)
+		return repository.PackFilePayload{}, fmt.Errorf("small file %q changed while reading: %w", filePath, errAgentPathChanged)
 	}
 	current := catalogRecordFromFile(root, catalogPath, stat)
 	current.Type = initial.Type
 	current.LinkTarget = initial.LinkTarget
 	if !catalogFileMatches(current, initial) {
-		return repository.PackFilePayload{}, fmt.Errorf("small file %q metadata changed while reading", filePath)
+		return repository.PackFilePayload{}, fmt.Errorf("small file %q metadata changed while reading: %w", filePath, errAgentPathChanged)
 	}
 	return repository.PackFilePayload{
 		Path:    entry.Path,
@@ -732,6 +774,26 @@ func readPackFilePayload(root, catalogPath, filePath string, initial catalogFile
 		ModTime: entry.ModTime,
 		Data:    data,
 	}, nil
+}
+
+func (s *backupScanner) readPackFilePayloadWithRetry(root, catalogPath, filePath string, record catalogFileRecord, entry repository.FileEntry) (repository.PackFilePayload, error) {
+	for attempt := 0; attempt <= defaultAgentChangedFileReadMaxRetries; attempt++ {
+		payload, err := readPackFilePayload(root, catalogPath, filePath, record, entry)
+		if err == nil {
+			return payload, nil
+		}
+		if !errors.Is(err, errAgentPathChanged) || attempt >= defaultAgentChangedFileReadMaxRetries {
+			return repository.PackFilePayload{}, err
+		}
+		s.logger.Warn("agent small file changed while reading; retrying", "path", filePath, "attempt", attempt+1, "max_retries", defaultAgentChangedFileReadMaxRetries)
+		refreshedEntry, refreshedRecord, refreshErr := refreshedRegularFileReadState(root, catalogPath, filePath, entry)
+		if refreshErr != nil {
+			return repository.PackFilePayload{}, refreshErr
+		}
+		entry = refreshedEntry
+		record = refreshedRecord
+	}
+	return repository.PackFilePayload{}, changedPathError{path: filePath}
 }
 
 func cloneChunkRefs(chunks []repository.ChunkRef) []repository.ChunkRef {
@@ -749,6 +811,111 @@ func estimateManifestBytes(manifest *repository.SnapshotManifest) int64 {
 		return 0
 	}
 	return int64(len(data))
+}
+
+type regularFileSnapshotReader struct {
+	root        string
+	catalogPath string
+	filePath    string
+	file        *os.File
+	initial     catalogFileRecord
+	bytesRead   int64
+}
+
+func newRegularFileSnapshotReader(root, catalogPath, filePath string, file *os.File, initial catalogFileRecord) *regularFileSnapshotReader {
+	return &regularFileSnapshotReader{
+		root:        root,
+		catalogPath: catalogPath,
+		filePath:    filePath,
+		file:        file,
+		initial:     initial,
+	}
+}
+
+func (r *regularFileSnapshotReader) Read(p []byte) (int, error) {
+	n, err := r.file.Read(p)
+	if n > 0 {
+		r.bytesRead += int64(n)
+		if checkErr := ensureRegularFileUnchangedDuringRead(r.root, r.catalogPath, r.filePath, r.file, r.bytesRead, r.initial); checkErr != nil {
+			return n, checkErr
+		}
+	}
+	return n, err
+}
+
+func (r *regularFileSnapshotReader) BytesRead() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.bytesRead
+}
+
+func refreshedRegularFileReadState(root, catalogPath, filePath string, entry repository.FileEntry) (repository.FileEntry, catalogFileRecord, error) {
+	info, err := agentLstat(filePath)
+	if err != nil {
+		return repository.FileEntry{}, catalogFileRecord{}, fmt.Errorf("stat file %q before retry: %w", filePath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return repository.FileEntry{}, catalogFileRecord{}, fmt.Errorf("file %q is no longer regular: %w", filePath, errAgentPathChanged)
+	}
+	entry = refreshedFileEntry(root, catalogPath, entry, info)
+	record := catalogRecordFromFile(root, catalogPath, info)
+	record.Type = string(repository.EntryTypeFile)
+	return entry, record, nil
+}
+
+func refreshedFileEntry(root, catalogPath string, entry repository.FileEntry, info fs.FileInfo) repository.FileEntry {
+	uid, gid := fileOwner(info)
+	entry.Size = info.Size()
+	entry.Mode = uint32(info.Mode())
+	entry.ModTime = info.ModTime().UTC()
+	entry.UID = uid
+	entry.GID = gid
+	entry.Chunks = nil
+	entry.Pack = nil
+	return entry
+}
+
+func ensureRegularFileUnchangedDuringRead(root, catalogPath, filePath string, file *os.File, bytesRead int64, initial catalogFileRecord) error {
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat file %q during read: %w", filePath, err)
+	}
+	if bytesRead > stat.Size() {
+		return fmt.Errorf("file %q shrank while reading: read %d bytes, stat size is %d: %w", filePath, bytesRead, stat.Size(), errAgentPathChanged)
+	}
+	current := catalogRecordFromFile(root, catalogPath, stat)
+	current.Type = string(repository.EntryTypeFile)
+	if current.Size != initial.Size ||
+		current.Mode != initial.Mode ||
+		current.UID != initial.UID ||
+		current.GID != initial.GID ||
+		current.MTimeNS != initial.MTimeNS ||
+		current.Dev != initial.Dev ||
+		current.Inode != initial.Inode {
+		return changedPathError{path: filePath}
+	}
+	return nil
+}
+
+func updateRegularFileReadMetadata(root, catalogPath, filePath string, bytesRead int64, stat fs.FileInfo, entry *repository.FileEntry, record *catalogFileRecord) error {
+	if stat == nil {
+		return fmt.Errorf("stat file %q after read: missing stat: %w", filePath, errAgentPathChanged)
+	}
+	if stat.Size() != bytesRead {
+		return fmt.Errorf("file %q changed while reading: read %d bytes, stat size is %d: %w", filePath, bytesRead, stat.Size(), errAgentPathChanged)
+	}
+	next := catalogRecordFromFile(root, catalogPath, stat)
+	next.Type = string(repository.EntryTypeFile)
+	if !catalogFileMatches(next, *record) {
+		return fmt.Errorf("file %q metadata changed while reading: %w", filePath, errAgentPathChanged)
+	}
+	entry.Size = stat.Size()
+	entry.Mode = uint32(stat.Mode())
+	entry.ModTime = stat.ModTime().UTC()
+	entry.UID, entry.GID = fileOwner(stat)
+	*record = next
+	return nil
 }
 
 func (c *agentClient) tryReuseCatalogFile(catalog *agentCatalog, record catalogFileRecord, entry *repository.FileEntry, opts backupRunOptions) (bool, error) {

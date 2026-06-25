@@ -26,6 +26,8 @@ const defaultAgentMaxChunkPipelineBytes = int64(128 * 1024 * 1024)
 
 const defaultAgentFileReadPipelineBytes = int64(512 * 1024 * 1024)
 
+const defaultAgentChangedFileReadMaxRetries = 3
+
 const defaultAgentChunkBatchMaxRetries = 5
 
 const defaultAgentChunkBatchRetryInitialBackoff = 500 * time.Millisecond

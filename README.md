@@ -101,6 +101,8 @@ go run ./cmd/turbk-agent \
 
 Agent 默认启用 `-skip-pseudo-fs=true`，会跳过 procfs、sysfs、cgroup 等 Linux 伪文件系统，避免读取 `/proc/*/attr/*` 这类伪文件导致备份失败。需要额外排除路径时可用 `-exclude` 或 `TURBK_AGENT_EXCLUDES`，规则相对备份根目录，多个规则用逗号或换行分隔。
 
+Agent 读取普通文件时会校验读取过程中的大小和元数据是否稳定。若文件在读取期间发生变化，agent 会有限重试；多次重试后仍持续变化的文件会被跳过，以避免提交文件大小与 chunk 字节数不一致的 manifest。这个机制只保证备份集结构一致，不保证数据库等多文件/页级更新应用的一致性；数据库请优先使用数据库原生备份、逻辑导出，或配合 LVM/ZFS/Btrfs/云盘快照等一致性快照，并按需通过 `-exclude` 排除在线数据文件。
+
 创建并运行一个本地备份任务。本地来源也先创建 Host，具体备份路径放在 Job 的 `source_config.root`：
 
 ```bash

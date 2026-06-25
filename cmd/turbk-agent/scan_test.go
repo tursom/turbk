@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -158,6 +160,284 @@ func TestScanAndUploadParallelSkipsPathRemovedBeforeRead(t *testing.T) {
 	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
 		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
 	}
+}
+
+func TestScanAndUploadRetriesFileChangedDuringRead(t *testing.T) {
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "changed.log")
+	if err := os.WriteFile(changedPath, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	finalData := []byte("initial plus appended log data")
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	changed := false
+	agentOpen = func(path string) (*os.File, error) {
+		if path == changedPath && !changed {
+			changed = true
+			if err := os.WriteFile(path, finalData, 0o644); err != nil {
+				return nil, err
+			}
+		}
+		return originalOpen(path)
+	}
+
+	server := newAgentScanLegacyChunkServer(t)
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("test did not mutate file during read")
+	}
+	entry, ok := manifest.Find("changed.log")
+	if !ok {
+		t.Fatal("changed file was not included after retry")
+	}
+	if entry.Size != int64(len(finalData)) {
+		t.Fatalf("changed file size = %d, want %d", entry.Size, len(finalData))
+	}
+	if chunkBytes(entry) != entry.Size {
+		t.Fatalf("changed file chunk bytes = %d, want %d", chunkBytes(entry), entry.Size)
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadSkipsFileChangedAfterRetries(t *testing.T) {
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "changed.log")
+	if err := os.WriteFile(changedPath, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	opens := 0
+	agentOpen = func(path string) (*os.File, error) {
+		if path == changedPath {
+			opens++
+			if err := os.WriteFile(path, []byte(strings.Repeat("changed ", opens+1)), 0o644); err != nil {
+				return nil, err
+			}
+		}
+		return originalOpen(path)
+	}
+
+	server := newAgentScanLegacyChunkServer(t)
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if opens != defaultAgentChangedFileReadMaxRetries+1 {
+		t.Fatalf("changed file opens = %d, want %d", opens, defaultAgentChangedFileReadMaxRetries+1)
+	}
+	if _, ok := manifest.Find("changed.log"); ok {
+		t.Fatal("changed file was included after retry exhaustion")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadParallelRetriesFileChangedDuringRead(t *testing.T) {
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "changed.log")
+	if err := os.WriteFile(changedPath, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	finalData := []byte("initial plus appended log data")
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	changed := false
+	agentOpen = func(path string) (*os.File, error) {
+		if path == changedPath && !changed {
+			changed = true
+			if err := os.WriteFile(path, finalData, 0o644); err != nil {
+				return nil, err
+			}
+		}
+		return originalOpen(path)
+	}
+
+	server := newAgentScanLegacyChunkServer(t)
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{
+		ScanParallelEnabled: true,
+		FileReadWorkers:     1,
+	})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("test did not mutate file during read")
+	}
+	entry, ok := manifest.Find("changed.log")
+	if !ok {
+		t.Fatal("changed file was not included after retry")
+	}
+	if entry.Size != int64(len(finalData)) {
+		t.Fatalf("changed file size = %d, want %d", entry.Size, len(finalData))
+	}
+	if chunkBytes(entry) != entry.Size {
+		t.Fatalf("changed file chunk bytes = %d, want %d", chunkBytes(entry), entry.Size)
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestScanAndUploadParallelSkipsFileChangedAfterRetries(t *testing.T) {
+	root := t.TempDir()
+	changedPath := filepath.Join(root, "changed.log")
+	if err := os.WriteFile(changedPath, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalOpen := agentOpen
+	t.Cleanup(func() {
+		agentOpen = originalOpen
+	})
+	opens := 0
+	agentOpen = func(path string) (*os.File, error) {
+		if path == changedPath {
+			opens++
+			if err := os.WriteFile(path, []byte(strings.Repeat("changed ", opens+1)), 0o644); err != nil {
+				return nil, err
+			}
+		}
+		return originalOpen(path)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/agent/v1/runs/1/progress" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+	}))
+	defer server.Close()
+
+	client := newAgentClient(server.URL, "", "")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manifest, err := client.scanAndUpload(1, []string{root}, logger, fsfilter.Options{}, backupRunOptions{
+		ScanParallelEnabled: true,
+		FileReadWorkers:     1,
+	})
+	if err != nil {
+		t.Fatalf("scanAndUpload() error = %v", err)
+	}
+	if opens != defaultAgentChangedFileReadMaxRetries+1 {
+		t.Fatalf("changed file opens = %d, want %d", opens, defaultAgentChangedFileReadMaxRetries+1)
+	}
+	if _, ok := manifest.Find("changed.log"); ok {
+		t.Fatal("changed file was included after retry exhaustion")
+	}
+	if entry, ok := manifest.Find("."); !ok || entry.Type != repository.EntryTypeDir {
+		t.Fatalf("root manifest entry = %+v ok=%v, want dir", entry, ok)
+	}
+}
+
+func TestRegularFileSnapshotReaderDetectsGrowthDuringRead(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "live.log")
+	initial := []byte(strings.Repeat("a", 64*1024))
+	if err := os.WriteFile(path, initial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := catalogRecordFromFile(root, "live.log", info)
+	record.Type = string(repository.EntryTypeFile)
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	reader := newRegularFileSnapshotReader(root, "live.log", path, file, record)
+	buf := make([]byte, 1024)
+	if n, err := reader.Read(buf); err != nil || n == 0 {
+		t.Fatalf("first Read() = %d, %v; want bytes without error", n, err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("appended")); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(buf); !errors.Is(err, errAgentPathChanged) {
+		t.Fatalf("second Read() error = %v, want errAgentPathChanged", err)
+	}
+}
+
+func newAgentScanLegacyChunkServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/agent/v1/runs/1/progress":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "accepted"})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/agent/v1/chunks/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"exists": false})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/agent/v1/chunks/"):
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read chunk body: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hash := strings.TrimPrefix(r.URL.Path, "/agent/v1/chunks/")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"exists":   true,
+				"uploaded": true,
+				"ref": map[string]any{
+					"hash":          hash,
+					"original_size": len(data),
+				},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+}
+
+func chunkBytes(entry repository.FileEntry) int64 {
+	var total int64
+	for _, chunk := range entry.Chunks {
+		total += chunk.OriginalSize
+	}
+	return total
 }
 
 func TestScanAndUploadSkipsPathDeniedBeforeRead(t *testing.T) {

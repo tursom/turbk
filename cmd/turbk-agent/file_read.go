@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -92,7 +93,7 @@ func runAgentParallelFileReaders(jobs []agentParallelFileJob, workers int, pipel
 		go func() {
 			defer wg.Done()
 			for job := range jobCh {
-				resultCh <- readAgentParallelFile(job, window)
+				resultCh <- readAgentParallelFileWithRetry(job, window)
 			}
 		}()
 	}
@@ -107,15 +108,35 @@ func runAgentParallelFileReaders(jobs []agentParallelFileJob, workers int, pipel
 	return resultCh, window
 }
 
-func readAgentParallelFile(job agentParallelFileJob, window *agentFileReadByteWindow) agentParallelFileResult {
+func readAgentParallelFileWithRetry(job agentParallelFileJob, window *agentFileReadByteWindow) agentParallelFileResult {
+	for attempt := 0; attempt <= defaultAgentChangedFileReadMaxRetries; attempt++ {
+		result := readAgentParallelFileOnce(job, window)
+		if result.err == nil {
+			return result
+		}
+		if !errors.Is(result.err, errAgentPathChanged) || attempt >= defaultAgentChangedFileReadMaxRetries {
+			return result
+		}
+		refreshedEntry, refreshedRecord, err := refreshedRegularFileReadState(job.root, job.catalogPath, job.filePath, job.entry)
+		if err != nil {
+			return agentParallelFileResult{job: job, err: err}
+		}
+		job.entry = refreshedEntry
+		job.record = refreshedRecord
+	}
+	return agentParallelFileResult{job: job, err: changedPathError{path: job.filePath}}
+}
+
+func readAgentParallelFileOnce(job agentParallelFileJob, window *agentFileReadByteWindow) agentParallelFileResult {
 	file, err := agentOpen(job.filePath)
 	if err != nil {
 		return agentParallelFileResult{job: job, err: fmt.Errorf("open file %q: %w", job.filePath, err)}
 	}
 	chunker := repository.NewChunker(agentChunkAvgSize)
+	reader := newRegularFileSnapshotReader(job.root, job.catalogPath, job.filePath, file, job.record)
 	var chunks [][]byte
 	var acquired int64
-	readErr := chunker.Split(file, func(chunk []byte) error {
+	readErr := chunker.Split(reader, func(chunk []byte) error {
 		data := append([]byte(nil), chunk...)
 		size := int64(len(data))
 		window.acquire(size)
@@ -123,14 +144,23 @@ func readAgentParallelFile(job agentParallelFileJob, window *agentFileReadByteWi
 		chunks = append(chunks, data)
 		return nil
 	})
+	stat, statErr := file.Stat()
 	closeErr := file.Close()
 	if readErr != nil {
 		window.release(acquired)
 		return agentParallelFileResult{job: job, err: fmt.Errorf("chunk file %q: %w", job.filePath, readErr)}
 	}
+	if statErr != nil {
+		window.release(acquired)
+		return agentParallelFileResult{job: job, err: fmt.Errorf("stat file %q after read: %w", job.filePath, statErr)}
+	}
 	if closeErr != nil {
 		window.release(acquired)
 		return agentParallelFileResult{job: job, err: fmt.Errorf("close file %q: %w", job.filePath, closeErr)}
+	}
+	if err := updateRegularFileReadMetadata(job.root, job.catalogPath, job.filePath, reader.BytesRead(), stat, &job.entry, &job.record); err != nil {
+		window.release(acquired)
+		return agentParallelFileResult{job: job, err: err}
 	}
 	return agentParallelFileResult{job: job, chunks: chunks, bytes: acquired}
 }
